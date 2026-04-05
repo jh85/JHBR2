@@ -1,0 +1,450 @@
+"""
+Training script for ShogiBT4.
+
+Supports supervised learning from SFEN game records (kifu).
+Training data format: one line per position:
+    sfen <SFEN string> moves <move1> <move2> ... result <W|D|L>
+
+Example:
+    sfen lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1 bestmove 7g7f result W
+
+Usage:
+    python shogi_train.py --data train.sfen --epochs 10 --batch 64
+"""
+
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# Add lc0 src to path for the Shogi C++ modules (via ctypes or subprocess).
+# For now we do everything in Python.
+from shogi_model import ShogiBT4, ShogiBT4Config, generate_attn_policy_map
+
+
+# =====================================================================
+# Shogi board encoding (pure Python, mirrors C++ encoder)
+# =====================================================================
+
+def sfen_to_planes(sfen_str):
+    """
+    Convert an SFEN string to a (44, 9, 9) input tensor.
+    Encodes from side-to-move's perspective (flipped for WHITE).
+    """
+    parts = sfen_str.strip().split()
+    board_str = parts[0]
+    side = parts[1]  # 'b' or 'w'
+    hand_str = parts[2]
+    flip = (side == 'w')
+
+    planes = np.zeros((44, 9, 9), dtype=np.float32)
+
+    # Piece type mapping: char → (color, plane_index)
+    # Our pieces = planes 0-13, their pieces = planes 14-27
+    PIECE_PLANE = {
+        'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6, 'K': 7,
+    }
+    PROMOTED_PLANE = {
+        'P': 8, 'L': 9, 'N': 10, 'S': 11, 'B': 12, 'R': 13,
+    }
+
+    # Parse board
+    r, f = 0, 8  # Start top-left: rank a (idx 0), file 9 (idx 8)
+    promoted = False
+    for ch in board_str:
+        if ch == '/':
+            r += 1
+            f = 8
+            continue
+        if ch == '+':
+            promoted = True
+            continue
+        if ch.isdigit():
+            f -= int(ch)
+            continue
+
+        is_black = ch.isupper()
+        base_ch = ch.upper()
+        if promoted and base_ch in PROMOTED_PLANE:
+            plane_idx = PROMOTED_PLANE[base_ch]
+        else:
+            plane_idx = PIECE_PLANE.get(base_ch, -1)
+        promoted = False
+        if plane_idx < 0:
+            f -= 1
+            continue
+
+        # Determine "ours" vs "theirs"
+        if flip:
+            is_ours = not is_black
+            sq_f, sq_r = 8 - f, 8 - r  # flip 180°
+        else:
+            is_ours = is_black
+            sq_f, sq_r = f, r
+
+        offset = 0 if is_ours else 14
+        planes[offset + plane_idx, sq_r, sq_f] = 1.0
+        f -= 1
+
+    # Plane 28: repetition (TODO: requires history)
+    # planes[28] = 0
+
+    # Hand pieces
+    HAND_PLANE = {'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6}
+    if hand_str != '-':
+        count = 0
+        for ch in hand_str:
+            if ch.isdigit():
+                count = count * 10 + int(ch)
+                continue
+            if count == 0:
+                count = 1
+            is_black = ch.isupper()
+            base = ch.upper()
+            idx = HAND_PLANE.get(base, -1)
+            if idx >= 0:
+                if flip:
+                    is_ours = not is_black
+                else:
+                    is_ours = is_black
+                plane = 29 + idx if is_ours else 36 + idx
+                planes[plane] = float(count)
+            count = 0
+
+    # Plane 43: all ones
+    planes[43] = 1.0
+
+    return planes
+
+
+def move_to_policy_index(move_str, flip):
+    """
+    Convert a USI move string to a policy index (0-3848).
+    If flip=True, the move is from WHITE's perspective and needs 180° rotation.
+    """
+    if move_str[1] == '*':
+        # Drop: "P*5e"
+        pt_char = move_str[0].upper()
+        pt_map = {'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6}
+        pt = pt_map[pt_char]
+        to_f = int(move_str[2]) - 1
+        to_r = ord(move_str[3]) - ord('a')
+        if flip:
+            to_f = 8 - to_f
+            to_r = 8 - to_r
+        to_sq = to_f * 9 + to_r
+        # Drop index: after all board+promo moves
+        # We need the actual policy map to find the index.
+        return ('drop', pt, to_sq)
+    else:
+        # Board move: "7g7f" or "7g7f+"
+        from_f = int(move_str[0]) - 1
+        from_r = ord(move_str[1]) - ord('a')
+        to_f = int(move_str[2]) - 1
+        to_r = ord(move_str[3]) - ord('a')
+        promote = len(move_str) >= 5 and move_str[4] == '+'
+
+        if flip:
+            from_f, from_r = 8 - from_f, 8 - from_r
+            to_f, to_r = 8 - to_f, 8 - to_r
+
+        from_sq = from_f * 9 + from_r
+        to_sq = to_f * 9 + to_r
+        return ('board', from_sq, to_sq, promote)
+
+
+# =====================================================================
+# Dataset
+# =====================================================================
+
+class ShogiDataset(Dataset):
+    """
+    Loads training data from a text file.
+    Each line: sfen <SFEN> bestmove <move> result <W|D|L>
+    """
+
+    def __init__(self, filepath, move_index_fn):
+        self.samples = []
+        self.move_index_fn = move_index_fn
+
+        with open(filepath) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                try:
+                    sample = self._parse_line(line)
+                    if sample:
+                        self.samples.append(sample)
+                except Exception:
+                    continue
+
+        print(f"Loaded {len(self.samples)} positions from {filepath}")
+
+    def _parse_line(self, line):
+        # Format: sfen <SFEN parts> bestmove <move> result <W|D|L>
+        parts = line.split()
+        if parts[0] == 'sfen':
+            sfen_parts = []
+            i = 1
+            while i < len(parts) and parts[i] not in ('bestmove', 'result'):
+                sfen_parts.append(parts[i])
+                i += 1
+            sfen = ' '.join(sfen_parts)
+
+            bestmove = None
+            result = None
+            while i < len(parts):
+                if parts[i] == 'bestmove' and i + 1 < len(parts):
+                    bestmove = parts[i + 1]
+                    i += 2
+                elif parts[i] == 'result' and i + 1 < len(parts):
+                    result = parts[i + 1]
+                    i += 2
+                else:
+                    i += 1
+
+            if bestmove and result:
+                return (sfen, bestmove, result)
+        return None
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        sfen, bestmove, result = self.samples[idx]
+        flip = sfen.split()[1] == 'w'
+
+        # Input planes
+        planes = sfen_to_planes(sfen)
+
+        # Policy target
+        move_info = move_to_policy_index(bestmove, flip)
+        policy_idx = self.move_index_fn(move_info)
+
+        # Value target: WDL
+        if result == 'W':
+            wdl = [1.0, 0.0, 0.0]
+        elif result == 'D':
+            wdl = [0.0, 1.0, 0.0]
+        else:  # L
+            wdl = [0.0, 0.0, 1.0]
+
+        return (torch.tensor(planes),
+                torch.tensor(policy_idx, dtype=torch.long),
+                torch.tensor(wdl))
+
+
+# =====================================================================
+# Training loop
+# =====================================================================
+
+def train(args):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
+    # Generate policy map
+    attn_map = generate_attn_policy_map()
+
+    # Build move index lookup
+    board_idx = {}
+    promo_idx = {}
+    drop_idx = {}
+    current = 0
+
+    # Rebuild the exact mapping from generate_attn_policy_map
+    BOARD = 9
+    def in_bounds(f, r): return 0 <= f < BOARD and 0 <= r < BOARD
+
+    piece_moves_def = {
+        'pawn':[(0,-1,1)],'lance':[(0,-1,8)],'knight':[(-1,-2,1),(1,-2,1)],
+        'silver':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,1,1),(1,1,1)],
+        'gold':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,0,1),(1,0,1),(0,1,1)],
+        'bishop':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8)],
+        'rook':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8)],
+        'king':[(df,dr,1) for df in(-1,0,1) for dr in(-1,0,1) if(df,dr)!=(0,0)],
+        'horse':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8),(0,-1,1),(0,1,1),(-1,0,1),(1,0,1)],
+        'dragon':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8),(-1,-1,1),(-1,1,1),(1,-1,1),(1,1,1)],
+    }
+    valid_pairs = set()
+    for moves in piece_moves_def.values():
+        for f in range(9):
+            for r in range(9):
+                for df,dr,md in moves:
+                    for dist in range(1,md+1):
+                        nf,nr=f+df*dist,r+dr*dist
+                        if not in_bounds(nf,nr): break
+                        valid_pairs.add((f*9+r,nf*9+nr))
+
+    for f,t in sorted(valid_pairs):
+        board_idx[(f,t)] = current; current += 1
+    promo_pairs = {(f,t) for f,t in valid_pairs if f%9<=2 or t%9<=2}
+    for f,t in sorted(promo_pairs):
+        promo_idx[(f,t)] = current; current += 1
+    for pt in range(7):
+        for sq in range(81):
+            drop_idx[(pt,sq)] = current; current += 1
+
+    def move_info_to_idx(info):
+        if info[0] == 'drop':
+            _, pt, sq = info
+            return drop_idx.get((pt, sq), 0)
+        elif info[0] == 'board':
+            _, f, t, promote = info
+            if promote:
+                return promo_idx.get((f, t), 0)
+            else:
+                return board_idx.get((f, t), 0)
+        return 0
+
+    # Model
+    cfg = ShogiBT4Config()
+    if args.d_model:
+        cfg.embedding_size = args.d_model
+        cfg.policy_d_model = args.d_model
+    if args.encoders:
+        cfg.num_encoders = args.encoders
+    if args.heads:
+        cfg.num_heads = args.heads
+
+    model = ShogiBT4(cfg, attn_map).to(device)
+    print(f"Model parameters: {model.count_parameters():,}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                  weight_decay=args.wd)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs)
+
+    # Dataset
+    if not os.path.exists(args.data):
+        print(f"Training data file not found: {args.data}")
+        print("Creating a small synthetic dataset for testing...")
+        create_synthetic_data(args.data)
+
+    dataset = ShogiDataset(args.data, move_info_to_idx)
+    loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
+                        num_workers=2, pin_memory=True)
+
+    # Training
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0
+        total_policy_loss = 0
+        total_value_loss = 0
+        n_batches = 0
+        t0 = time.time()
+
+        for planes, policy_target, wdl_target in loader:
+            planes = planes.to(device)
+            policy_target = policy_target.to(device)
+            wdl_target = wdl_target.to(device)
+
+            policy_logits, wdl_logits, mlh = model(planes)
+
+            # Policy loss: cross-entropy
+            policy_loss = F.cross_entropy(policy_logits, policy_target)
+
+            # Value loss: cross-entropy on WDL
+            value_loss = F.cross_entropy(wdl_logits, wdl_target)
+
+            # Combined loss
+            loss = policy_loss + args.value_weight * value_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_policy_loss += policy_loss.item()
+            total_value_loss += value_loss.item()
+            n_batches += 1
+
+        scheduler.step()
+
+        elapsed = time.time() - t0
+        print(f"Epoch {epoch+1}/{args.epochs}  "
+              f"loss={total_loss/n_batches:.4f}  "
+              f"policy={total_policy_loss/n_batches:.4f}  "
+              f"value={total_value_loss/n_batches:.4f}  "
+              f"lr={scheduler.get_last_lr()[0]:.6f}  "
+              f"time={elapsed:.1f}s")
+
+        # Save checkpoint
+        if (epoch + 1) % args.save_every == 0:
+            path = f"shogi_bt4_epoch{epoch+1}.pt"
+            torch.save({
+                'epoch': epoch + 1,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'cfg': vars(cfg),
+            }, path)
+            print(f"  Saved {path}")
+
+    # Export to ONNX
+    if args.export_onnx:
+        export_onnx(model, cfg, args.export_onnx, device)
+
+
+def export_onnx(model, cfg, path, device):
+    """Export the trained model to ONNX format."""
+    model.eval()
+    dummy = torch.randn(1, cfg.input_planes, 9, 9, device=device)
+
+    torch.onnx.export(
+        model, dummy, path,
+        input_names=['input_planes'],
+        output_names=['policy', 'wdl', 'mlh'],
+        dynamic_axes={
+            'input_planes': {0: 'batch'},
+            'policy': {0: 'batch'},
+            'wdl': {0: 'batch'},
+            'mlh': {0: 'batch'},
+        },
+        opset_version=17,
+    )
+    print(f"Exported ONNX model to {path}")
+
+
+def create_synthetic_data(path, n=1000):
+    """Create synthetic training data for testing the pipeline."""
+    import random
+
+    PIECES = "PLNSBRGK"
+    with open(path, 'w') as f:
+        for _ in range(n):
+            # Just use starting position with random "best moves"
+            sfen = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1"
+            moves = ["7g7f", "2g2f", "3g3f", "6i7h", "5g5f", "4g4f",
+                      "2h7h", "2h3h", "2h6h", "1g1f"]
+            move = random.choice(moves)
+            result = random.choice(['W', 'D', 'L'])
+            f.write(f"sfen {sfen} bestmove {move} result {result}\n")
+    print(f"Created synthetic data: {path} ({n} positions)")
+
+
+# =====================================================================
+# CLI
+# =====================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train ShogiBT4")
+    parser.add_argument("--data", default="train.sfen", help="Training data file")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--wd", type=float, default=0.01)
+    parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--d-model", type=int, default=None)
+    parser.add_argument("--encoders", type=int, default=None)
+    parser.add_argument("--heads", type=int, default=None)
+    parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
+    args = parser.parse_args()
+    train(args)
