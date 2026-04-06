@@ -106,20 +106,12 @@ def parse_csa_game(filepath):
                 elif line.startswith('N-'):
                     game['gote_name'] = line[2:]
 
-                # Ratings (in comments)
-                elif "'rating:" in line or "'white_rate:" in line:
-                    # Format: 'rating:name+hash:name+hash
-                    # or: 'white_rate:name+hash:RATING
-                    # We need to extract both ratings
-                    pass
-                elif line.startswith("'") and 'rate' in line.lower():
-                    # Try to extract rating
-                    match = re.search(r'(\w+)\+\w+:(\d+\.?\d*)', line)
+                # Ratings: 'black_rate:name+hash:RATING or 'white_rate:name+hash:RATING
+                elif line.startswith("'black_rate:") or line.startswith("'white_rate:"):
+                    match = re.search(r':(\d+\.?\d*)\s*$', line)
                     if match:
-                        name = match.group(1)
-                        rate = float(match.group(2))
-                        if name == game['sente_name'] or \
-                           (game['sente_rate'] is None and game['gote_rate'] is not None):
+                        rate = float(match.group(1))
+                        if line.startswith("'black_rate:"):
                             game['sente_rate'] = rate
                         else:
                             game['gote_rate'] = rate
