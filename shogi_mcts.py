@@ -45,6 +45,9 @@ class MCTSConfig:
     max_time: float = 0.0          # Time limit in seconds (0 = unlimited)
     max_depth: int = 200           # Maximum tree depth
 
+    # Game limits (tournament rules)
+    max_game_moves: int = 320      # Draw if no winner after this many moves
+
     # Temperature for move selection
     temperature: float = 0.0       # 0 = argmax, >0 = proportional to N^(1/T)
     temp_moves: int = 30           # Apply temperature for first N moves of game
