@@ -317,20 +317,13 @@ class ShogiDataset(Dataset):
 # Training loop
 # =====================================================================
 
-def train(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-
-    # Generate policy map
-    attn_map = generate_attn_policy_map()
-
-    # Build move index lookup
+def build_move_index():
+    """Build the policy move index lookup tables."""
     board_idx = {}
     promo_idx = {}
     drop_idx = {}
     current = 0
 
-    # Rebuild the exact mapping from generate_attn_policy_map
     BOARD = 9
     def in_bounds(f, r): return 0 <= f < BOARD and 0 <= r < BOARD
 
@@ -375,7 +368,20 @@ def train(args):
                 return board_idx.get((f, t), 0)
         return 0
 
-    # Model
+    return move_info_to_idx
+
+
+def train(args):
+    # --- Device setup ---
+    num_gpus = torch.cuda.device_count()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}, GPUs: {num_gpus}")
+
+    # Generate policy map
+    attn_map = generate_attn_policy_map()
+    move_info_to_idx = build_move_index()
+
+    # --- Model ---
     cfg = ShogiBT4Config()
     if args.d_model:
         cfg.embedding_size = args.d_model
@@ -390,10 +396,34 @@ def train(args):
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.wd)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs)
 
-    # Dataset
+    # --- Resume from checkpoint ---
+    start_epoch = 0
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"Resuming from {args.resume}")
+            ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+            # Handle DataParallel state_dict keys (strip 'module.' prefix)
+            state_dict = ckpt['model']
+            if any(k.startswith('module.') for k in state_dict):
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            model.load_state_dict(state_dict)
+            if 'optimizer' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            start_epoch = ckpt.get('epoch', 0)
+            print(f"  Resumed at epoch {start_epoch}")
+        else:
+            print(f"Checkpoint not found: {args.resume}, starting from scratch")
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs, last_epoch=start_epoch - 1 if start_epoch > 0 else -1)
+
+    # --- Multi-GPU with DataParallel ---
+    if num_gpus > 1:
+        print(f"Using DataParallel across {num_gpus} GPUs")
+        model = torch.nn.DataParallel(model)
+
+    # --- Dataset ---
     if not os.path.exists(args.data):
         print(f"Training data file not found: {args.data}")
         print("Creating a small synthetic dataset for testing...")
@@ -401,10 +431,10 @@ def train(args):
 
     dataset = ShogiDataset(args.data, move_info_to_idx)
     loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
-                        num_workers=2, pin_memory=True)
+                        num_workers=4, pin_memory=True, drop_last=True)
 
-    # Training
-    for epoch in range(args.epochs):
+    # --- Training loop ---
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0
         total_policy_loss = 0
@@ -413,9 +443,9 @@ def train(args):
         t0 = time.time()
 
         for planes, policy_target, wdl_target in loader:
-            planes = planes.to(device)
-            policy_target = policy_target.to(device)
-            wdl_target = wdl_target.to(device)
+            planes = planes.to(device, non_blocking=True)
+            policy_target = policy_target.to(device, non_blocking=True)
+            wdl_target = wdl_target.to(device, non_blocking=True)
 
             policy_logits, wdl_logits, mlh = model(planes)
 
@@ -443,30 +473,46 @@ def train(args):
             total_value_loss += value_loss.item()
             n_batches += 1
 
+            # Print progress within epoch
+            if n_batches % 1000 == 0:
+                avg_loss = total_loss / n_batches
+                samples = n_batches * args.batch
+                elapsed = time.time() - t0
+                speed = samples / elapsed
+                print(f"  Epoch {epoch+1} batch {n_batches}: "
+                      f"loss={avg_loss:.4f} "
+                      f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
+
         scheduler.step()
 
         elapsed = time.time() - t0
+        samples_per_sec = (n_batches * args.batch) / max(elapsed, 1)
         print(f"Epoch {epoch+1}/{args.epochs}  "
               f"loss={total_loss/n_batches:.4f}  "
               f"policy={total_policy_loss/n_batches:.4f}  "
               f"value={total_value_loss/n_batches:.4f}  "
               f"lr={scheduler.get_last_lr()[0]:.6f}  "
-              f"time={elapsed:.1f}s")
+              f"time={elapsed:.1f}s  "
+              f"speed={samples_per_sec:.0f} samples/sec")
 
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
+            # Save the underlying model (unwrap DataParallel if needed)
+            raw_model = model.module if hasattr(model, 'module') else model
             path = f"shogi_bt4_epoch{epoch+1}.pt"
             torch.save({
                 'epoch': epoch + 1,
-                'model': model.state_dict(),
+                'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'cfg': vars(cfg),
+                'attn_map': attn_map,
             }, path)
             print(f"  Saved {path}")
 
     # Export to ONNX
     if args.export_onnx:
-        export_onnx(model, cfg, args.export_onnx, device)
+        raw_model = model.module if hasattr(model, 'module') else model
+        export_onnx(raw_model, cfg, args.export_onnx, device)
 
 
 def export_onnx(model, cfg, path, device):
@@ -484,7 +530,7 @@ def export_onnx(model, cfg, path, device):
             'wdl': {0: 'batch'},
             'mlh': {0: 'batch'},
         },
-        opset_version=17,
+        opset_version=18,
     )
     print(f"Exported ONNX model to {path}")
 
@@ -523,5 +569,6 @@ if __name__ == "__main__":
     parser.add_argument("--heads", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
+    parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     args = parser.parse_args()
     train(args)
