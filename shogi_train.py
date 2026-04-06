@@ -34,7 +34,7 @@ from shogi_model import ShogiBT4, ShogiBT4Config, generate_attn_policy_map
 
 def sfen_to_planes(sfen_str):
     """
-    Convert an SFEN string to a (44, 9, 9) input tensor.
+    Convert an SFEN string to a (48, 9, 9) input tensor.
     Encodes from side-to-move's perspective (flipped for WHITE).
     """
     parts = sfen_str.strip().split()
@@ -43,7 +43,7 @@ def sfen_to_planes(sfen_str):
     hand_str = parts[2]
     flip = (side == 'w')
 
-    planes = np.zeros((44, 9, 9), dtype=np.float32)
+    planes = np.zeros((48, 9, 9), dtype=np.float32)
 
     # Piece type mapping: char → (color, plane_index)
     # Our pieces = planes 0-13, their pieces = planes 14-27
@@ -119,6 +119,55 @@ def sfen_to_planes(sfen_str):
 
     # Plane 43: all ones
     planes[43] = 1.0
+
+    # Planes 44-47: Entering-king (nyugyoku) progress features.
+    # Compute points and piece counts for both sides.
+    # We need to parse the board to count pieces in enemy camp.
+    MAJOR_PIECES = {'B', 'R'}  # bishop, rook (and promoted forms count too)
+    for color_is_ours in [True, False]:
+        points = 0
+        pieces_in_camp = 0
+
+        # Enemy camp: ranks 0,1,2 for "us" (after flip, us=BLACK perspective).
+        # For the opponent, enemy camp is ranks 6,7,8 (from our perspective).
+        if color_is_ours:
+            camp_ranks = {0, 1, 2}
+        else:
+            camp_ranks = {6, 7, 8}
+
+        # Count board pieces in enemy camp
+        for r in range(9):
+            for f in range(9):
+                # Check the piece planes
+                for pt_idx in range(14):
+                    offset = 0 if color_is_ours else 14
+                    if planes[offset + pt_idx, r, f] > 0.5:
+                        if r in camp_ranks:
+                            if pt_idx == 7:  # King
+                                pass  # King doesn't count for points or piece count
+                            else:
+                                pieces_in_camp += 1
+                                # Major pieces: Bishop(4), Rook(5), Horse(12), Dragon(13)
+                                if pt_idx in (4, 5, 12, 13):
+                                    points += 5
+                                else:
+                                    points += 1
+
+        # Add hand piece points
+        for i in range(7):
+            hand_plane = 29 + i if color_is_ours else 36 + i
+            count = planes[hand_plane, 0, 0]  # scalar broadcast
+            if i in (4, 5):  # Bishop, Rook
+                points += int(count) * 5
+            else:
+                points += int(count)
+
+        if color_is_ours:
+            planes[44] = float(points) / 28.0
+            planes[46] = float(pieces_in_camp) / 10.0
+        else:
+            planes[45] = float(points) / 28.0
+            planes[47] = float(pieces_in_camp) / 10.0
 
     return planes
 

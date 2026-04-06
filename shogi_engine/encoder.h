@@ -5,13 +5,17 @@
 
 // Neural network input/output encoding for Shogi.
 //
-// INPUT PLANES (44 channels, 9×9 each):
+// INPUT PLANES (48 channels, 9×9 each):
 //   Planes  0-13:  Our 14 piece types on board (P,L,N,S,B,R,G,K,+P,+L,+N,+S,+H,+D)
 //   Planes 14-27:  Their 14 piece types on board
 //   Plane   28:    Repetition flag (all 1s if position has occurred before)
 //   Planes 29-35:  Our hand piece counts (P,L,N,S,B,R,G), value = count
 //   Planes 36-42:  Their hand piece counts
 //   Plane   43:    All ones (board edge helper)
+//   Plane   44:    Our entering-king points / 28.0 (nyugyoku progress)
+//   Plane   45:    Their entering-king points / 28.0
+//   Plane   46:    Our pieces in enemy camp / 10.0
+//   Plane   47:    Their pieces in enemy camp / 10.0
 //
 // POLICY OUTPUT (3849 moves):
 //   Indices    0-2223:  Board moves (from×to, non-promotion)
@@ -36,7 +40,7 @@ namespace lczero {
 
 // --- Constants ---
 
-constexpr int kShogiInputPlanes = 44;
+constexpr int kShogiInputPlanes = 48;
 constexpr int kShogiPolicySize = 3849;
 constexpr int kShogiBoardSize = 9;
 

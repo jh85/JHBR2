@@ -133,12 +133,36 @@ class ShogiBoard {
 
   enum class GameResult {
     kUndecided,
-    kCheckmate,     // Side to move is checkmated (loses)
+    kCheckmate,        // Side to move is checkmated (loses)
+    kDeclarationWin,   // Side to move wins by entering-king declaration
     // In Shogi there's no stalemate — if you can't move, you lose.
     // Repetition (sennichite) handling is left to the search layer.
   };
 
   GameResult ComputeGameResult() const;
+
+  // --- Entering-king declaration (入玉宣言) ---
+
+  // Check if the side to move can declare a win by entering king.
+  // Implements CSA 27-point rule:
+  //   (1) Side to move's turn (implicit)
+  //   (2) King is in opponent's camp (last 3 ranks)
+  //   (3) Points >= 28 (BLACK) or >= 27 (WHITE)
+  //       Major pieces (R,B,+R,+B) = 5 pts, others = 1 pt
+  //       Counted: hand pieces + pieces in opponent's camp
+  //   (4) 10+ pieces (excluding king) in opponent's camp
+  //   (5) King is not in check
+  //   (6) Time remaining (not checked here — engine-level concern)
+  bool CanDeclareWin() const;
+
+  // Compute entering-king point and piece counts for a given color.
+  // Used for both declaration checking and NN input features.
+  struct EnteringKingInfo {
+    int points;            // Total points (major=5, minor=1)
+    int pieces_in_camp;    // Pieces in enemy camp (excluding king)
+    bool king_in_camp;     // King is in enemy camp
+  };
+  EnteringKingInfo ComputeEnteringKingInfo(Color c) const;
 
   // --- Perspective flip ---
 

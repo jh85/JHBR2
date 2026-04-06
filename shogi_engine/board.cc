@@ -457,6 +457,10 @@ bool ShogiBoard::IsLegal(Move m) const {
 // =====================================================================
 
 ShogiBoard::GameResult ShogiBoard::ComputeGameResult() const {
+  // Check for declaration win first.
+  if (CanDeclareWin()) {
+    return GameResult::kDeclarationWin;
+  }
   // In Shogi, if the side to move has no legal moves, it's checkmate.
   // (There is no stalemate — no legal moves = loss.)
   MoveList moves = GenerateLegalMoves();
@@ -464,6 +468,71 @@ ShogiBoard::GameResult ShogiBoard::ComputeGameResult() const {
     return GameResult::kCheckmate;
   }
   return GameResult::kUndecided;
+}
+
+// =====================================================================
+// Entering-king declaration (入玉宣言)
+// =====================================================================
+
+ShogiBoard::EnteringKingInfo ShogiBoard::ComputeEnteringKingInfo(Color c) const {
+  EnteringKingInfo info = {0, 0, false};
+
+  // Enemy camp: last 3 ranks from the given color's perspective.
+  // BLACK's enemy camp = ranks 0,1,2 (top).  WHITE's = ranks 6,7,8 (bottom).
+  Bitboard enemy_camp = ShogiTables::PromotionZoneBB[c];
+
+  // Is king in enemy camp?
+  info.king_in_camp = enemy_camp.Test(king_sq_[c]);
+
+  // Count our pieces in enemy camp (excluding king).
+  Bitboard our_in_camp = pieces(c) & enemy_camp;
+  int total_in_camp = our_in_camp.PopCount();
+  if (info.king_in_camp) total_in_camp--;  // Exclude king
+  info.pieces_in_camp = total_in_camp;
+
+  // Count points.
+  // Major pieces (R, B, Dragon, Horse) in enemy camp = 5 pts each.
+  // Other pieces in enemy camp = 1 pt each.
+  Bitboard major_in_camp = our_in_camp &
+      (by_type_[kBishop.idx] | by_type_[kRook.idx] |
+       by_type_[kHorse.idx] | by_type_[kDragon.idx]);
+  int major_count = major_in_camp.PopCount();
+  int minor_count = info.pieces_in_camp - major_count;
+
+  int points = major_count * 5 + minor_count;
+
+  // Add hand pieces.
+  Hand h = hand_[c];
+  // Minor hand pieces: P, L, N, S, G = 1 pt each.
+  points += h.Count(kPawn) + h.Count(kLance) + h.Count(kKnight)
+          + h.Count(kSilver) + h.Count(kGold);
+  // Major hand pieces: B, R = 5 pts each.
+  points += (h.Count(kBishop) + h.Count(kRook)) * 5;
+
+  info.points = points;
+  return info;
+}
+
+bool ShogiBoard::CanDeclareWin() const {
+  Color us = side_to_move_;
+
+  // (5) King must not be in check.
+  if (InCheck(us)) return false;
+
+  // Compute entering king info.
+  EnteringKingInfo info = ComputeEnteringKingInfo(us);
+
+  // (2) King must be in enemy camp.
+  if (!info.king_in_camp) return false;
+
+  // (4) At least 10 pieces (excluding king) in enemy camp.
+  if (info.pieces_in_camp < 10) return false;
+
+  // (3) Point threshold: BLACK needs 28+, WHITE needs 27+.
+  int threshold = (us == BLACK) ? 28 : 27;
+  if (info.points < threshold) return false;
+
+  return true;
 }
 
 // =====================================================================

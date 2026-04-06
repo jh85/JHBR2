@@ -28,7 +28,7 @@ class ShogiBT4Config:
     # Board
     board_size: int = 9
     num_squares: int = 81
-    input_planes: int = 44
+    input_planes: int = 48
     policy_size: int = 3849
 
     # Embedding

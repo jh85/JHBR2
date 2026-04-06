@@ -256,6 +256,14 @@ ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
   // Plane 43: All ones.
   planes[43].SetAll(1.0f);
 
+  // Planes 44-47: Entering-king (nyugyoku) progress features.
+  auto our_ek = b.ComputeEnteringKingInfo(us);
+  auto their_ek = b.ComputeEnteringKingInfo(them);
+  planes[44].SetAll(static_cast<float>(our_ek.points) / 28.0f);
+  planes[45].SetAll(static_cast<float>(their_ek.points) / 28.0f);
+  planes[46].SetAll(static_cast<float>(our_ek.pieces_in_camp) / 10.0f);
+  planes[47].SetAll(static_cast<float>(their_ek.pieces_in_camp) / 10.0f);
+
   return planes;
 }
 
