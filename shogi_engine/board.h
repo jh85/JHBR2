@@ -56,9 +56,10 @@ struct Piece {
 
 // Undo information stored per move for undo_move().
 struct UndoInfo {
-  Piece captured;       // Piece captured (Piece::None() if no capture)
-  Hand prev_hand;       // Hand of the side that moved, before the move
-  // We could add hash keys here later for transposition tables.
+  Piece captured;           // Piece captured (Piece::None() if no capture)
+  Hand prev_hand;           // Hand of the side that moved, before the move
+  uint64_t prev_hash;       // Position hash before the move
+  int prev_continuous_check; // Continuous check counter for the moving side
 };
 
 // =====================================================================
@@ -164,6 +165,37 @@ class ShogiBoard {
   };
   EnteringKingInfo ComputeEnteringKingInfo(Color c) const;
 
+  // --- Position hashing ---
+
+  // Hash of the current position (board + hand + side to move).
+  // Two positions are the same if and only if they have the same hash,
+  // same hand pieces, and same side to move.
+  uint64_t Hash() const { return hash_; }
+
+  // --- Sennichite (repetition) detection ---
+
+  // Repetition result.
+  enum class RepetitionResult {
+    kNone,       // No repetition
+    kDraw,       // Normal sennichite (4th occurrence) → draw
+    kWin,        // Opponent was giving perpetual check → we win
+    kLoss,       // We were giving perpetual check → we lose
+  };
+
+  // Check for sennichite by examining position history.
+  // Call this after DoMove() to check if the new position is a repetition.
+  // The history is tracked internally.
+  RepetitionResult CheckRepetition() const;
+
+  // Get the repetition count (how many times current position has occurred).
+  int RepetitionCount() const;
+
+  // Is the current position a repetition (occurred at least once before)?
+  bool IsRepetition() const { return RepetitionCount() >= 1; }
+
+  // Clear position history (call when starting a new game or setting position).
+  void ClearHistory();
+
   // --- Perspective flip ---
 
   // Return a copy of the board rotated 180° with colors swapped.
@@ -203,6 +235,9 @@ class ShogiBoard {
   Bitboard PieceAttacks(PieceType pt, Color c, Square sq,
                         const Bitboard& occ) const;
 
+  // Compute hash from scratch (called after SetFromSfen).
+  void ComputeHash();
+
   // --- Data members ---
 
   std::array<Piece, kSquareNB> board_;      // Square → Piece
@@ -212,6 +247,20 @@ class ShogiBoard {
   Square king_sq_[COLOR_NB];                // Cached king positions
   Color side_to_move_ = BLACK;
   int ply_ = 0;
+  uint64_t hash_ = 0;                       // Position hash
+
+  // Continuous check counters (number of consecutive plies giving check).
+  // Reset to 0 when a non-checking move is made.
+  int continuous_check_[COLOR_NB] = {0, 0};
+
+  // Position history for sennichite detection.
+  // Stores (hash, hand[BLACK], hand[WHITE]) for each position in the game.
+  struct HistoryEntry {
+    uint64_t hash;
+    uint32_t hand_black;
+    uint32_t hand_white;
+  };
+  std::vector<HistoryEntry> history_;
 };
 
 // =====================================================================

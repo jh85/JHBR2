@@ -234,9 +234,12 @@ ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
     planes[14 + i].SetFromBitboard(b.pieces(them, piece_types[i]));
   }
 
-  // Plane 28: Repetition flag.
-  // (For now, always 0 — requires position history to detect.)
-  planes[28].Clear();
+  // Plane 28: Repetition flag (1 if current position has occurred before).
+  if (b.IsRepetition()) {
+    planes[28].SetAll(1.0f);
+  } else {
+    planes[28].Clear();
+  }
 
   // Planes 29-35: Our hand piece counts.
   const PieceType hand_types[] = {

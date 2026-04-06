@@ -9,6 +9,24 @@
 #include <cassert>
 #include <sstream>
 
+// =====================================================================
+// Simple hash combiner (same approach as lc0's HashCat)
+// =====================================================================
+
+namespace {
+
+uint64_t HashMix(uint64_t val) {
+  return UINT64_C(0xfad0d7f2fbb059f1) * (val + UINT64_C(0xbaad41cdcb839961)) +
+         UINT64_C(0x7acec0050bf82f43) * ((val >> 31) + UINT64_C(0xd571b3a92b1b2755));
+}
+
+uint64_t HashCombine(uint64_t hash, uint64_t x) {
+  hash ^= UINT64_C(0x299799adf0d95def) + HashMix(x) + (hash << 6) + (hash >> 2);
+  return hash;
+}
+
+}  // namespace
+
 namespace lczero {
 
 // =====================================================================
@@ -236,6 +254,11 @@ UndoInfo ShogiBoard::DoMove(Move m) {
   UndoInfo undo;
   Color us = side_to_move_;
   undo.prev_hand = hand_[us];
+  undo.prev_hash = hash_;
+  undo.prev_continuous_check = continuous_check_[us];
+
+  // Save current position to history (before making the move).
+  history_.push_back({hash_, hand_[BLACK].raw(), hand_[WHITE].raw()});
 
   if (m.is_drop()) {
     // Drop: remove from hand, place on board.
@@ -272,6 +295,19 @@ UndoInfo ShogiBoard::DoMove(Move m) {
 
   side_to_move_ = ~us;
   ply_++;
+
+  // Recompute hash for the new position.
+  ComputeHash();
+
+  // Update continuous check counter.
+  // If the opponent's king is now in check, increment our counter.
+  // Otherwise, reset it.
+  if (InCheck(~us)) {
+    continuous_check_[us] += 1;
+  } else {
+    continuous_check_[us] = 0;
+  }
+
   return undo;
 }
 
@@ -305,6 +341,15 @@ void ShogiBoard::UndoMove(Move m, const UndoInfo& undo) {
       // Restore hand.
       hand_[us] = undo.prev_hand;
     }
+  }
+
+  // Restore hash and continuous check counter.
+  hash_ = undo.prev_hash;
+  continuous_check_[us] = undo.prev_continuous_check;
+
+  // Remove the history entry we added in DoMove.
+  if (!history_.empty()) {
+    history_.pop_back();
   }
 }
 
@@ -622,6 +667,10 @@ bool ShogiBoard::SetFromSfen(const std::string& sfen) {
     ply_ = 1;
   }
 
+  // Compute initial hash and clear history.
+  ComputeHash();
+  ClearHistory();
+
   return true;
 }
 
@@ -677,6 +726,91 @@ std::string ShogiBoard::ToSfen() const {
   s += " " + std::to_string(ply_);
 
   return s;
+}
+
+// =====================================================================
+// Position hashing
+// =====================================================================
+
+void ShogiBoard::ComputeHash() {
+  uint64_t h = 0;
+  // Hash board pieces.
+  for (int sq = 0; sq < kSquareNB; ++sq) {
+    if (!board_[sq].IsNone()) {
+      h = HashCombine(h, sq * 32 + board_[sq].val);
+    }
+  }
+  // Hash hand pieces.
+  h = HashCombine(h, hand_[BLACK].raw());
+  h = HashCombine(h, hand_[WHITE].raw() + UINT64_C(0x1234567890));
+  // Hash side to move.
+  if (side_to_move_ == WHITE) {
+    h = HashCombine(h, UINT64_C(0xABCDEF0123456789));
+  }
+  hash_ = h;
+}
+
+// =====================================================================
+// Sennichite (repetition) detection
+// =====================================================================
+
+void ShogiBoard::ClearHistory() {
+  history_.clear();
+  continuous_check_[BLACK] = 0;
+  continuous_check_[WHITE] = 0;
+}
+
+int ShogiBoard::RepetitionCount() const {
+  int count = 0;
+  for (const auto& entry : history_) {
+    if (entry.hash == hash_ &&
+        entry.hand_black == hand_[BLACK].raw() &&
+        entry.hand_white == hand_[WHITE].raw()) {
+      count++;
+    }
+  }
+  return count;
+}
+
+ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition() const {
+  // Count how many times the current position has appeared in history.
+  // Sennichite occurs on the 4th occurrence (3 previous + current = 4).
+
+  int occurrences = 0;
+  int last_match_distance = 0;
+
+  for (int i = static_cast<int>(history_.size()) - 1; i >= 0; --i) {
+    const auto& entry = history_[i];
+    if (entry.hash == hash_ &&
+        entry.hand_black == hand_[BLACK].raw() &&
+        entry.hand_white == hand_[WHITE].raw()) {
+      occurrences++;
+      if (occurrences == 1) {
+        last_match_distance = static_cast<int>(history_.size()) - i;
+      }
+      if (occurrences >= 3) {
+        // 4th occurrence (3 in history + current) → sennichite.
+        // Check for perpetual check.
+        // If the side to move has been continuously checking for at least
+        // as many plies as the distance to the first repetition,
+        // that side LOSES (perpetual check).
+        // If the opponent was continuously checking, we WIN.
+
+        Color us = side_to_move_;
+        int dist = static_cast<int>(history_.size()) - i;
+
+        if (continuous_check_[us] >= dist) {
+          return RepetitionResult::kLoss;  // We were giving perpetual check
+        }
+        if (continuous_check_[~us] >= dist) {
+          return RepetitionResult::kWin;   // Opponent was giving perpetual check
+        }
+        return RepetitionResult::kDraw;
+      }
+    }
+  }
+
+  return RepetitionResult::kNone;
 }
 
 // =====================================================================
