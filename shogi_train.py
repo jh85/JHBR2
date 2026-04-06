@@ -212,10 +212,61 @@ def move_to_policy_index(move_str, flip):
 # Dataset
 # =====================================================================
 
+class PrecomputedDataset(Dataset):
+    """
+    Fast dataset loading pre-computed .npz shard files.
+
+    Expects files named: {prefix}_000.npz, {prefix}_001.npz, ...
+    Each shard contains: planes (float16), policy (int32), wdl (float32).
+
+    Usage:
+        dataset = PrecomputedDataset("/path/to/prefix")
+    """
+
+    def __init__(self, prefix):
+        self.planes_list = []
+        self.policy_list = []
+        self.wdl_list = []
+
+        # Find all shards
+        shard_idx = 0
+        while True:
+            path = f"{prefix}_{shard_idx:03d}.npz"
+            if not os.path.exists(path):
+                break
+            print(f"  Loading shard {path}...")
+            data = np.load(path)
+            self.planes_list.append(data['planes'])
+            self.policy_list.append(data['policy'])
+            self.wdl_list.append(data['wdl'])
+            shard_idx += 1
+
+        if shard_idx == 0:
+            raise FileNotFoundError(f"No shard files found: {prefix}_000.npz")
+
+        # Concatenate all shards
+        self.planes = np.concatenate(self.planes_list)
+        self.policy = np.concatenate(self.policy_list)
+        self.wdl = np.concatenate(self.wdl_list)
+
+        # Free shard references
+        del self.planes_list, self.policy_list, self.wdl_list
+
+        print(f"Loaded {len(self.planes):,} positions from {shard_idx} shards")
+
+    def __len__(self):
+        return len(self.planes)
+
+    def __getitem__(self, idx):
+        return (torch.from_numpy(self.planes[idx].astype(np.float32)),
+                torch.tensor(self.policy[idx], dtype=torch.long),
+                torch.tensor(self.wdl[idx], dtype=torch.float32))
+
+
 class ShogiDataset(Dataset):
     """
-    Loads training data from a text file.
-    Each line: sfen <SFEN> bestmove <move> result <W|D|L>
+    Loads training data from a text file (slow — use PrecomputedDataset instead).
+    Each line: sfen <SFEN> [bestmove <move>] [score <score>] result <W|D|L>
     """
 
     def __init__(self, filepath, move_index_fn):
@@ -424,14 +475,24 @@ def train(args):
         model = torch.nn.DataParallel(model)
 
     # --- Dataset ---
-    if not os.path.exists(args.data):
-        print(f"Training data file not found: {args.data}")
+    # Auto-detect format: if prefix_000.npz exists, use pre-computed; else text
+    if os.path.exists(f"{args.data}_000.npz"):
+        print("Using pre-computed binary dataset (fast)")
+        dataset = PrecomputedDataset(args.data)
+        loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
+                            num_workers=4, pin_memory=True, drop_last=True)
+    elif os.path.exists(args.data):
+        print("Using text dataset (slow — consider running precompute.py first)")
+        dataset = ShogiDataset(args.data, move_info_to_idx)
+        loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
+                            num_workers=4, pin_memory=True, drop_last=True)
+    else:
+        print(f"Training data not found: {args.data}")
         print("Creating a small synthetic dataset for testing...")
-        create_synthetic_data(args.data)
-
-    dataset = ShogiDataset(args.data, move_info_to_idx)
-    loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
-                        num_workers=4, pin_memory=True, drop_last=True)
+        create_synthetic_data(args.data + ".sfen")
+        dataset = ShogiDataset(args.data + ".sfen", move_info_to_idx)
+        loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
+                            num_workers=2, pin_memory=True, drop_last=True)
 
     # --- Training loop ---
     for epoch in range(start_epoch, args.epochs):
