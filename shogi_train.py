@@ -237,21 +237,26 @@ class ShogiDataset(Dataset):
         print(f"Loaded {len(self.samples)} positions from {filepath}")
 
     def _parse_line(self, line):
-        # Format: sfen <SFEN parts> bestmove <move> result <W|D|L>
+        # Format: sfen <SFEN> [bestmove <move>] [score <score>] result <W|D|L>
+        # bestmove is optional — if missing, policy_idx = -1 (value-only training)
         parts = line.split()
         if parts[0] == 'sfen':
             sfen_parts = []
             i = 1
-            while i < len(parts) and parts[i] not in ('bestmove', 'result'):
+            while i < len(parts) and parts[i] not in ('bestmove', 'result', 'score'):
                 sfen_parts.append(parts[i])
                 i += 1
             sfen = ' '.join(sfen_parts)
 
             bestmove = None
             result = None
+            score = None
             while i < len(parts):
                 if parts[i] == 'bestmove' and i + 1 < len(parts):
                     bestmove = parts[i + 1]
+                    i += 2
+                elif parts[i] == 'score' and i + 1 < len(parts):
+                    score = int(parts[i + 1])
                     i += 2
                 elif parts[i] == 'result' and i + 1 < len(parts):
                     result = parts[i + 1]
@@ -259,26 +264,44 @@ class ShogiDataset(Dataset):
                 else:
                     i += 1
 
-            if bestmove and result:
-                return (sfen, bestmove, result)
+            if result:
+                # Value-only record (no bestmove) or full record
+                return (sfen, bestmove, result, score)
         return None
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sfen, bestmove, result = self.samples[idx]
+        sfen, bestmove, result, score = self.samples[idx]
         flip = sfen.split()[1] == 'w'
 
         # Input planes
         planes = sfen_to_planes(sfen)
 
-        # Policy target
-        move_info = move_to_policy_index(bestmove, flip)
-        policy_idx = self.move_index_fn(move_info)
+        # Policy target (-1 if no bestmove available)
+        if bestmove:
+            move_info = move_to_policy_index(bestmove, flip)
+            policy_idx = self.move_index_fn(move_info)
+        else:
+            policy_idx = -1  # No policy target
 
         # Value target: WDL
-        if result == 'W':
+        # If we have a score, use soft WDL derived from evaluation
+        if score is not None:
+            import math
+            win_rate = 1.0 / (1.0 + math.exp(-score / 600.0))
+            # Blend with game result for a softer target
+            if result == 'W':
+                hard = [1.0, 0.0, 0.0]
+            elif result == 'D':
+                hard = [0.0, 1.0, 0.0]
+            else:
+                hard = [0.0, 0.0, 1.0]
+            # 70% score-based, 30% game result
+            soft = [win_rate, 0.0, 1.0 - win_rate]
+            wdl = [0.7 * s + 0.3 * h for s, h in zip(soft, hard)]
+        elif result == 'W':
             wdl = [1.0, 0.0, 0.0]
         elif result == 'D':
             wdl = [0.0, 1.0, 0.0]
@@ -396,8 +419,13 @@ def train(args):
 
             policy_logits, wdl_logits, mlh = model(planes)
 
-            # Policy loss: cross-entropy
-            policy_loss = F.cross_entropy(policy_logits, policy_target)
+            # Policy loss: cross-entropy (only for samples with valid move targets)
+            has_policy = policy_target >= 0
+            if has_policy.any():
+                policy_loss = F.cross_entropy(
+                    policy_logits[has_policy], policy_target[has_policy])
+            else:
+                policy_loss = torch.tensor(0.0, device=device)
 
             # Value loss: cross-entropy on WDL
             value_loss = F.cross_entropy(wdl_logits, wdl_target)
