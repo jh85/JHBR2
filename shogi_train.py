@@ -212,66 +212,78 @@ def move_to_policy_index(move_str, flip):
 # Dataset
 # =====================================================================
 
-class PrecomputedDataset(Dataset):
+class ShardedDataset(Dataset):
     """
-    Fast dataset loading pre-computed .npz shard files.
+    Memory-efficient dataset that loads ONE shard at a time.
 
-    Expects files named: {prefix}_000.npz, {prefix}_001.npz, ...
-    Each shard contains: planes (float16), policy (int32), wdl (float32).
-
-    Memory-efficient: keeps shards as separate arrays, uses index mapping
-    to find the right shard + offset for each sample. No concatenation.
+    Only ~4 GB in memory (one 500K-position shard) instead of ~43 GB.
+    Call load_shard(idx) to switch shards between training iterations.
 
     Usage:
-        dataset = PrecomputedDataset("/path/to/prefix")
+        dataset = ShardedDataset("/path/to/prefix")
+        for shard_id in dataset.shard_order():
+            dataset.load_shard(shard_id)
+            # train on this shard
     """
 
     def __init__(self, prefix):
-        self.shards = []       # list of (planes, policy, wdl) per shard
-        self.shard_offsets = [] # cumulative offset for each shard
-        total = 0
-
-        shard_idx = 0
+        # Discover shards without loading them
+        self.shard_paths = []
+        idx = 0
         while True:
-            path = f"{prefix}_{shard_idx:03d}.npz"
+            path = f"{prefix}_{idx:03d}.npz"
             if not os.path.exists(path):
                 break
-            data = np.load(path)
-            planes = data['planes']  # (N, 48, 9, 9) float16
-            policy = data['policy']  # (N,) int32
-            wdl = data['wdl']        # (N, 3) float32
-            self.shards.append((planes, policy, wdl))
-            self.shard_offsets.append(total)
-            total += len(planes)
-            shard_idx += 1
-            if shard_idx % 20 == 0:
-                print(f"  Loaded {shard_idx} shards ({total/1e6:.1f}M positions)...")
+            self.shard_paths.append(path)
+            idx += 1
 
-        if shard_idx == 0:
+        if idx == 0:
             raise FileNotFoundError(f"No shard files found: {prefix}_000.npz")
 
-        self.total = total
-        print(f"Loaded {total:,} positions from {shard_idx} shards "
-              f"(memory: ~{total * 48 * 81 * 2 / 1e9:.1f} GB)")
+        self.num_shards = idx
+        self.planes = None
+        self.policy = None
+        self.wdl = None
+        self.current_shard = -1
+
+        # Load first shard to get the count
+        self.load_shard(0)
+        self.shard_size = len(self.planes)
+
+        print(f"Found {self.num_shards} shards, ~{self.shard_size:,} positions each")
+        print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions "
+              f"(memory: ~{self.shard_size * 48 * 81 * 2 / 1e9:.1f} GB per shard)")
+
+    def load_shard(self, shard_id):
+        """Load a specific shard into memory (frees the previous one)."""
+        if shard_id == self.current_shard:
+            return
+        # Free previous shard
+        self.planes = None
+        self.policy = None
+        self.wdl = None
+
+        data = np.load(self.shard_paths[shard_id])
+        self.planes = data['planes']
+        self.policy = data['policy']
+        self.wdl = data['wdl']
+        self.current_shard = shard_id
+
+    def shard_order(self, shuffle=True):
+        """Return shard indices in random order."""
+        import random
+        order = list(range(self.num_shards))
+        if shuffle:
+            random.shuffle(order)
+        return order
 
     def __len__(self):
-        return self.total
+        return len(self.planes)
 
     def __getitem__(self, idx):
-        # Binary search for the right shard
-        # (simple linear scan is fine for ~100 shards)
-        shard_id = len(self.shard_offsets) - 1
-        for i in range(len(self.shard_offsets) - 1):
-            if idx < self.shard_offsets[i + 1]:
-                shard_id = i
-                break
-
-        local_idx = idx - self.shard_offsets[shard_id]
-        planes, policy, wdl = self.shards[shard_id]
-
-        return (torch.from_numpy(planes[local_idx].astype(np.float32)),
-                torch.tensor(policy[local_idx], dtype=torch.long),
-                torch.tensor(wdl[local_idx], dtype=torch.float32))
+        return (torch.from_numpy(self.planes[idx].astype(np.float32)),
+                torch.tensor(self.policy[idx], dtype=torch.long),
+                torch.tensor(self.wdl[idx], dtype=torch.float32))
 
 
 class ShogiDataset(Dataset):
@@ -486,24 +498,21 @@ def train(args):
         model = torch.nn.DataParallel(model)
 
     # --- Dataset ---
-    # Auto-detect format: if prefix_000.npz exists, use pre-computed; else text
-    if os.path.exists(f"{args.data}_000.npz"):
-        print("Using pre-computed binary dataset (fast)")
-        dataset = PrecomputedDataset(args.data)
-        loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
-                            num_workers=4, pin_memory=True, drop_last=True)
-    elif os.path.exists(args.data):
+    use_sharded = os.path.exists(f"{args.data}_000.npz")
+    use_text = not use_sharded and os.path.exists(args.data)
+
+    if use_sharded:
+        print("Using pre-computed binary dataset (fast, memory-efficient)")
+        sharded_dataset = ShardedDataset(args.data)
+    elif use_text:
         print("Using text dataset (slow — consider running precompute.py first)")
         dataset = ShogiDataset(args.data, move_info_to_idx)
-        loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
-                            num_workers=4, pin_memory=True, drop_last=True)
     else:
         print(f"Training data not found: {args.data}")
         print("Creating a small synthetic dataset for testing...")
         create_synthetic_data(args.data + ".sfen")
         dataset = ShogiDataset(args.data + ".sfen", move_info_to_idx)
-        loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
-                            num_workers=2, pin_memory=True, drop_last=True)
+        use_text = True
 
     # --- Training loop ---
     for epoch in range(start_epoch, args.epochs):
@@ -514,62 +523,105 @@ def train(args):
         n_batches = 0
         t0 = time.time()
 
-        for planes, policy_target, wdl_target in loader:
-            planes = planes.to(device, non_blocking=True)
-            policy_target = policy_target.to(device, non_blocking=True)
-            wdl_target = wdl_target.to(device, non_blocking=True)
+        if use_sharded:
+            # Iterate through shards in random order
+            shard_order = sharded_dataset.shard_order(shuffle=True)
+            for shard_id in shard_order:
+                sharded_dataset.load_shard(shard_id)
+                loader = DataLoader(sharded_dataset, batch_size=args.batch,
+                                    shuffle=True, num_workers=4,
+                                    pin_memory=True, drop_last=True)
 
-            policy_logits, wdl_logits, mlh = model(planes)
+                for planes, policy_target, wdl_target in loader:
+                    planes = planes.to(device, non_blocking=True)
+                    policy_target = policy_target.to(device, non_blocking=True)
+                    wdl_target = wdl_target.to(device, non_blocking=True)
 
-            # Policy loss: cross-entropy (only for samples with valid move targets)
-            has_policy = policy_target >= 0
-            if has_policy.any():
-                policy_loss = F.cross_entropy(
-                    policy_logits[has_policy], policy_target[has_policy])
-            else:
-                policy_loss = torch.tensor(0.0, device=device)
+                    policy_logits, wdl_logits, mlh = model(planes)
 
-            # Value loss: cross-entropy on WDL
-            value_loss = F.cross_entropy(wdl_logits, wdl_target)
+                    has_policy = policy_target >= 0
+                    if has_policy.any():
+                        policy_loss = F.cross_entropy(
+                            policy_logits[has_policy], policy_target[has_policy])
+                    else:
+                        policy_loss = torch.tensor(0.0, device=device)
 
-            # Combined loss
-            loss = policy_loss + args.value_weight * value_loss
+                    value_loss = F.cross_entropy(wdl_logits, wdl_target)
+                    loss = policy_loss + args.value_weight * value_loss
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
 
-            total_loss += loss.item()
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            n_batches += 1
+                    total_loss += loss.item()
+                    total_policy_loss += policy_loss.item()
+                    total_value_loss += value_loss.item()
+                    n_batches += 1
 
-            # Print progress within epoch
-            if n_batches % 1000 == 0:
-                avg_loss = total_loss / n_batches
-                samples = n_batches * args.batch
+                # Print after each shard
                 elapsed = time.time() - t0
-                speed = samples / elapsed
-                print(f"  Epoch {epoch+1} batch {n_batches}: "
+                samples = n_batches * args.batch
+                speed = samples / max(elapsed, 1)
+                avg_loss = total_loss / max(n_batches, 1)
+                print(f"  Epoch {epoch+1} shard {shard_id:03d}: "
                       f"loss={avg_loss:.4f} "
                       f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
+        else:
+            # Text dataset: single loader for entire epoch
+            loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
+                                num_workers=4, pin_memory=True, drop_last=True)
+
+            for planes, policy_target, wdl_target in loader:
+                planes = planes.to(device, non_blocking=True)
+                policy_target = policy_target.to(device, non_blocking=True)
+                wdl_target = wdl_target.to(device, non_blocking=True)
+
+                policy_logits, wdl_logits, mlh = model(planes)
+
+                has_policy = policy_target >= 0
+                if has_policy.any():
+                    policy_loss = F.cross_entropy(
+                        policy_logits[has_policy], policy_target[has_policy])
+                else:
+                    policy_loss = torch.tensor(0.0, device=device)
+
+                value_loss = F.cross_entropy(wdl_logits, wdl_target)
+                loss = policy_loss + args.value_weight * value_loss
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+
+                total_loss += loss.item()
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                n_batches += 1
+
+                if n_batches % 1000 == 0:
+                    avg_loss = total_loss / n_batches
+                    samples = n_batches * args.batch
+                    elapsed = time.time() - t0
+                    speed = samples / elapsed
+                    print(f"  Epoch {epoch+1} batch {n_batches}: "
+                          f"loss={avg_loss:.4f} "
+                          f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
 
         scheduler.step()
 
         elapsed = time.time() - t0
         samples_per_sec = (n_batches * args.batch) / max(elapsed, 1)
         print(f"Epoch {epoch+1}/{args.epochs}  "
-              f"loss={total_loss/n_batches:.4f}  "
-              f"policy={total_policy_loss/n_batches:.4f}  "
-              f"value={total_value_loss/n_batches:.4f}  "
+              f"loss={total_loss/max(n_batches,1):.4f}  "
+              f"policy={total_policy_loss/max(n_batches,1):.4f}  "
+              f"value={total_value_loss/max(n_batches,1):.4f}  "
               f"lr={scheduler.get_last_lr()[0]:.6f}  "
               f"time={elapsed:.1f}s  "
               f"speed={samples_per_sec:.0f} samples/sec")
 
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
-            # Save the underlying model (unwrap DataParallel if needed)
             raw_model = model.module if hasattr(model, 'module') else model
             path = f"shogi_bt4_epoch{epoch+1}.pt"
             torch.save({
