@@ -219,48 +219,59 @@ class PrecomputedDataset(Dataset):
     Expects files named: {prefix}_000.npz, {prefix}_001.npz, ...
     Each shard contains: planes (float16), policy (int32), wdl (float32).
 
+    Memory-efficient: keeps shards as separate arrays, uses index mapping
+    to find the right shard + offset for each sample. No concatenation.
+
     Usage:
         dataset = PrecomputedDataset("/path/to/prefix")
     """
 
     def __init__(self, prefix):
-        self.planes_list = []
-        self.policy_list = []
-        self.wdl_list = []
+        self.shards = []       # list of (planes, policy, wdl) per shard
+        self.shard_offsets = [] # cumulative offset for each shard
+        total = 0
 
-        # Find all shards
         shard_idx = 0
         while True:
             path = f"{prefix}_{shard_idx:03d}.npz"
             if not os.path.exists(path):
                 break
-            print(f"  Loading shard {path}...")
             data = np.load(path)
-            self.planes_list.append(data['planes'])
-            self.policy_list.append(data['policy'])
-            self.wdl_list.append(data['wdl'])
+            planes = data['planes']  # (N, 48, 9, 9) float16
+            policy = data['policy']  # (N,) int32
+            wdl = data['wdl']        # (N, 3) float32
+            self.shards.append((planes, policy, wdl))
+            self.shard_offsets.append(total)
+            total += len(planes)
             shard_idx += 1
+            if shard_idx % 20 == 0:
+                print(f"  Loaded {shard_idx} shards ({total/1e6:.1f}M positions)...")
 
         if shard_idx == 0:
             raise FileNotFoundError(f"No shard files found: {prefix}_000.npz")
 
-        # Concatenate all shards
-        self.planes = np.concatenate(self.planes_list)
-        self.policy = np.concatenate(self.policy_list)
-        self.wdl = np.concatenate(self.wdl_list)
-
-        # Free shard references
-        del self.planes_list, self.policy_list, self.wdl_list
-
-        print(f"Loaded {len(self.planes):,} positions from {shard_idx} shards")
+        self.total = total
+        print(f"Loaded {total:,} positions from {shard_idx} shards "
+              f"(memory: ~{total * 48 * 81 * 2 / 1e9:.1f} GB)")
 
     def __len__(self):
-        return len(self.planes)
+        return self.total
 
     def __getitem__(self, idx):
-        return (torch.from_numpy(self.planes[idx].astype(np.float32)),
-                torch.tensor(self.policy[idx], dtype=torch.long),
-                torch.tensor(self.wdl[idx], dtype=torch.float32))
+        # Binary search for the right shard
+        # (simple linear scan is fine for ~100 shards)
+        shard_id = len(self.shard_offsets) - 1
+        for i in range(len(self.shard_offsets) - 1):
+            if idx < self.shard_offsets[i + 1]:
+                shard_id = i
+                break
+
+        local_idx = idx - self.shard_offsets[shard_id]
+        planes, policy, wdl = self.shards[shard_id]
+
+        return (torch.from_numpy(planes[local_idx].astype(np.float32)),
+                torch.tensor(policy[local_idx], dtype=torch.long),
+                torch.tensor(wdl[local_idx], dtype=torch.float32))
 
 
 class ShogiDataset(Dataset):
