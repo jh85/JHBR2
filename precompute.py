@@ -30,7 +30,7 @@ import numpy as np
 from shogi_train import sfen_to_planes, move_to_policy_index, build_move_index
 
 
-def precompute(input_path, output_prefix, shard_size=5_000_000):
+def precompute(input_path, output_prefix, shard_size=500_000):
     """Convert SFEN text file to sharded .npz files with pre-computed tensors."""
 
     move_info_to_idx = build_move_index()
@@ -182,9 +182,16 @@ def _parse_line(line, move_info_to_idx):
 def _save_shard(prefix, idx, planes_list, policy_list, wdl_list):
     """Save one shard as compressed .npz."""
     path = f"{prefix}_{idx:03d}.npz"
+    n = len(planes_list)
+
+    # Pre-allocate arrays and fill (avoids np.array() on huge list of arrays)
+    planes = np.empty((n, 48, 9, 9), dtype=np.float16)
+    for i in range(n):
+        planes[i] = planes_list[i]
+
     np.savez_compressed(
         path,
-        planes=np.array(planes_list, dtype=np.float16),  # float16 to save disk
+        planes=planes,
         policy=np.array(policy_list, dtype=np.int32),
         wdl=np.array(wdl_list, dtype=np.float32),
     )
@@ -194,7 +201,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pre-compute training data")
     parser.add_argument("--input", required=True, help="Input SFEN text file")
     parser.add_argument("--output", required=True, help="Output prefix (without .npz)")
-    parser.add_argument("--shard-size", type=int, default=5_000_000,
-                        help="Positions per shard file (default 5M)")
+    parser.add_argument("--shard-size", type=int, default=500_000,
+                        help="Positions per shard file (default 500K)")
     args = parser.parse_args()
     precompute(args.input, args.output, args.shard_size)
