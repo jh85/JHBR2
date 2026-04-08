@@ -612,13 +612,32 @@ def train(args):
 
         elapsed = time.time() - t0
         samples_per_sec = (n_batches * args.batch) / max(elapsed, 1)
+        avg_loss = total_loss / max(n_batches, 1)
+        avg_policy = total_policy_loss / max(n_batches, 1)
+        avg_value = total_value_loss / max(n_batches, 1)
+        lr = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch+1}/{args.epochs}  "
-              f"loss={total_loss/max(n_batches,1):.4f}  "
-              f"policy={total_policy_loss/max(n_batches,1):.4f}  "
-              f"value={total_value_loss/max(n_batches,1):.4f}  "
-              f"lr={scheduler.get_last_lr()[0]:.6f}  "
+              f"loss={avg_loss:.4f}  "
+              f"policy={avg_policy:.4f}  "
+              f"value={avg_value:.4f}  "
+              f"lr={lr:.6f}  "
               f"time={elapsed:.1f}s  "
               f"speed={samples_per_sec:.0f} samples/sec")
+
+        # Log to CSV
+        if args.log_csv:
+            import csv
+            write_header = not os.path.exists(args.log_csv)
+            with open(args.log_csv, 'a', newline='') as csvf:
+                writer = csv.writer(csvf)
+                if write_header:
+                    writer.writerow(['epoch', 'loss', 'policy_loss', 'value_loss',
+                                     'lr', 'time_sec', 'samples_per_sec',
+                                     'total_samples', 'batches'])
+                writer.writerow([epoch + 1, f'{avg_loss:.6f}', f'{avg_policy:.6f}',
+                                 f'{avg_value:.6f}', f'{lr:.8f}', f'{elapsed:.1f}',
+                                 f'{samples_per_sec:.0f}',
+                                 n_batches * args.batch, n_batches])
 
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
@@ -694,5 +713,6 @@ if __name__ == "__main__":
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
+    parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
     args = parser.parse_args()
     train(args)
