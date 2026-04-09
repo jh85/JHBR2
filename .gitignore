@@ -10,3 +10,10 @@ dist/
 build/
 .venv/
 venv/
+
+# C++ build artifacts
+*.o
+*.d
+*.a
+*.so
+shogi
