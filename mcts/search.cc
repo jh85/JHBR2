@@ -110,12 +110,12 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     // --- Mate detection (before NN eval, following dlshogi) ---
 
     // No legal moves = checkmate.
+    // The leaf's side is mated (value -1). Parent played the mating move = parent WINS.
     if (leaf_legal.empty()) {
       leaf->SetTerminal(-1.0f);
       leaf->set_mate_status(-1);
-      // The parent's edge that led here: opponent is mated = win for parent.
       if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
+        leaf->parent()->edge(leaf->parent_edge_idx()).SetWin();
       }
       Backpropagate(leaf, -1.0f, 0.0f);
       PropagateMateUp(leaf);
@@ -123,12 +123,13 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     }
 
     // Tier 1: 1-ply mate check (essentially free).
+    // The leaf can deliver mate-in-1 (value +1). Parent's move led to this = parent LOSES.
     Move mate1 = Mate1Ply(leaf_board);
     if (!mate1.is_null()) {
       leaf->SetTerminal(1.0f);
       leaf->set_mate_status(1);
       if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).SetWin();
+        leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
       }
       Backpropagate(leaf, 1.0f, 0.0f);
       PropagateMateUp(leaf);
@@ -136,32 +137,31 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     }
 
     // Tier 2: Shallow df-pn mate search.
+    // Same as Mate1Ply: leaf can force mate = parent LOSES.
     if (dfpn_leaf_ && !leaf->dfpn_checked()) {
       leaf->set_dfpn_checked(true);
       Move mate_move = dfpn_leaf_->search(leaf_board, config_.leaf_dfpn_nodes);
       if (MateDfpnSolver::IsNoMate(mate_move)) {
-        // Proved no mate exists.
         leaf->set_dfpn_proven_no_mate(true);
       } else if (!mate_move.is_null()) {
-        // Mate found (valid mating move returned).
         leaf->SetTerminal(1.0f);
         leaf->set_mate_status(1);
         if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-          leaf->parent()->edge(leaf->parent_edge_idx()).SetWin();
+          leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
         }
         Backpropagate(leaf, 1.0f, 0.0f);
         PropagateMateUp(leaf);
         continue;
       }
-      // else: mate_move.is_null() = unsolved/timeout, proceed normally.
     }
 
     // Check entering-king declaration.
+    // Leaf can declare win = parent LOSES.
     if (leaf_board.CanDeclareWin()) {
       leaf->SetTerminal(1.0f);
       leaf->set_mate_status(1);
       if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).SetWin();
+        leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
       }
       Backpropagate(leaf, 1.0f, 0.0f);
       continue;
@@ -481,7 +481,7 @@ void MCTSSearch::PvMateSearch(Node* root, const ShogiBoard& root_board) {
         child->set_mate_status(1);
         child->SetTerminal(1.0f);
         // The edge from parent to this child: child's side wins = parent loses.
-        node->edge(best_idx).SetWin();
+        node->edge(best_idx).SetLose();
         PropagateMateUp(child);
 
         // If root is now resolved, stop.
@@ -503,8 +503,7 @@ Move MCTSSearch::SelectMove(Node* root, int game_ply) {
   // If root has a proven mate, pick the winning move.
   if (root->mate_status() == 1) {
     for (int i = 0; i < root->num_edges(); i++) {
-      if (root->edge(i).IsLose()) {
-        // This edge leads to opponent being mated = our win.
+      if (root->edge(i).IsWin()) {
         return root->edge(i).move;
       }
     }
