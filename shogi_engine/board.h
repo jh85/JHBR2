@@ -112,15 +112,20 @@ class ShogiBoard {
   Bitboard AttackersTo(Square sq, const Bitboard& occ) const;
   Bitboard AttackersTo(Square sq) const { return AttackersTo(sq, occupied()); }
 
+  // --- Pin detection ---
+
+  // Compute bitboard of pieces pinned to the king of the given color.
+  // A piece is "pinned" if removing it would expose its king to a sliding attack.
+  // Returns both own and enemy pinned pieces (caller filters by color if needed).
+  Bitboard ComputeBlockersForKing(Color king_color) const;
+
   // --- Move generation ---
 
   // Generate all legal moves for the side to move.
   MoveList GenerateLegalMoves();
 
   // Is the given move legal in the current position?
-  // (Does not check if the move is well-formed — only checks legality
-  // assuming a valid from/to/flags encoding.)
-  bool IsLegal(Move m);
+  bool IsLegal(Move m, const Bitboard& pinned);
 
   // --- Move application ---
 

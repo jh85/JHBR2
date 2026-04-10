@@ -24,6 +24,8 @@ Bitboard KingEffectBB[kSquareNB];
 Bitboard HorseStepBB[kSquareNB];
 Bitboard DragonStepBB[kSquareNB];
 Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
+Bitboard BetweenBB[kSquareNB][kSquareNB];
+Bitboard LineBB[kSquareNB][kSquareNB];
 Bitboard QugiyRookMask[kSquareNB][2];
 Bitboard256 QugiyBishopMask[kSquareNB][2];
 
@@ -104,6 +106,53 @@ static Bitboard MakeRayBB(int f, int r, int df, int dr) {
     nr += dr;
   }
   return bb;
+}
+
+static void InitBetweenAndLine() {
+  // 8 directions: (df, dr)
+  constexpr int dirs[8][2] = {
+    {0,-1}, {0,+1}, {-1,0}, {+1,0},   // rook directions
+    {-1,-1}, {-1,+1}, {+1,-1}, {+1,+1} // bishop directions
+  };
+
+  for (int sq1 = 0; sq1 < kSquareNB; ++sq1) {
+    for (int sq2 = 0; sq2 < kSquareNB; ++sq2) {
+      BetweenBB[sq1][sq2] = Bitboard::Zero();
+      LineBB[sq1][sq2] = Bitboard::Zero();
+    }
+  }
+
+  for (int f1 = 0; f1 < 9; ++f1) {
+    for (int r1 = 0; r1 < 9; ++r1) {
+      int sq1 = f1 * 9 + r1;
+      for (auto [df, dr] : dirs) {
+        // Walk from sq1 in this direction, building the full ray.
+        Bitboard ray = Bitboard::Zero();
+        int f = f1 + df, r = r1 + dr;
+        while (f >= 0 && f < 9 && r >= 0 && r < 9) {
+          int sq2 = f * 9 + r;
+          // BetweenBB[sq1][sq2] = all squares between sq1 and sq2 (exclusive).
+          BetweenBB[sq1][sq2] = ray;
+          ray.Set(Square::FromIdx(sq2));
+          f += df;
+          r += dr;
+        }
+        // LineBB: for every pair on this ray, the full line through both.
+        // Full ray from sq1 in this direction (both ways).
+        Bitboard full_line = MakeRayBB(f1, r1, df, dr) |
+                             MakeRayBB(f1, r1, -df, -dr);
+        full_line.Set(Square::FromIdx(sq1));
+        // Assign to every sq2 on the forward ray.
+        f = f1 + df; r = r1 + dr;
+        while (f >= 0 && f < 9 && r >= 0 && r < 9) {
+          int sq2 = f * 9 + r;
+          LineBB[sq1][sq2] = full_line;
+          f += df;
+          r += dr;
+        }
+      }
+    }
+  }
 }
 
 static void InitQugiyMasks() {
@@ -198,6 +247,9 @@ void Init() {
 
   // Step attack tables.
   InitStepAttacks();
+
+  // Line and between tables (needed for pin detection).
+  InitBetweenAndLine();
 
   // Qugiy sliding attack masks.
   InitQugiyMasks();

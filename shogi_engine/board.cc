@@ -442,6 +442,59 @@ void ShogiBoard::GenerateDropMoves(MoveList& moves) const {
   }
 }
 
+Bitboard ShogiBoard::ComputeBlockersForKing(Color king_color) const {
+  Square ksq = king_sq_[king_color];
+  Bitboard occ = occupied();
+  Bitboard blockers = Bitboard::Zero();
+  Color enemy = ~king_color;
+
+  // Rook-type pinners (rook, dragon) — check rank and file directions.
+  Bitboard rook_pinners = pieces(enemy, kRook) | pieces(enemy, kDragon);
+  Bitboard rook_rays = ShogiTables::RookFileEffect(ksq, Bitboard::Zero()) |
+                       ShogiTables::RookRankEffect(ksq, Bitboard::Zero());
+  Bitboard rook_candidates = rook_rays & rook_pinners;
+
+  while (rook_candidates.Any()) {
+    Square pinner = rook_candidates.Pop();
+    Bitboard between = ShogiTables::BetweenBB[ksq.as_idx()][pinner.as_idx()] & occ;
+    // Exactly one piece between king and pinner = that piece is pinned.
+    if (between.Any() && !between.MoreThanOne()) {
+      blockers |= between;
+    }
+  }
+
+  // Bishop-type pinners (bishop, horse) — check diagonal directions.
+  Bitboard bishop_pinners = pieces(enemy, kBishop) | pieces(enemy, kHorse);
+  Bitboard bishop_rays = ShogiTables::BishopEffect(ksq, Bitboard::Zero());
+  Bitboard bishop_candidates = bishop_rays & bishop_pinners;
+
+  while (bishop_candidates.Any()) {
+    Square pinner = bishop_candidates.Pop();
+    Bitboard between = ShogiTables::BetweenBB[ksq.as_idx()][pinner.as_idx()] & occ;
+    if (between.Any() && !between.MoreThanOne()) {
+      blockers |= between;
+    }
+  }
+
+  // Lance pinners — only pin along the file (vertical), color-dependent direction.
+  Bitboard lance_pinners = pieces(enemy, kLance);
+  // An enemy lance attacks toward the king from the opposite direction.
+  // E.g., a BLACK lance moves up, so it must be BELOW the king to attack it.
+  // Look from the king in the king's own forward direction to find enemy lances.
+  Bitboard lance_rays = ShogiTables::LanceEffect(king_color, ksq, Bitboard::Zero());
+  Bitboard lance_candidates = lance_rays & lance_pinners;
+
+  while (lance_candidates.Any()) {
+    Square pinner = lance_candidates.Pop();
+    Bitboard between = ShogiTables::BetweenBB[ksq.as_idx()][pinner.as_idx()] & occ;
+    if (between.Any() && !between.MoreThanOne()) {
+      blockers |= between;
+    }
+  }
+
+  return blockers;
+}
+
 MoveList ShogiBoard::GenerateLegalMoves() {
   MoveList pseudo;
   pseudo.reserve(128);
@@ -449,40 +502,80 @@ MoveList ShogiBoard::GenerateLegalMoves() {
   GenerateBoardMoves(pseudo);
   GenerateDropMoves(pseudo);
 
-  // Filter: only keep moves that don't leave our king in check.
+  Color us = side_to_move_;
+  bool in_check = InCheck(us);
+
+  // When in check, fall back to DoMove+InCheck+UndoMove (correct for all cases).
+  // When not in check, use fast pin-aware legality test.
+  Bitboard pinned = Bitboard::Zero();
+  if (!in_check) {
+    pinned = ComputeBlockersForKing(us) & pieces(us);
+  }
+
   MoveList legal;
   legal.reserve(pseudo.size());
 
   for (const Move& m : pseudo) {
-    if (IsLegal(m)) {
+    if (in_check) {
+      // Slow path: verify by applying the move.
+      UndoInfo undo = DoMove(m);
+      bool ok = !InCheck(us);
+      // Pawn drop mate check: if this pawn drop gives check, verify it's not mate.
+      if (ok && m.is_drop() && m.drop_piece() == kPawn && InCheck(~us)) {
+        if (GenerateLegalMoves().empty()) {
+          ok = false;
+        }
+      }
+      UndoMove(m, undo);
+      if (!ok) continue;
       legal.push_back(m);
+    } else {
+      if (IsLegal(m, pinned)) {
+        legal.push_back(m);
+      }
     }
   }
 
   return legal;
 }
 
-bool ShogiBoard::IsLegal(Move m) {
-  // Apply the move in-place, check if our king is in check, then undo.
+bool ShogiBoard::IsLegal(Move m, const Bitboard& pinned) {
   Color us = side_to_move_;
-  UndoInfo undo = DoMove(m);
+  Square ksq = king_sq_[us];
 
-  bool legal = !InCheck(us);
-
-  // Additional check for pawn drop mate (打ち歩詰め):
-  // You can't drop a pawn that gives checkmate.
-  if (legal && m.is_drop() && m.drop_piece() == kPawn) {
-    if (InCheck(~us)) {
-      // The pawn drop gives check. Check if it's checkmate.
-      MoveList responses = GenerateLegalMoves();
-      if (responses.empty()) {
-        legal = false;
+  if (m.is_drop()) {
+    // Drop moves are always legal (nifu, rank restrictions already handled
+    // in GenerateDropMoves). Exception: pawn drop checkmate (uchifuzume).
+    if (m.drop_piece() == kPawn) {
+      // Check if this pawn drop gives check.
+      Square to = m.to();
+      if (ShogiTables::PawnEffectBB[to.as_idx()][us].Test(king_sq_[~us])) {
+        // The pawn drop gives check. Use DoMove to check if it's checkmate.
+        UndoInfo undo = DoMove(m);
+        bool is_mate = GenerateLegalMoves().empty();
+        UndoMove(m, undo);
+        if (is_mate) return false;  // Pawn drop checkmate is illegal.
       }
     }
+    return true;
   }
 
-  UndoMove(m, undo);
-  return legal;
+  Square from = m.from();
+  Square to = m.to();
+
+  // King moves: check if destination is attacked by enemy.
+  if (from == ksq) {
+    // Remove king from occupancy to detect X-ray attacks through king's source.
+    Bitboard occ_without_king = occupied() ^ ShogiTables::SquareBB[ksq.as_idx()];
+    return (AttackersTo(to, occ_without_king) & pieces(~us)).Empty();
+  }
+
+  // Non-king moves: legal unless the piece is pinned and moves off the pin line.
+  if (pinned.Empty()) return true;  // No pinned pieces at all — fast path.
+  if (!pinned.Test(from)) return true;  // This piece is not pinned.
+
+  // Piece is pinned: legal only if it moves along the pin line (from-king line).
+  return ShogiTables::LineBB[from.as_idx()][ksq.as_idx()].Test(to);
 }
 
 // =====================================================================

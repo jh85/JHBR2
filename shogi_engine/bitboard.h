@@ -383,6 +383,14 @@ extern Bitboard DragonStepBB[kSquareNB];
 // LanceMaskBB[sq][WHITE] = squares on same file with rank > sq's rank.
 extern Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
 
+// BetweenBB[sq1][sq2]: squares strictly between sq1 and sq2 on the same
+// rank, file, or diagonal. Empty if not aligned.
+extern Bitboard BetweenBB[kSquareNB][kSquareNB];
+
+// LineBB[sq1][sq2]: full line through sq1 and sq2 (rank, file, or diagonal).
+// Includes both endpoints and extends to board edges. Empty if not aligned.
+extern Bitboard LineBB[kSquareNB][kSquareNB];
+
 // Qugiy rook horizontal masks: [sq][0]=lo (left direction), [sq][1]=hi (right reversed).
 extern Bitboard QugiyRookMask[kSquareNB][2];
 
