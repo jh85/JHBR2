@@ -10,10 +10,12 @@
 */
 
 #include "usi/usi_engine.h"
+#include "shogi/bitboard.h"
 #include "shogi/encoder.h"
 
 int main(int /*argc*/, char* /*argv*/[]) {
   // Initialize static tables.
+  lczero::ShogiTables::Init();
   lczero::ShogiEncoderTables::Init();
 
   // Run USI engine.
