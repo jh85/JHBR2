@@ -24,6 +24,8 @@ Bitboard KingEffectBB[kSquareNB];
 Bitboard HorseStepBB[kSquareNB];
 Bitboard DragonStepBB[kSquareNB];
 Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
+Bitboard QugiyRookMask[kSquareNB][2];
+Bitboard256 QugiyBishopMask[kSquareNB][2];
 
 // Helper: build a step attack bitboard from a list of (df, dr) deltas.
 static Bitboard MakeStepBB(int f, int r,
@@ -92,6 +94,81 @@ static void InitStepAttacks() {
   }
 }
 
+// Build unobstructed ray in one diagonal/horizontal direction from (f,r).
+static Bitboard MakeRayBB(int f, int r, int df, int dr) {
+  Bitboard bb = Bitboard::Zero();
+  int nf = f + df, nr = r + dr;
+  while (nf >= 0 && nf < 9 && nr >= 0 && nr < 9) {
+    bb.Set(Square(File::FromIdx(nf), Rank::FromIdx(nr)));
+    nf += df;
+    nr += dr;
+  }
+  return bb;
+}
+
+static void InitQugiyMasks() {
+  for (int f = 0; f < 9; ++f) {
+    for (int r = 0; r < 9; ++r) {
+      int sq = f * 9 + r;
+
+      // --- Rook horizontal masks ---
+      // Left direction: increasing file (higher bit positions in same rank).
+      Bitboard left = MakeRayBB(f, r, +1, 0);
+      // Right direction: decreasing file.
+      Bitboard right = MakeRayBB(f, r, -1, 0);
+
+      Bitboard right_rev = right.byte_reverse();
+      Bitboard hi, lo;
+      Bitboard::Unpack(right_rev, left, hi, lo);
+      QugiyRookMask[sq][0] = lo;
+      QugiyRookMask[sq][1] = hi;
+
+      // --- Bishop diagonal masks ---
+      // 4 diagonals: LU (left-up), LD (left-down), RU (right-up), RD (right-down).
+      // "Left" = increasing file direction, "Right" = decreasing file direction.
+      // "Up" = decreasing rank (toward rank a), "Down" = increasing rank (toward rank i).
+      Bitboard lu = MakeRayBB(f, r, +1, -1);  // left-up
+      Bitboard ld = MakeRayBB(f, r, +1, +1);  // left-down
+      Bitboard ru = MakeRayBB(f, r, -1, -1);  // right-up
+      Bitboard rd = MakeRayBB(f, r, -1, +1);  // right-down
+
+      // Byte-reverse the right diagonals.
+      Bitboard ru_rev = ru.byte_reverse();
+      Bitboard rd_rev = rd.byte_reverse();
+
+      // Pack into Bitboard256 after unpack.
+      // We want two Bitboard256s (lo and hi) such that after
+      // Unpack(reversed_occ256, occ256, hi256, lo256), the masks align.
+      //
+      // After Unpack on Bitboard256:
+      //   lo_out.p[0] = occ.p[0]          (left diag, lower 64-bit)
+      //   lo_out.p[1] = rev_occ.p[0]      (right diag rev, lower 64-bit)
+      //   lo_out.p[2] = occ.p[0]          (second copy, left diag)
+      //   lo_out.p[3] = rev_occ.p[0]      (second copy, right diag rev)
+      //   hi_out.p[0] = occ.p[1]          (left diag, upper 64-bit)
+      //   hi_out.p[1] = rev_occ.p[1]      (right diag rev, upper 64-bit)
+      //   hi_out.p[2] = occ.p[1]          (second copy)
+      //   hi_out.p[3] = rev_occ.p[1]      (second copy)
+      //
+      // So the masks should be arranged in the same order:
+      //   lo_mask.p[0] = lu.p[0],  lo_mask.p[1] = ru_rev.p[0]
+      //   lo_mask.p[2] = ld.p[0],  lo_mask.p[3] = rd_rev.p[0]
+      //   hi_mask.p[0] = lu.p[1],  hi_mask.p[1] = ru_rev.p[1]
+      //   hi_mask.p[2] = ld.p[1],  hi_mask.p[3] = rd_rev.p[1]
+
+      // Construct the mask Bitboard256s:
+      // lo_mask = Bitboard256(Bitboard(lu.lo, ru_rev.lo), Bitboard(ld.lo, rd_rev.lo))
+      // hi_mask = Bitboard256(Bitboard(lu.hi, ru_rev.hi), Bitboard(ld.hi, rd_rev.hi))
+      QugiyBishopMask[sq][0] = Bitboard256(
+          Bitboard::FromRaw(lu.Lo(), ru_rev.Lo()),
+          Bitboard::FromRaw(ld.Lo(), rd_rev.Lo()));
+      QugiyBishopMask[sq][1] = Bitboard256(
+          Bitboard::FromRaw(lu.Hi(), ru_rev.Hi()),
+          Bitboard::FromRaw(ld.Hi(), rd_rev.Hi()));
+    }
+  }
+}
+
 void Init() {
   // Square bitboards.
   for (int sq = 0; sq < kSquareNB; ++sq) {
@@ -121,6 +198,9 @@ void Init() {
 
   // Step attack tables.
   InitStepAttacks();
+
+  // Qugiy sliding attack masks.
+  InitQugiyMasks();
 }
 
 }  // namespace ShogiTables

@@ -124,25 +124,14 @@ Bitboard ShogiBoard::SlidingAttacks(PieceType pt, Color c, Square sq,
   if (pt == kLance) {
     return ShogiTables::LanceEffect(c, sq, occ);
   }
-
-  Bitboard bb = Bitboard::Zero();
-  int f = sq.file().idx;
-  int r = sq.rank().idx;
-
   if (pt == kBishop || pt == kHorse) {
-    bb |= RayAttack(f, r, -1, -1, occ);
-    bb |= RayAttack(f, r, -1, +1, occ);
-    bb |= RayAttack(f, r, +1, -1, occ);
-    bb |= RayAttack(f, r, +1, +1, occ);
-  } else if (pt == kRook || pt == kDragon) {
-    // Vertical: use fast Qugiy lance trick.
-    bb |= ShogiTables::RookFileEffect(sq, occ);
-    // Horizontal: still loop-based.
-    bb |= RayAttack(f, r, -1, 0, occ);
-    bb |= RayAttack(f, r, +1, 0, occ);
+    return ShogiTables::BishopEffect(sq, occ);
   }
-
-  return bb;
+  if (pt == kRook || pt == kDragon) {
+    return ShogiTables::RookFileEffect(sq, occ) |
+           ShogiTables::RookRankEffect(sq, occ);
+  }
+  return Bitboard::Zero();
 }
 
 Bitboard ShogiBoard::PieceAttacks(PieceType pt, Color c, Square sq,
@@ -182,19 +171,13 @@ Bitboard ShogiBoard::AttackersTo(Square sq, const Bitboard& occ) const {
   // King.
   attackers |= ShogiTables::KingEffectBB[i] & by_type_[kKing.idx];
 
-  // Rook/Dragon: vertical via Qugiy, horizontal via RayAttack.
-  Bitboard straight = ShogiTables::RookFileEffect(sq, occ);
-  int f = sq.file().idx, r = sq.rank().idx;
-  straight |= RayAttack(f, r, -1, 0, occ);
-  straight |= RayAttack(f, r, +1, 0, occ);
+  // Rook/Dragon: full sliding (vertical + horizontal, both Qugiy).
+  Bitboard straight = ShogiTables::RookFileEffect(sq, occ) |
+                      ShogiTables::RookRankEffect(sq, occ);
   attackers |= straight & (by_type_[kRook.idx] | by_type_[kDragon.idx]);
 
-  // Bishop/Horse: diagonals (still loop-based).
-  Bitboard diag = Bitboard::Zero();
-  diag |= RayAttack(f, r, -1, -1, occ);
-  diag |= RayAttack(f, r, -1, +1, occ);
-  diag |= RayAttack(f, r, +1, -1, occ);
-  diag |= RayAttack(f, r, +1, +1, occ);
+  // Bishop/Horse: diagonal sliding (Qugiy).
+  Bitboard diag = ShogiTables::BishopEffect(sq, occ);
   attackers |= diag & (by_type_[kBishop.idx] | by_type_[kHorse.idx]);
 
   // Horse/Dragon step attacks.

@@ -222,6 +222,33 @@ class Bitboard {
     }
   }
 
+  // --- Qugiy algorithm support ---
+
+  // Byte-reverse the 128-bit value (reverses byte order and swaps halves).
+  // Used by Qugiy to transform right-direction rays for arithmetic.
+  Bitboard byte_reverse() const {
+    return Bitboard(__builtin_bswap64(p_[1]), __builtin_bswap64(p_[0]));
+  }
+
+  // Unpack: rearrange two Bitboards so that p[0] and p[1] from each
+  // end up in separate output Bitboards.
+  // hi_out = {lo_in.p[1], hi_in.p[1]}
+  // lo_out = {lo_in.p[0], hi_in.p[0]}
+  static void Unpack(const Bitboard& hi_in, const Bitboard& lo_in,
+                     Bitboard& hi_out, Bitboard& lo_out) {
+    hi_out = Bitboard(lo_in.p_[1], hi_in.p_[1]);
+    lo_out = Bitboard(lo_in.p_[0], hi_in.p_[0]);
+  }
+
+  // Decrement two (hi:lo) pairs as independent 128-bit integers.
+  // Each pair (hi.p[i], lo.p[i]) is treated as one 128-bit value.
+  static void Decrement(const Bitboard& hi_in, const Bitboard& lo_in,
+                        Bitboard& hi_out, Bitboard& lo_out) {
+    hi_out = Bitboard(hi_in.p_[0] - (lo_in.p_[0] == 0 ? 1 : 0),
+                      hi_in.p_[1] - (lo_in.p_[1] == 0 ? 1 : 0));
+    lo_out = Bitboard(lo_in.p_[0] - 1, lo_in.p_[1] - 1);
+  }
+
   // --- debug ---
 
   // Pretty-print the bitboard as a 9×9 grid.
@@ -231,6 +258,93 @@ class Bitboard {
   constexpr Bitboard(uint64_t p0, uint64_t p1) : p_{p0, p1} {}
 
   uint64_t p_[2];
+};
+
+// =====================================================================
+// Bitboard256 — pair of Bitboards for parallel Qugiy processing
+// =====================================================================
+// Used for bishop effects: processes all 4 diagonals as 2 independent
+// 128-bit decrements.
+
+class Bitboard256 {
+ public:
+  Bitboard256() = default;
+
+  // From two Bitboards.
+  Bitboard256(const Bitboard& b0, const Bitboard& b1)
+      : p_{b0.Lo(), b0.Hi(), b1.Lo(), b1.Hi()} {}
+
+  // Replicate one Bitboard.
+  explicit Bitboard256(const Bitboard& b)
+      : p_{b.Lo(), b.Hi(), b.Lo(), b.Hi()} {}
+
+  static Bitboard256 Zero() { return Bitboard256(Bitboard::Zero(), Bitboard::Zero()); }
+
+  Bitboard256& operator&=(const Bitboard256& o) {
+    p_[0] &= o.p_[0]; p_[1] &= o.p_[1];
+    p_[2] &= o.p_[2]; p_[3] &= o.p_[3];
+    return *this;
+  }
+  Bitboard256& operator^=(const Bitboard256& o) {
+    p_[0] ^= o.p_[0]; p_[1] ^= o.p_[1];
+    p_[2] ^= o.p_[2]; p_[3] ^= o.p_[3];
+    return *this;
+  }
+  Bitboard256 operator|(const Bitboard256& o) const {
+    Bitboard256 r;
+    r.p_[0] = p_[0] | o.p_[0]; r.p_[1] = p_[1] | o.p_[1];
+    r.p_[2] = p_[2] | o.p_[2]; r.p_[3] = p_[3] | o.p_[3];
+    return r;
+  }
+  Bitboard256 operator&(const Bitboard256& o) const {
+    Bitboard256 r;
+    r.p_[0] = p_[0] & o.p_[0]; r.p_[1] = p_[1] & o.p_[1];
+    r.p_[2] = p_[2] & o.p_[2]; r.p_[3] = p_[3] & o.p_[3];
+    return r;
+  }
+  Bitboard256 operator^(const Bitboard256& o) const {
+    Bitboard256 r;
+    r.p_[0] = p_[0] ^ o.p_[0]; r.p_[1] = p_[1] ^ o.p_[1];
+    r.p_[2] = p_[2] ^ o.p_[2]; r.p_[3] = p_[3] ^ o.p_[3];
+    return r;
+  }
+
+  Bitboard256 byte_reverse() const {
+    Bitboard256 r;
+    r.p_[0] = __builtin_bswap64(p_[1]);
+    r.p_[1] = __builtin_bswap64(p_[0]);
+    r.p_[2] = __builtin_bswap64(p_[3]);
+    r.p_[3] = __builtin_bswap64(p_[2]);
+    return r;
+  }
+
+  static void Unpack(const Bitboard256& hi_in, const Bitboard256& lo_in,
+                     Bitboard256& hi_out, Bitboard256& lo_out) {
+    hi_out.p_[0] = lo_in.p_[1]; hi_out.p_[1] = hi_in.p_[1];
+    hi_out.p_[2] = lo_in.p_[3]; hi_out.p_[3] = hi_in.p_[3];
+    lo_out.p_[0] = lo_in.p_[0]; lo_out.p_[1] = hi_in.p_[0];
+    lo_out.p_[2] = lo_in.p_[2]; lo_out.p_[3] = hi_in.p_[2];
+  }
+
+  static void Decrement(const Bitboard256& hi_in, const Bitboard256& lo_in,
+                        Bitboard256& hi_out, Bitboard256& lo_out) {
+    hi_out.p_[0] = hi_in.p_[0] - (lo_in.p_[0] == 0 ? 1 : 0);
+    hi_out.p_[1] = hi_in.p_[1] - (lo_in.p_[1] == 0 ? 1 : 0);
+    hi_out.p_[2] = hi_in.p_[2] - (lo_in.p_[2] == 0 ? 1 : 0);
+    hi_out.p_[3] = hi_in.p_[3] - (lo_in.p_[3] == 0 ? 1 : 0);
+    lo_out.p_[0] = lo_in.p_[0] - 1;
+    lo_out.p_[1] = lo_in.p_[1] - 1;
+    lo_out.p_[2] = lo_in.p_[2] - 1;
+    lo_out.p_[3] = lo_in.p_[3] - 1;
+  }
+
+  // Merge into a single Bitboard by ORing both halves.
+  Bitboard Merge() const {
+    return Bitboard::FromRaw(p_[0] | p_[2], p_[1] | p_[3]);
+  }
+
+ private:
+  uint64_t p_[4] = {};
 };
 
 // --- pre-computed tables (initialized at startup) ---
@@ -269,7 +383,55 @@ extern Bitboard DragonStepBB[kSquareNB];
 // LanceMaskBB[sq][WHITE] = squares on same file with rank > sq's rank.
 extern Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
 
+// Qugiy rook horizontal masks: [sq][0]=lo (left direction), [sq][1]=hi (right reversed).
+extern Bitboard QugiyRookMask[kSquareNB][2];
+
+// Qugiy bishop masks: [sq][0]=lo (left diagonals), [sq][1]=hi (right diagonals reversed).
+extern Bitboard256 QugiyBishopMask[kSquareNB][2];
+
 // --- Fast sliding attack functions ---
+
+// Rook rank (horizontal) effect using Qugiy algorithm. O(1), no loops.
+inline Bitboard RookRankEffect(Square sq, const Bitboard& occ) {
+  int i = sq.as_idx();
+  Bitboard rocc = occ.byte_reverse();
+
+  Bitboard hi, lo;
+  Bitboard::Unpack(rocc, occ, hi, lo);
+  hi &= QugiyRookMask[i][1];
+  lo &= QugiyRookMask[i][0];
+
+  Bitboard t1, t0;
+  Bitboard::Decrement(hi, lo, t1, t0);
+  t1 = (t1 ^ hi) & QugiyRookMask[i][1];
+  t0 = (t0 ^ lo) & QugiyRookMask[i][0];
+
+  Bitboard hi2, lo2;
+  Bitboard::Unpack(t1, t0, hi2, lo2);
+  return hi2.byte_reverse() | lo2;
+}
+
+// Bishop effect using Qugiy algorithm with Bitboard256. O(1), no loops.
+inline Bitboard BishopEffect(Square sq, const Bitboard& occ) {
+  int i = sq.as_idx();
+  Bitboard256 occ2(occ);
+  Bitboard256 rocc2(occ.byte_reverse());
+
+  Bitboard256 hi, lo;
+  Bitboard256::Unpack(rocc2, occ2, hi, lo);
+  hi &= QugiyBishopMask[i][1];
+  lo &= QugiyBishopMask[i][0];
+
+  Bitboard256 t1, t0;
+  Bitboard256::Decrement(hi, lo, t1, t0);
+  t1 = (t1 ^ hi) & QugiyBishopMask[i][1];
+  t0 = (t0 ^ lo) & QugiyBishopMask[i][0];
+
+  Bitboard256 hi2, lo2;
+  Bitboard256::Unpack(t1, t0, hi2, lo2);
+  Bitboard256 result = hi2.byte_reverse() | lo2;
+  return result.Merge();
+}
 
 // Lance effect using Qugiy bit-subtraction trick. O(1), no loops.
 inline Bitboard LanceEffect(Color c, Square sq, const Bitboard& occ) {
