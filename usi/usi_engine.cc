@@ -251,21 +251,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 
   // Check entering-king declaration.
   if (board_.CanDeclareWin()) {
-    Log("Declaring win (entering king)");
     Send("bestmove win");
     return;
-  }
-
-  // Log position and legal moves for debugging.
-  Log("SFEN: " + board_.ToSfen());
-  {
-    auto legal = board_.GenerateLegalMoves();
-    std::string legal_str;
-    for (const auto& m : legal) {
-      if (!legal_str.empty()) legal_str += " ";
-      legal_str += m.ToString();
-    }
-    Log("Legal moves (" + std::to_string(legal.size()) + "): " + legal_str);
   }
 
   // Set search limits.
@@ -279,22 +266,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   SearchResult result = search_->Search(board_, game_ply_);
 
   if (result.best_move.is_null()) {
-    Log("Search returned null move, resigning");
     Send("bestmove resign");
     return;
-  }
-
-  // Verify bestmove is in legal moves.
-  {
-    auto legal = board_.GenerateLegalMoves();
-    bool found = false;
-    for (const auto& m : legal) {
-      if (m.ToString() == result.best_move.ToString()) { found = true; break; }
-    }
-    if (!found) {
-      Log("WARNING: bestmove " + result.best_move.ToString() +
-          " is NOT in legal moves!");
-    }
   }
 
   // Format info string.
