@@ -31,8 +31,23 @@ endif()
 
 if(ONNXRUNTIME_ROOT)
   message(STATUS "ONNX Runtime: ${ONNXRUNTIME_ROOT}")
-  set(ORT_INCLUDE ${ONNXRUNTIME_ROOT}/include)
-  set(ORT_LIB ${ONNXRUNTIME_ROOT}/lib)
+  # Support both pre-built release layout and from-source build layout
+  if(EXISTS ${ONNXRUNTIME_ROOT}/include/onnxruntime/core/session/onnxruntime_cxx_api.h)
+    # From-source build: headers are in include/onnxruntime/core/session/
+    set(ORT_INCLUDE ${ONNXRUNTIME_ROOT}/include/onnxruntime/core/session)
+    # Look for the shared library in build/Linux/Release or build/Linux/Debug
+    if(EXISTS ${ONNXRUNTIME_ROOT}/build/Linux/Release/libonnxruntime.so)
+      set(ORT_LIB ${ONNXRUNTIME_ROOT}/build/Linux/Release)
+    elseif(EXISTS ${ONNXRUNTIME_ROOT}/build/Linux/Debug/libonnxruntime.so)
+      set(ORT_LIB ${ONNXRUNTIME_ROOT}/build/Linux/Debug)
+    else()
+      message(FATAL_ERROR "Found ONNX Runtime source tree but no built libraries in build/Linux/")
+    endif()
+  else()
+    # Pre-built release package layout
+    set(ORT_INCLUDE ${ONNXRUNTIME_ROOT}/include)
+    set(ORT_LIB ${ONNXRUNTIME_ROOT}/lib)
+  endif()
 else()
   message(WARNING "ONNXRUNTIME_ROOT not set. NN evaluator will not build. "
     "Download from: https://github.com/microsoft/onnxruntime/releases")

@@ -116,6 +116,13 @@ void USIEngine::CmdIsReady() {
   Send("readyok");
 }
 
+static std::string ToLower(const std::string& s) {
+  std::string r = s;
+  std::transform(r.begin(), r.end(), r.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return r;
+}
+
 void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   // Parse: setoption name <NAME> value <VALUE>
   std::string name, value;
@@ -127,21 +134,23 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     }
   }
 
-  if (name == "MaxNodes") {
+  std::string name_lower = ToLower(name);
+
+  if (name_lower == "maxnodes") {
     max_nodes_ = std::stoi(value);
     config_.max_nodes = max_nodes_;
-  } else if (name == "OnnxModel") {
+  } else if (name_lower == "onnxmodel") {
     onnx_path_ = value;
-  } else if (name == "NoiseEpsilon") {
+  } else if (name_lower == "noiseepsilon") {
     noise_epsilon_ = std::stof(value);
     config_.noise_epsilon = noise_epsilon_;
-  } else if (name == "LeafDfpnNodes") {
+  } else if (name_lower == "leafdfpnnodes") {
     leaf_dfpn_nodes_ = std::stoi(value);
     config_.leaf_dfpn_nodes = leaf_dfpn_nodes_;
-  } else if (name == "PvDfpnNodes") {
+  } else if (name_lower == "pvdfpnnodes") {
     pv_dfpn_nodes_ = std::stoi(value);
     config_.pv_dfpn_nodes = pv_dfpn_nodes_;
-  } else if (name == "UseGPU") {
+  } else if (name_lower == "usegpu") {
     use_gpu_ = (value == "true");
   }
 
