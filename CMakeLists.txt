@@ -120,6 +120,10 @@ if(ORT_INCLUDE)
   target_include_directories(jhbr2 PRIVATE ${ORT_INCLUDE})
 endif()
 
-# ---- Optional: test executable ----
-# add_executable(jhbr2_test test/test_main.cc)
-# target_link_libraries(jhbr2_test PRIVATE mcts mate_solver shogi_core)
+# ---- Test: move generation correctness ----
+add_executable(test_movegen test/test_movegen.cc)
+target_link_libraries(test_movegen PRIVATE shogi_core)
+
+# ---- Test: game replay (DoMove chain) ----
+add_executable(test_replay test/test_replay.cc)
+target_link_libraries(test_replay PRIVATE shogi_core)
