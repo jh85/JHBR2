@@ -249,6 +249,67 @@ extern Bitboard RankBB[kBoardSize];
 // Promotion zone bitboards for each color.
 extern Bitboard PromotionZoneBB[COLOR_NB];
 
+// --- Precomputed step attack tables ---
+// Indexed by [square][color].  For king, color is irrelevant (symmetric).
+
+extern Bitboard PawnEffectBB[kSquareNB][COLOR_NB];
+extern Bitboard KnightEffectBB[kSquareNB][COLOR_NB];
+extern Bitboard SilverEffectBB[kSquareNB][COLOR_NB];
+extern Bitboard GoldEffectBB[kSquareNB][COLOR_NB];
+extern Bitboard KingEffectBB[kSquareNB];
+
+// Horse extra steps (4 cardinal: up/down/left/right).
+extern Bitboard HorseStepBB[kSquareNB];
+
+// Dragon extra steps (4 diagonal: NE/NW/SE/SW).
+extern Bitboard DragonStepBB[kSquareNB];
+
+// Lance ray masks (all squares the lance could reach, ignoring blockers).
+// LanceMaskBB[sq][BLACK] = squares on same file with rank < sq's rank.
+// LanceMaskBB[sq][WHITE] = squares on same file with rank > sq's rank.
+extern Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
+
+// --- Fast sliding attack functions ---
+
+// Lance effect using Qugiy bit-subtraction trick. O(1), no loops.
+inline Bitboard LanceEffect(Color c, Square sq, const Bitboard& occ) {
+  int i = sq.as_idx();
+  int part = Bitboard::Part(sq);
+
+  if (c == WHITE) {
+    // WHITE moves toward higher bits (toward rank i).
+    if (part == 0) {
+      uint64_t mask = LanceMaskBB[i][WHITE].Lo();
+      uint64_t mocc = occ.Lo() & mask;
+      return Bitboard::FromRaw((mocc ^ (mocc - 1)) & mask, 0);
+    } else {
+      uint64_t mask = LanceMaskBB[i][WHITE].Hi();
+      uint64_t mocc = occ.Hi() & mask;
+      return Bitboard::FromRaw(0, (mocc ^ (mocc - 1)) & mask);
+    }
+  } else {
+    // BLACK moves toward lower bits (toward rank a).
+    if (part == 0) {
+      uint64_t mask = LanceMaskBB[i][BLACK].Lo();
+      uint64_t mocc = occ.Lo() & mask;
+      // MSB trick: find highest set bit in mocc (first blocker).
+      // mocc|1 avoids UB when mocc==0; effect becomes full mask.
+      int msb = 63 - __builtin_clzll(mocc | 1);
+      return Bitboard::FromRaw((UINT64_C(0xFFFFFFFFFFFFFFFF) << msb) & mask, 0);
+    } else {
+      uint64_t mask = LanceMaskBB[i][BLACK].Hi();
+      uint64_t mocc = occ.Hi() & mask;
+      int msb = 63 - __builtin_clzll(mocc | 1);
+      return Bitboard::FromRaw(0, (UINT64_C(0xFFFFFFFFFFFFFFFF) << msb) & mask);
+    }
+  }
+}
+
+// Rook file (vertical) effect = BLACK lance + WHITE lance.
+inline Bitboard RookFileEffect(Square sq, const Bitboard& occ) {
+  return LanceEffect(BLACK, sq, occ) | LanceEffect(WHITE, sq, occ);
+}
+
 // Initialize all tables.  Must be called once at startup.
 void Init();
 

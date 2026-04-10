@@ -70,7 +70,7 @@ class MCTSSearch {
 
   // Run search from the given board position.
   // game_ply: current game move number (for temperature scheduling).
-  SearchResult Search(const ShogiBoard& board, int game_ply = 1);
+  SearchResult Search(ShogiBoard board, int game_ply = 1);
 
   // Set stop flag (can be called from another thread).
   void Stop() { stop_ = true; }
@@ -103,7 +103,7 @@ class MCTSSearch {
   // --- Mate search ---
 
   // Check for 1-ply mate (essentially free).
-  Move Mate1Ply(const ShogiBoard& board);
+  Move Mate1Ply(ShogiBoard& board);
 
   // PV mate search: deep df-pn along principal variation.
   void PvMateSearch(Node* root, const ShogiBoard& root_board);

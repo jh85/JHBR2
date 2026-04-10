@@ -136,8 +136,8 @@ class MateDfpnSolver {
   //   kNoMateMove = proved that no forced mate exists
   //
   // The side_to_move of the board is the attacker (OR node).
-  Move search(const ShogiBoard& board, size_t nodes_limit);
-  Move search(const ShogiBoard& board) {
+  Move search(ShogiBoard board, size_t nodes_limit);
+  Move search(ShogiBoard board) {
     return search(board, default_nodes_limit_);
   }
 
@@ -182,7 +182,7 @@ class MateDfpnSolver {
                              uint32_t& second_pn, uint32_t& second_dn);
 
   // Generate checking moves (for OR node / attacker).
-  MoveList GenerateChecks(const ShogiBoard& board);
+  MoveList GenerateChecks(ShogiBoard& board);
 
   // 1-ply mate check (fast shortcut).
   Move Mate1Ply(ShogiBoard& board);

@@ -39,7 +39,7 @@ MateDfpnSolver::MateDfpnSolver(size_t default_nodes_limit)
 // Main search entry point
 // =====================================================================
 
-Move MateDfpnSolver::search(const ShogiBoard& board, size_t nodes_limit) {
+Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
   stop_ = false;
   nodes_searched_ = 0;
   mate_ply_ = 0;
@@ -56,7 +56,7 @@ Move MateDfpnSolver::search(const ShogiBoard& board, size_t nodes_limit) {
   root.pn = 1;
   root.dn = 1;
 
-  ShogiBoard pos = board;
+  ShogiBoard& pos = board;
 
   // Push initial hash for repetition detection.
   path_hashes_.push_back(pos.Hash());
@@ -199,7 +199,7 @@ void MateDfpnSolver::ExpandNode(ShogiBoard& board, DfpnNode& node, int ply) {
   }
 
   node.children = children;
-  node.child_num = static_cast<uint8_t>(std::min(moves.size(), (size_t)254));
+  node.child_num = static_cast<uint8_t>(std::min((int)moves.size(), 254));
 
   for (size_t i = 0; i < moves.size() && i < 254; i++) {
     children[i].last_move = moves[i];
@@ -315,17 +315,17 @@ DfpnNode* MateDfpnSolver::SelectBestChild(DfpnNode& node,
 // Generate checking moves (for OR node)
 // =====================================================================
 
-MoveList MateDfpnSolver::GenerateChecks(const ShogiBoard& board) {
+MoveList MateDfpnSolver::GenerateChecks(ShogiBoard& board) {
   // Generate all legal moves, then filter for those that give check.
   MoveList all_moves = board.GenerateLegalMoves();
   MoveList checks;
 
   for (const Move& m : all_moves) {
-    ShogiBoard copy = board;
-    copy.DoMove(m);
-    if (copy.InCheck()) {
+    UndoInfo undo = board.DoMove(m);
+    if (board.InCheck()) {
       checks.push_back(m);
     }
+    board.UndoMove(m, undo);
   }
 
   return checks;
@@ -338,15 +338,14 @@ MoveList MateDfpnSolver::GenerateChecks(const ShogiBoard& board) {
 Move MateDfpnSolver::Mate1Ply(ShogiBoard& board) {
   MoveList moves = board.GenerateLegalMoves();
   for (const Move& m : moves) {
-    ShogiBoard copy = board;
-    UndoInfo undo = copy.DoMove(m);
-    if (copy.InCheck(copy.side_to_move())) {
-      // We just moved, so opponent is now to move.
-      // Check if they have no legal evasions.
-      if (copy.GenerateLegalMoves().empty()) {
+    UndoInfo undo = board.DoMove(m);
+    if (board.InCheck(board.side_to_move())) {
+      if (board.GenerateLegalMoves().empty()) {
+        board.UndoMove(m, undo);
         return m;
       }
     }
+    board.UndoMove(m, undo);
   }
   return Move();
 }

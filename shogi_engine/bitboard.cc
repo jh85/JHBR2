@@ -5,6 +5,9 @@
 
 #include "shogi/bitboard.h"
 
+#include <initializer_list>
+#include <utility>
+
 namespace lczero {
 namespace ShogiTables {
 
@@ -12,6 +15,82 @@ Bitboard SquareBB[kSquareNB];
 Bitboard FileBB[kBoardSize];
 Bitboard RankBB[kBoardSize];
 Bitboard PromotionZoneBB[COLOR_NB];
+
+Bitboard PawnEffectBB[kSquareNB][COLOR_NB];
+Bitboard KnightEffectBB[kSquareNB][COLOR_NB];
+Bitboard SilverEffectBB[kSquareNB][COLOR_NB];
+Bitboard GoldEffectBB[kSquareNB][COLOR_NB];
+Bitboard KingEffectBB[kSquareNB];
+Bitboard HorseStepBB[kSquareNB];
+Bitboard DragonStepBB[kSquareNB];
+Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
+
+// Helper: build a step attack bitboard from a list of (df, dr) deltas.
+static Bitboard MakeStepBB(int f, int r,
+                           const std::initializer_list<std::pair<int,int>>& deltas) {
+  Bitboard bb = Bitboard::Zero();
+  for (auto [df, dr] : deltas) {
+    int nf = f + df, nr = r + dr;
+    if (nf >= 0 && nf < 9 && nr >= 0 && nr < 9)
+      bb.Set(Square(File::FromIdx(nf), Rank::FromIdx(nr)));
+  }
+  return bb;
+}
+
+static void InitStepAttacks() {
+  for (int f = 0; f < 9; ++f) {
+    for (int r = 0; r < 9; ++r) {
+      int sq = f * 9 + r;
+
+      // Pawn: one step forward.
+      // BLACK forward = rank-1, WHITE forward = rank+1.
+      PawnEffectBB[sq][BLACK] = MakeStepBB(f, r, {{0, -1}});
+      PawnEffectBB[sq][WHITE] = MakeStepBB(f, r, {{0, +1}});
+
+      // Knight: 2 forward + 1 sideways.
+      KnightEffectBB[sq][BLACK] = MakeStepBB(f, r, {{-1, -2}, {+1, -2}});
+      KnightEffectBB[sq][WHITE] = MakeStepBB(f, r, {{-1, +2}, {+1, +2}});
+
+      // Silver: forward + 2 forward-diagonals + 2 backward-diagonals.
+      SilverEffectBB[sq][BLACK] = MakeStepBB(f, r,
+          {{0,-1}, {-1,-1}, {+1,-1}, {-1,+1}, {+1,+1}});
+      SilverEffectBB[sq][WHITE] = MakeStepBB(f, r,
+          {{0,+1}, {-1,+1}, {+1,+1}, {-1,-1}, {+1,-1}});
+
+      // Gold (also used for promoted pawn/lance/knight/silver):
+      // forward + 2 forward-diagonals + left + right + backward.
+      GoldEffectBB[sq][BLACK] = MakeStepBB(f, r,
+          {{0,-1}, {-1,-1}, {+1,-1}, {-1,0}, {+1,0}, {0,+1}});
+      GoldEffectBB[sq][WHITE] = MakeStepBB(f, r,
+          {{0,+1}, {-1,+1}, {+1,+1}, {-1,0}, {+1,0}, {0,-1}});
+
+      // King: all 8 neighbors.
+      KingEffectBB[sq] = MakeStepBB(f, r,
+          {{-1,-1}, {-1,0}, {-1,+1}, {0,-1}, {0,+1}, {+1,-1}, {+1,0}, {+1,+1}});
+
+      // Horse extra steps: 4 cardinal directions.
+      HorseStepBB[sq] = MakeStepBB(f, r,
+          {{0,-1}, {0,+1}, {-1,0}, {+1,0}});
+
+      // Dragon extra steps: 4 diagonal directions.
+      DragonStepBB[sq] = MakeStepBB(f, r,
+          {{-1,-1}, {-1,+1}, {+1,-1}, {+1,+1}});
+
+      // Lance masks: all squares on the same file in the forward direction.
+      // BLACK moves toward rank 0 (lower bits), WHITE toward rank 8 (higher bits).
+      {
+        Bitboard black_mask = Bitboard::Zero();
+        Bitboard white_mask = Bitboard::Zero();
+        for (int rr = 0; rr < r; ++rr)  // ranks above (BLACK direction)
+          black_mask.Set(Square(File::FromIdx(f), Rank::FromIdx(rr)));
+        for (int rr = r + 1; rr < 9; ++rr)  // ranks below (WHITE direction)
+          white_mask.Set(Square(File::FromIdx(f), Rank::FromIdx(rr)));
+        LanceMaskBB[sq][BLACK] = black_mask;
+        LanceMaskBB[sq][WHITE] = white_mask;
+      }
+    }
+  }
+}
 
 void Init() {
   // Square bitboards.
@@ -39,6 +118,9 @@ void Init() {
   //                 WHITE = ranks 6,7,8 (bottom 3 rows).
   PromotionZoneBB[BLACK] = RankBB[0] | RankBB[1] | RankBB[2];
   PromotionZoneBB[WHITE] = RankBB[6] | RankBB[7] | RankBB[8];
+
+  // Step attack tables.
+  InitStepAttacks();
 }
 
 }  // namespace ShogiTables

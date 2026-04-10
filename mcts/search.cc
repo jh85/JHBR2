@@ -43,7 +43,7 @@ MCTSSearch::~MCTSSearch() = default;
 // Main search loop
 // =====================================================================
 
-SearchResult MCTSSearch::Search(const ShogiBoard& board, int game_ply) {
+SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
   stop_ = false;
 
   MoveList legal_moves = board.GenerateLegalMoves();
@@ -607,17 +607,16 @@ void MCTSSearch::AddDirichletNoise(Node* root) {
   }
 }
 
-Move MCTSSearch::Mate1Ply(const ShogiBoard& board) {
+Move MCTSSearch::Mate1Ply(ShogiBoard& board) {
   // Try each legal move; if it results in checkmate, return it.
   // This is extremely fast for typical positions because we bail
   // at the first mate found.
   MoveList moves = board.GenerateLegalMoves();
   for (const Move& m : moves) {
-    ShogiBoard copy = board;
-    copy.DoMove(m);
-    if (copy.GenerateLegalMoves().empty()) {
-      return m;  // Opponent has no legal moves = checkmate
-    }
+    UndoInfo undo = board.DoMove(m);
+    bool is_mate = board.GenerateLegalMoves().empty();
+    board.UndoMove(m, undo);
+    if (is_mate) return m;
   }
   return Move();  // No 1-ply mate
 }

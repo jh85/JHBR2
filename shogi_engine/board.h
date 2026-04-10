@@ -115,12 +115,12 @@ class ShogiBoard {
   // --- Move generation ---
 
   // Generate all legal moves for the side to move.
-  MoveList GenerateLegalMoves() const;
+  MoveList GenerateLegalMoves();
 
   // Is the given move legal in the current position?
   // (Does not check if the move is well-formed — only checks legality
   // assuming a valid from/to/flags encoding.)
-  bool IsLegal(Move m) const;
+  bool IsLegal(Move m);
 
   // --- Move application ---
 
@@ -140,7 +140,7 @@ class ShogiBoard {
     // Repetition (sennichite) handling is left to the search layer.
   };
 
-  GameResult ComputeGameResult() const;
+  GameResult ComputeGameResult();
 
   // --- Entering-king declaration (入玉宣言) ---
 

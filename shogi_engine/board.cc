@@ -9,25 +9,65 @@
 #include <cassert>
 #include <sstream>
 
-// =====================================================================
-// Simple hash combiner (same approach as lc0's HashCat)
-// =====================================================================
-
-namespace {
-
-uint64_t HashMix(uint64_t val) {
-  return UINT64_C(0xfad0d7f2fbb059f1) * (val + UINT64_C(0xbaad41cdcb839961)) +
-         UINT64_C(0x7acec0050bf82f43) * ((val >> 31) + UINT64_C(0xd571b3a92b1b2755));
-}
-
-uint64_t HashCombine(uint64_t hash, uint64_t x) {
-  hash ^= UINT64_C(0x299799adf0d95def) + HashMix(x) + (hash << 6) + (hash >> 2);
-  return hash;
-}
-
-}  // namespace
-
 namespace lczero {
+
+// =====================================================================
+// Zobrist hash tables
+// =====================================================================
+
+namespace Zobrist {
+
+// Random keys for each piece on each square.
+// Index: [piece.val][square] where piece.val covers BLACK (1-14) and WHITE (17-30).
+static uint64_t Psq[32][kSquareNB];
+
+// Random keys for hand piece counts.
+// Index: [color][piece_type_idx][count] (max count: pawn=18, others≤4).
+static uint64_t HandPiece[COLOR_NB][8][20];
+
+// XOR this when side to move is WHITE.
+static uint64_t Side;
+
+// Simple PRNG for table initialization (splitmix64).
+static uint64_t s_seed = UINT64_C(0x70736575646F7267);
+
+static uint64_t Rand64() {
+  s_seed += UINT64_C(0x9E3779B97F4A7C15);
+  uint64_t z = s_seed;
+  z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+  z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+  return z ^ (z >> 31);
+}
+
+static bool s_initialized = false;
+
+void Init() {
+  if (s_initialized) return;
+  s_initialized = true;
+
+  for (int pc = 0; pc < 32; ++pc)
+    for (int sq = 0; sq < kSquareNB; ++sq)
+      Psq[pc][sq] = Rand64();
+
+  for (int c = 0; c < COLOR_NB; ++c)
+    for (int pt = 0; pt < 8; ++pt)
+      for (int n = 0; n < 20; ++n)
+        HandPiece[c][pt][n] = Rand64();
+
+  Side = Rand64();
+}
+
+}  // namespace Zobrist
+
+// Hash a hand by XORing in the Zobrist key for each piece's count.
+static uint64_t HashHand(Color c, const Hand& h) {
+  uint64_t z = 0;
+  for (int pt = kPawn.idx; pt <= kGold.idx; ++pt) {
+    int n = h.Count(PieceType::FromIdx(pt));
+    if (n > 0) z ^= Zobrist::HandPiece[c][pt][n];
+  }
+  return z;
+}
 
 // =====================================================================
 // Step attack tables (non-sliding pieces)
@@ -43,62 +83,17 @@ namespace lczero {
 // We compute these dynamically — no static tables needed for correctness.
 
 Bitboard ShogiBoard::StepAttacks(PieceType pt, Color c, Square sq) {
-  Bitboard bb = Bitboard::Zero();
-  int f = sq.file().idx;
-  int r = sq.rank().idx;
-
-  // Helper: add square if in bounds.
-  auto add = [&](int df, int dr) {
-    int nf = f + df, nr = r + dr;
-    if (nf >= 0 && nf < 9 && nr >= 0 && nr < 9) {
-      bb.Set(Square(File::FromIdx(nf), Rank::FromIdx(nr)));
-    }
-  };
-
-  // "Forward" depends on color: BLACK moves toward rank 0 (up), WHITE toward
-  // rank 8 (down).
-  int fwd = (c == BLACK) ? -1 : 1;
-
-  if (pt == kPawn) {
-    add(0, fwd);  // one step forward
-  } else if (pt == kKnight) {
-    // Shogi knight: 2 forward + 1 left/right (only forward, not backward)
-    add(-1, 2 * fwd);
-    add(+1, 2 * fwd);
-  } else if (pt == kSilver) {
-    add(0, fwd);      // forward
-    add(-1, fwd);     // forward-right
-    add(+1, fwd);     // forward-left
-    add(-1, -fwd);    // backward-right
-    add(+1, -fwd);    // backward-left
-  } else if (pt == kGold || pt == kProPawn || pt == kProLance ||
-             pt == kProKnight || pt == kProSilver) {
-    // Gold and all promoted minor pieces move the same way.
-    add(0, fwd);      // forward
-    add(-1, fwd);     // forward-right
-    add(+1, fwd);     // forward-left
-    add(-1, 0);       // right
-    add(+1, 0);       // left
-    add(0, -fwd);     // backward
-  } else if (pt == kKing) {
-    for (int df = -1; df <= 1; ++df)
-      for (int dr = -1; dr <= 1; ++dr)
-        if (df || dr) add(df, dr);
-  }
-  // Horse and Dragon step attacks are handled separately (they also have
-  // sliding components, so they go through PieceAttacks).
-  // Horse extra steps: 4 cardinal directions (in addition to bishop slides)
-  else if (pt == kHorse) {
-    add(0, -1); add(0, +1); add(-1, 0); add(+1, 0);
-  }
-  // Dragon extra steps: 4 diagonal directions (in addition to rook slides)
-  else if (pt == kDragon) {
-    add(-1, -1); add(-1, +1); add(+1, -1); add(+1, +1);
-  }
-  // Lance has no step attacks (it's purely sliding).
-  // Bishop and Rook have no step attacks (purely sliding).
-
-  return bb;
+  int i = sq.as_idx();
+  if (pt == kPawn)    return ShogiTables::PawnEffectBB[i][c];
+  if (pt == kKnight)  return ShogiTables::KnightEffectBB[i][c];
+  if (pt == kSilver)  return ShogiTables::SilverEffectBB[i][c];
+  if (pt == kGold || pt == kProPawn || pt == kProLance ||
+      pt == kProKnight || pt == kProSilver)
+                      return ShogiTables::GoldEffectBB[i][c];
+  if (pt == kKing)    return ShogiTables::KingEffectBB[i];
+  if (pt == kHorse)   return ShogiTables::HorseStepBB[i];
+  if (pt == kDragon)  return ShogiTables::DragonStepBB[i];
+  return Bitboard::Zero();
 }
 
 // =====================================================================
@@ -126,21 +121,23 @@ Bitboard RayAttack(int f, int r, int df, int dr, const Bitboard& occ) {
 
 Bitboard ShogiBoard::SlidingAttacks(PieceType pt, Color c, Square sq,
                                     const Bitboard& occ) const {
+  if (pt == kLance) {
+    return ShogiTables::LanceEffect(c, sq, occ);
+  }
+
   Bitboard bb = Bitboard::Zero();
   int f = sq.file().idx;
   int r = sq.rank().idx;
-  int fwd = (c == BLACK) ? -1 : 1;
 
-  if (pt == kLance) {
-    bb |= RayAttack(f, r, 0, fwd, occ);
-  } else if (pt == kBishop || pt == kHorse) {
+  if (pt == kBishop || pt == kHorse) {
     bb |= RayAttack(f, r, -1, -1, occ);
     bb |= RayAttack(f, r, -1, +1, occ);
     bb |= RayAttack(f, r, +1, -1, occ);
     bb |= RayAttack(f, r, +1, +1, occ);
   } else if (pt == kRook || pt == kDragon) {
-    bb |= RayAttack(f, r, 0, -1, occ);
-    bb |= RayAttack(f, r, 0, +1, occ);
+    // Vertical: use fast Qugiy lance trick.
+    bb |= ShogiTables::RookFileEffect(sq, occ);
+    // Horizontal: still loop-based.
     bb |= RayAttack(f, r, -1, 0, occ);
     bb |= RayAttack(f, r, +1, 0, occ);
   }
@@ -166,49 +163,43 @@ Bitboard ShogiBoard::PieceAttacks(PieceType pt, Color c, Square sq,
 // =====================================================================
 
 Bitboard ShogiBoard::AttackersTo(Square sq, const Bitboard& occ) const {
+  int i = sq.as_idx();
   Bitboard attackers = Bitboard::Zero();
 
-  // For each color, check which pieces can reach this square.
+  // Step attacks: reverse-perspective lookup.
   for (Color c : {BLACK, WHITE}) {
-    // Step pieces: check if sq is in their attack set.
-    // Trick: if a pawn at sq (as color ~c) attacks a square S,
-    // then a pawn at S (as color c) can attack sq.
-    // So we compute attacks FROM sq AS the defender, and intersect with
-    // attacker pieces.
+    attackers |= ShogiTables::PawnEffectBB[i][~c] & pieces(c, kPawn);
+    attackers |= ShogiTables::KnightEffectBB[i][~c] & pieces(c, kKnight);
+    attackers |= ShogiTables::SilverEffectBB[i][~c] & pieces(c, kSilver);
+    attackers |= ShogiTables::GoldEffectBB[i][~c] &
+        (pieces(c, kGold) | pieces(c, kProPawn) | pieces(c, kProLance) |
+         pieces(c, kProKnight) | pieces(c, kProSilver));
 
-    // Pawn, Knight, Silver, Gold (and promoted equivalents), King
-    PieceType step_types[] = {kPawn, kKnight, kSilver, kGold,
-                              kProPawn, kProLance, kProKnight, kProSilver,
-                              kKing};
-    for (PieceType pt : step_types) {
-      // Attacks from sq as if we were the OTHER color's piece of type pt
-      // → these are the squares where an attacker of type pt/color c
-      //   would need to be to attack sq.
-      Bitboard reverse = StepAttacks(pt, ~c, sq);
-      attackers |= (reverse & pieces(c, pt));
-    }
-
-    // Sliding pieces: lance, bishop, rook, horse, dragon.
-    // For lance, direction depends on color.
-    Bitboard lance_atk = SlidingAttacks(kLance, ~c, sq, occ);
-    attackers |= (lance_atk & pieces(c, kLance));
-
-    // Bishop/Horse share diagonal slides.
-    Bitboard diag_atk = SlidingAttacks(kBishop, c, sq, occ);
-    attackers |= (diag_atk & (pieces(c, kBishop) | pieces(c, kHorse)));
-
-    // Rook/Dragon share straight slides.
-    Bitboard straight_atk = SlidingAttacks(kRook, c, sq, occ);
-    attackers |= (straight_atk & (pieces(c, kRook) | pieces(c, kDragon)));
-
-    // Horse step attacks (cardinal directions).
-    Bitboard horse_step = StepAttacks(kHorse, ~c, sq);
-    attackers |= (horse_step & pieces(c, kHorse));
-
-    // Dragon step attacks (diagonal directions).
-    Bitboard dragon_step = StepAttacks(kDragon, ~c, sq);
-    attackers |= (dragon_step & pieces(c, kDragon));
+    // Lance: use fast Qugiy effect (direction depends on color).
+    attackers |= ShogiTables::LanceEffect(~c, sq, occ) & pieces(c, kLance);
   }
+
+  // King.
+  attackers |= ShogiTables::KingEffectBB[i] & by_type_[kKing.idx];
+
+  // Rook/Dragon: vertical via Qugiy, horizontal via RayAttack.
+  Bitboard straight = ShogiTables::RookFileEffect(sq, occ);
+  int f = sq.file().idx, r = sq.rank().idx;
+  straight |= RayAttack(f, r, -1, 0, occ);
+  straight |= RayAttack(f, r, +1, 0, occ);
+  attackers |= straight & (by_type_[kRook.idx] | by_type_[kDragon.idx]);
+
+  // Bishop/Horse: diagonals (still loop-based).
+  Bitboard diag = Bitboard::Zero();
+  diag |= RayAttack(f, r, -1, -1, occ);
+  diag |= RayAttack(f, r, -1, +1, occ);
+  diag |= RayAttack(f, r, +1, -1, occ);
+  diag |= RayAttack(f, r, +1, +1, occ);
+  attackers |= diag & (by_type_[kBishop.idx] | by_type_[kHorse.idx]);
+
+  // Horse/Dragon step attacks.
+  attackers |= ShogiTables::HorseStepBB[i] & by_type_[kHorse.idx];
+  attackers |= ShogiTables::DragonStepBB[i] & by_type_[kDragon.idx];
 
   return attackers;
 }
@@ -264,44 +255,59 @@ UndoInfo ShogiBoard::DoMove(Move m) {
     // Drop: remove from hand, place on board.
     PieceType pt = m.drop_piece();
     undo.captured = Piece::None();
+
+    // Hash: remove old hand state, update hand, add new hand state.
+    hash_ ^= HashHand(us, hand_[us]);
     hand_[us].Sub(pt);
-    PutPiece(m.to(), Piece::Make(us, pt));
+    hash_ ^= HashHand(us, hand_[us]);
+
+    // Place piece on board.
+    Piece pc = Piece::Make(us, pt);
+    PutPiece(m.to(), pc);
+    hash_ ^= Zobrist::Psq[pc.val][m.to().as_idx()];
   } else {
-    // Board move: handle capture, then move piece.
     Square to = m.to();
     Square from = m.from();
 
     // Capture?
     if (!empty(to)) {
-      Piece captured = RemovePiece(to);
+      Piece captured = piece_on(to);
       undo.captured = captured;
-      // Add captured piece to hand (unpromoted form).
+
+      // Remove captured piece from hash and board.
+      hash_ ^= Zobrist::Psq[captured.val][to.as_idx()];
+      RemovePiece(to);
+
+      // Add captured piece (unpromoted) to hand.
       PieceType cap_base = captured.GetType().Unpromote();
+      hash_ ^= HashHand(us, hand_[us]);
       hand_[us].Add(cap_base);
+      hash_ ^= HashHand(us, hand_[us]);
     } else {
       undo.captured = Piece::None();
     }
 
-    // Move the piece.
-    Piece moved = RemovePiece(from);
+    // Remove moving piece from source.
+    Piece moved = piece_on(from);
+    hash_ ^= Zobrist::Psq[moved.val][from.as_idx()];
+    RemovePiece(from);
 
     // Promote if flagged.
     if (m.is_promotion()) {
       moved = moved.Promote();
     }
 
+    // Place at destination.
     PutPiece(to, moved);
+    hash_ ^= Zobrist::Psq[moved.val][to.as_idx()];
   }
 
+  // Flip side to move.
+  hash_ ^= Zobrist::Side;
   side_to_move_ = ~us;
   ply_++;
 
-  // Recompute hash for the new position.
-  ComputeHash();
-
   // Update continuous check counter.
-  // If the opponent's king is now in check, increment our counter.
-  // Otherwise, reset it.
   if (InCheck(~us)) {
     continuous_check_[us] += 1;
   } else {
@@ -453,7 +459,7 @@ void ShogiBoard::GenerateDropMoves(MoveList& moves) const {
   }
 }
 
-MoveList ShogiBoard::GenerateLegalMoves() const {
+MoveList ShogiBoard::GenerateLegalMoves() {
   MoveList pseudo;
   pseudo.reserve(128);
 
@@ -473,27 +479,26 @@ MoveList ShogiBoard::GenerateLegalMoves() const {
   return legal;
 }
 
-bool ShogiBoard::IsLegal(Move m) const {
-  // Apply the move, check if our king is in check, undo.
-  ShogiBoard copy = *this;
-  UndoInfo undo = copy.DoMove(m);
+bool ShogiBoard::IsLegal(Move m) {
+  // Apply the move in-place, check if our king is in check, then undo.
+  Color us = side_to_move_;
+  UndoInfo undo = DoMove(m);
 
-  // After DoMove, side_to_move_ has flipped. Our king must not be in check.
-  Color us = side_to_move_;  // The side that just moved (before flip in copy).
-  bool legal = !copy.InCheck(us);
+  bool legal = !InCheck(us);
 
   // Additional check for pawn drop mate (打ち歩詰め):
   // You can't drop a pawn that gives checkmate.
   if (legal && m.is_drop() && m.drop_piece() == kPawn) {
-    if (copy.InCheck(~us)) {
+    if (InCheck(~us)) {
       // The pawn drop gives check. Check if it's checkmate.
-      MoveList responses = copy.GenerateLegalMoves();
+      MoveList responses = GenerateLegalMoves();
       if (responses.empty()) {
-        legal = false;  // Pawn drop checkmate is illegal.
+        legal = false;
       }
     }
   }
 
+  UndoMove(m, undo);
   return legal;
 }
 
@@ -501,7 +506,7 @@ bool ShogiBoard::IsLegal(Move m) const {
 // Game result
 // =====================================================================
 
-ShogiBoard::GameResult ShogiBoard::ComputeGameResult() const {
+ShogiBoard::GameResult ShogiBoard::ComputeGameResult() {
   // Check for declaration win first.
   if (CanDeclareWin()) {
     return GameResult::kDeclarationWin;
@@ -733,19 +738,17 @@ std::string ShogiBoard::ToSfen() const {
 // =====================================================================
 
 void ShogiBoard::ComputeHash() {
+  Zobrist::Init();
   uint64_t h = 0;
-  // Hash board pieces.
   for (int sq = 0; sq < kSquareNB; ++sq) {
     if (!board_[sq].IsNone()) {
-      h = HashCombine(h, sq * 32 + board_[sq].val);
+      h ^= Zobrist::Psq[board_[sq].val][sq];
     }
   }
-  // Hash hand pieces.
-  h = HashCombine(h, hand_[BLACK].raw());
-  h = HashCombine(h, hand_[WHITE].raw() + UINT64_C(0x1234567890));
-  // Hash side to move.
+  h ^= HashHand(BLACK, hand_[BLACK]);
+  h ^= HashHand(WHITE, hand_[WHITE]);
   if (side_to_move_ == WHITE) {
-    h = HashCombine(h, UINT64_C(0xABCDEF0123456789));
+    h ^= Zobrist::Side;
   }
   hash_ = h;
 }

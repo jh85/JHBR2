@@ -430,7 +430,26 @@ class Move {
   static constexpr uint16_t kFlagMask    = kDropFlag | kPromoteFlag;
 };
 
-using MoveList = std::vector<Move>;
+// Stack-allocated move list. Max legal moves in shogi is ~593.
+class MoveList {
+ public:
+  MoveList() = default;
+  void push_back(Move m) { assert(count_ < kMaxMoves); moves_[count_++] = m; }
+  int size() const { return count_; }
+  bool empty() const { return count_ == 0; }
+  void reserve(int) {}  // no-op, for compatibility
+  Move& operator[](int i) { return moves_[i]; }
+  const Move& operator[](int i) const { return moves_[i]; }
+  Move* begin() { return moves_; }
+  Move* end() { return moves_ + count_; }
+  const Move* begin() const { return moves_; }
+  const Move* end() const { return moves_ + count_; }
+
+ private:
+  static constexpr int kMaxMoves = 600;
+  Move moves_[kMaxMoves];
+  int count_ = 0;
+};
 
 // =====================================================================
 // Inline implementations

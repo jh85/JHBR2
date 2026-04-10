@@ -127,3 +127,7 @@ target_link_libraries(test_movegen PRIVATE shogi_core)
 # ---- Test: game replay (DoMove chain) ----
 add_executable(test_replay test/test_replay.cc)
 target_link_libraries(test_replay PRIVATE shogi_core)
+
+# ---- Benchmark: move generation ----
+add_executable(bench_movegen test/bench_movegen.cc)
+target_link_libraries(bench_movegen PRIVATE shogi_core)
