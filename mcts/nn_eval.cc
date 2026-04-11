@@ -202,26 +202,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
       max_logit = std::max(max_logit, legal_logits[i]);
     }
 
-    // Fix promotion bias: for each (from, to) pair where both promotion
-    // and non-promotion exist, use the max logit for both. The model's
-    // promo_offset is unreliable (trains to be systematically negative),
-    // so we let MCTS discover the correct choice via evaluation instead.
-    for (size_t i = 0; i < legal_moves.size(); i++) {
-      if (legal_moves[i].is_drop() || !legal_moves[i].is_promotion()) continue;
-      // This is a promotion move. Find the non-promotion version.
-      for (size_t j = 0; j < legal_moves.size(); j++) {
-        if (i == j) continue;
-        if (!legal_moves[j].is_promotion() && !legal_moves[j].is_drop() &&
-            legal_moves[j].from() == legal_moves[i].from() &&
-            legal_moves[j].to() == legal_moves[i].to()) {
-          // Found the pair. Use the max logit for both.
-          float mx = std::max(legal_logits[i], legal_logits[j]);
-          legal_logits[i] = mx;
-          legal_logits[j] = mx;
-          break;
-        }
-      }
-    }
+
 
     // Softmax over legal moves.
     result.policy.resize(legal_moves.size());

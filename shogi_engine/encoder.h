@@ -41,20 +41,7 @@ namespace lczero {
 // --- Constants ---
 
 constexpr int kShogiInputPlanes = 48;
-constexpr int kShogiPolicySize = 3849;
 constexpr int kShogiBoardSize = 9;
-
-// Planes per board position (pieces + repetition).
-constexpr int kShogiPlanesPerPosition = 29;  // 14 ours + 14 theirs + 1 rep
-
-// Hand piece plane indices (relative to hand section start).
-constexpr int kShogiHandPieces = 7;  // P, L, N, S, B, R, G
-
-// Raw attention output sections.
-constexpr int kShogiRawBoard = 81 * 81;   // 6561
-constexpr int kShogiRawPromo = 81 * 81;   // 6561
-constexpr int kShogiRawDrop  = 7 * 81;    // 567
-constexpr int kShogiRawTotal = kShogiRawBoard + kShogiRawPromo + kShogiRawDrop;
 
 // --- Input Plane ---
 
@@ -88,18 +75,22 @@ using ShogiInputPlanes = std::array<ShogiInputPlane, kShogiInputPlanes>;
 // if it's WHITE's turn, the board is flipped 180° before encoding.
 ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board);
 
-// --- Policy mapping ---
+// --- Policy mapping (v2: direction-based, 2187 outputs) ---
+//
+// Encoding: direction * 81 + to_sq
+//   Directions 0-9:   non-promotion board moves
+//   Directions 10-19: promotion board moves
+//   Directions 20-26: drops (P, L, N, S, B, R, G)
+//   Total: 27 * 81 = 2187
 
-// Convert a Move to its index in the 3849-element policy vector.
-// The move must be from the side-to-move's perspective (BLACK after flip).
-// Returns -1 if the move is not found.
+constexpr int kPolicySize = 2187;
+constexpr int kNumDirections = 10;
+constexpr int kNumDropTypes = 7;
+
+// Convert a Move to its index in the 2187-element policy vector.
+// The move must be from BLACK's perspective (flip for WHITE before calling).
+// Returns -1 if the move direction is not recognized.
 int ShogiMoveToNNIndex(Move move);
-
-// Convert a policy index back to a Move (from BLACK's perspective).
-Move ShogiMoveFromNNIndex(int idx);
-
-// Convert a Move to its index in the raw attention output (13689 elements).
-int ShogiMoveToRawIndex(Move move);
 
 // --- Tables (initialized at startup) ---
 

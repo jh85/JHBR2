@@ -25,7 +25,9 @@ from torch.utils.data import Dataset, DataLoader
 
 # Add lc0 src to path for the Shogi C++ modules (via ctypes or subprocess).
 # For now we do everything in Python.
-from shogi_model import ShogiBT4, ShogiBT4Config, generate_attn_policy_map
+from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
+                            make_direction_policy_index, POLICY_SIZE,
+                            NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS)
 
 
 # =====================================================================
@@ -174,38 +176,10 @@ def sfen_to_planes(sfen_str):
 
 def move_to_policy_index(move_str, flip):
     """
-    Convert a USI move string to a policy index (0-3848).
+    Convert a USI move string to a direction-based policy index (0-2186).
     If flip=True, the move is from WHITE's perspective and needs 180° rotation.
     """
-    if move_str[1] == '*':
-        # Drop: "P*5e"
-        pt_char = move_str[0].upper()
-        pt_map = {'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6}
-        pt = pt_map[pt_char]
-        to_f = int(move_str[2]) - 1
-        to_r = ord(move_str[3]) - ord('a')
-        if flip:
-            to_f = 8 - to_f
-            to_r = 8 - to_r
-        to_sq = to_f * 9 + to_r
-        # Drop index: after all board+promo moves
-        # We need the actual policy map to find the index.
-        return ('drop', pt, to_sq)
-    else:
-        # Board move: "7g7f" or "7g7f+"
-        from_f = int(move_str[0]) - 1
-        from_r = ord(move_str[1]) - ord('a')
-        to_f = int(move_str[2]) - 1
-        to_r = ord(move_str[3]) - ord('a')
-        promote = len(move_str) >= 5 and move_str[4] == '+'
-
-        if flip:
-            from_f, from_r = 8 - from_f, 8 - from_r
-            to_f, to_r = 8 - to_f, 8 - to_r
-
-        from_sq = from_f * 9 + from_r
-        to_sq = to_f * 9 + to_r
-        return ('board', from_sq, to_sq, promote)
+    return make_direction_policy_index(move_str, flip)
 
 
 # =====================================================================
@@ -392,57 +366,10 @@ class ShogiDataset(Dataset):
 # =====================================================================
 
 def build_move_index():
-    """Build the policy move index lookup tables."""
-    board_idx = {}
-    promo_idx = {}
-    drop_idx = {}
-    current = 0
-
-    BOARD = 9
-    def in_bounds(f, r): return 0 <= f < BOARD and 0 <= r < BOARD
-
-    piece_moves_def = {
-        'pawn':[(0,-1,1)],'lance':[(0,-1,8)],'knight':[(-1,-2,1),(1,-2,1)],
-        'silver':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,1,1),(1,1,1)],
-        'gold':[(0,-1,1),(-1,-1,1),(1,-1,1),(-1,0,1),(1,0,1),(0,1,1)],
-        'bishop':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8)],
-        'rook':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8)],
-        'king':[(df,dr,1) for df in(-1,0,1) for dr in(-1,0,1) if(df,dr)!=(0,0)],
-        'horse':[(-1,-1,8),(-1,1,8),(1,-1,8),(1,1,8),(0,-1,1),(0,1,1),(-1,0,1),(1,0,1)],
-        'dragon':[(0,-1,8),(0,1,8),(-1,0,8),(1,0,8),(-1,-1,1),(-1,1,1),(1,-1,1),(1,1,1)],
-    }
-    valid_pairs = set()
-    for moves in piece_moves_def.values():
-        for f in range(9):
-            for r in range(9):
-                for df,dr,md in moves:
-                    for dist in range(1,md+1):
-                        nf,nr=f+df*dist,r+dr*dist
-                        if not in_bounds(nf,nr): break
-                        valid_pairs.add((f*9+r,nf*9+nr))
-
-    for f,t in sorted(valid_pairs):
-        board_idx[(f,t)] = current; current += 1
-    promo_pairs = {(f,t) for f,t in valid_pairs if f%9<=2 or t%9<=2}
-    for f,t in sorted(promo_pairs):
-        promo_idx[(f,t)] = current; current += 1
-    for pt in range(7):
-        for sq in range(81):
-            drop_idx[(pt,sq)] = current; current += 1
-
-    def move_info_to_idx(info):
-        if info[0] == 'drop':
-            _, pt, sq = info
-            return drop_idx.get((pt, sq), 0)
-        elif info[0] == 'board':
-            _, f, t, promote = info
-            if promote:
-                return promo_idx.get((f, t), 0)
-            else:
-                return board_idx.get((f, t), 0)
-        return 0
-
-    return move_info_to_idx
+    """Direction-based policy index: move_to_policy_index already returns the index directly."""
+    # With v2 encoding, move_to_policy_index returns an int (0-2186) directly.
+    # No separate lookup needed.
+    return lambda idx: idx
 
 
 def train(args):
@@ -451,12 +378,11 @@ def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}, GPUs: {num_gpus}")
 
-    # Generate policy map
-    attn_map = generate_attn_policy_map()
+    # Move index function (v2: direction-based, returns index directly)
     move_info_to_idx = build_move_index()
 
     # --- Model ---
-    cfg = ShogiBT4Config()
+    cfg = ShogiBT4v2Config()
     if args.d_model:
         cfg.embedding_size = args.d_model
         cfg.policy_d_model = args.d_model
@@ -465,7 +391,7 @@ def train(args):
     if args.heads:
         cfg.num_heads = args.heads
 
-    model = ShogiBT4(cfg, attn_map).to(device)
+    model = ShogiBT4v2(cfg).to(device)
     print(f"Model parameters: {model.count_parameters():,}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
@@ -648,7 +574,6 @@ def train(args):
                 'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'cfg': vars(cfg),
-                'attn_map': attn_map,
             }, path)
             print(f"  Saved {path}")
 
