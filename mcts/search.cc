@@ -63,11 +63,22 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     return result;
   }
 
-  // Check for mate-in-1 at root (before spending time on NN eval).
+  // Check for mate at root before spending time on NN eval.
+  // Tier 1: Mate-in-1 (essentially free).
   {
     Move mate1 = Mate1Ply(board);
     if (!mate1.is_null()) {
       result.best_move = mate1;
+      result.mate_status = 1;
+      result.nodes = 0;
+      return result;
+    }
+  }
+  // Tier 2: df-pn mate search at root (finds deeper forced mates).
+  if (dfpn_leaf_) {
+    Move mate_move = dfpn_leaf_->search(board, config_.leaf_dfpn_nodes);
+    if (!mate_move.is_null() && !MateDfpnSolver::IsNoMate(mate_move)) {
+      result.best_move = mate_move;
       result.mate_status = 1;
       result.nodes = 0;
       return result;
