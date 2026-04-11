@@ -63,6 +63,17 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     return result;
   }
 
+  // Check for mate-in-1 at root (before spending time on NN eval).
+  {
+    Move mate1 = Mate1Ply(board);
+    if (!mate1.is_null()) {
+      result.best_move = mate1;
+      result.mate_status = 1;
+      result.nodes = 0;
+      return result;
+    }
+  }
+
   // Evaluate root position.
   NNOutput root_eval = evaluator_.Evaluate(board, legal_moves);
 
