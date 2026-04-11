@@ -192,6 +192,7 @@ class MateDfpnSolver {
 
   // --- Members ---
   size_t default_nodes_limit_;
+  size_t nodes_limit_ = 0;
   DfpnNodePool pool_;
   size_t nodes_searched_ = 0;
   int mate_ply_ = 0;

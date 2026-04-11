@@ -42,6 +42,7 @@ MateDfpnSolver::MateDfpnSolver(size_t default_nodes_limit)
 Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
   stop_ = false;
   nodes_searched_ = 0;
+  nodes_limit_ = nodes_limit;
   mate_ply_ = 0;
   pv_.clear();
   path_hashes_.clear();
@@ -109,7 +110,8 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
          node.dn < second_dn &&
          node.pn != 0 && node.dn != 0 &&
          !pool_.OutOfMemory() &&
-         !stop_) {
+         !stop_ &&
+         nodes_searched_ < nodes_limit_) {
 
     // Find best child and 2nd-best thresholds.
     uint32_t child_second_pn = second_pn;
