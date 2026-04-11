@@ -88,7 +88,7 @@ void USIEngine::CmdUsi() {
   Send("option name MaxNodes type spin default 800 min 1 max 1000000");
   Send("option name OnnxModel type string default shogi_bt4.onnx");
   Send("option name NoiseEpsilon type string default 0.0");
-  Send("option name LeafDfpnNodes type spin default 40 min 0 max 100000");
+  Send("option name LeafDfpnNodes type spin default 100 min 0 max 100000");
   Send("option name PvDfpnNodes type spin default 100000 min 0 max 10000000");
   Send("option name UseGPU type check default true");
 

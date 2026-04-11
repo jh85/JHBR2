@@ -225,7 +225,7 @@ struct MCTSConfig {
   float draw_score = 0.0f;
 
   // df-pn mate search settings
-  int leaf_dfpn_nodes = 40;       // Shallow df-pn budget per leaf (0=disable)
+  int leaf_dfpn_nodes = 100;      // Shallow df-pn budget per leaf (0=disable)
   int pv_dfpn_nodes = 100000;     // Deep df-pn for PV search (0=disable)
 };
 

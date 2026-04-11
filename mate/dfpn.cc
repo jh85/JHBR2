@@ -61,8 +61,12 @@ Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
   // Push initial hash for repetition detection.
   path_hashes_.push_back(pos.Hash());
 
-  // Search with infinite thresholds.
-  Search<true>(pos, root, DfpnNode::INF, DfpnNode::INF, 0);
+  // Search iteratively until solved or out of resources.
+  while (root.pn != 0 && root.dn != 0 &&
+         !pool_.OutOfMemory() && !stop_ &&
+         nodes_searched_ < nodes_limit) {
+    Search<true>(pos, root, DfpnNode::INF, DfpnNode::INF, 0);
+  }
 
   path_hashes_.pop_back();
 
@@ -96,6 +100,7 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
   if (!node.is_expanded()) {
     ExpandNode<or_node>(board, node, ply);
     nodes_searched_++;
+    SummarizeNode<or_node>(node);
     return;
   }
 
