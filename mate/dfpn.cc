@@ -47,9 +47,9 @@ Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
   pv_.clear();
   path_hashes_.clear();
 
-  // Allocate node pool. Each node expansion may create up to ~600 children
-  // (max legal moves in Shogi), so multiply limit by a factor.
-  size_t pool_size = std::max(nodes_limit * 8, (size_t)1024);
+  // Allocate node pool. Each expansion creates children (up to ~600 for AND nodes).
+  // Cap pool at 2M nodes to avoid excessive memory allocation time.
+  size_t pool_size = std::min(std::max(nodes_limit * 4, (size_t)1024), (size_t)2000000);
   pool_.Alloc(pool_size);
 
   // Create root node (OR node — attacker).

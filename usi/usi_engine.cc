@@ -7,9 +7,12 @@
 #include "usi/usi_engine.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "mate/dfpn.h"
@@ -298,13 +301,61 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 }
 
 void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
-  // go mate <time_ms> or go mate infinite
-  // Use a dedicated df-pn solver with large budget.
-  MateDfpnSolver solver(2000000);
-  Move mate_move = solver.search(board_, 2000000);
+  // Parse: go mate <time_ms> | go mate infinite
+  int time_limit_ms = 0;  // 0 = infinite
+  for (size_t i = 1; i < parts.size(); i++) {
+    if (parts[i] == "mate") {
+      if (i + 1 < parts.size() && parts[i + 1] != "infinite") {
+        time_limit_ms = std::stoi(parts[i + 1]);
+      }
+      break;
+    }
+  }
 
-  if (!mate_move.is_null() && mate_move.raw() != 0 &&
-      !MateDfpnSolver::IsNoMate(mate_move)) {
+  // Scale node budget with time limit. The df-pn can search ~50K-200K nodes/sec.
+  size_t max_nodes;
+  if (time_limit_ms <= 0) {
+    max_nodes = 10000000;  // infinite: 10M nodes
+  } else {
+    max_nodes = std::max((size_t)(time_limit_ms * 200), (size_t)100000);  // ~200K nodes/sec
+  }
+  MateDfpnSolver solver(max_nodes);
+
+  // Run df-pn in a separate thread so we can enforce the time limit.
+  std::atomic<bool> search_done{false};
+  Move mate_move;
+
+  auto search_thread = std::thread([&]() {
+    mate_move = solver.search(board_, max_nodes);
+    search_done = true;
+  });
+
+  // Wait for completion or time limit.
+  auto t0 = std::chrono::steady_clock::now();
+  while (!search_done) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (time_limit_ms > 0) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (elapsed >= time_limit_ms) {
+        solver.stop();
+        break;
+      }
+    }
+  }
+
+  search_thread.join();
+
+  auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+
+  // Report result.
+  if (!search_done && time_limit_ms > 0) {
+    // Time's up before search completed.
+    Log("Mate search timeout after " + std::to_string(elapsed) + " ms, " +
+        std::to_string(solver.get_nodes_searched()) + " nodes");
+    Send("checkmate timeout");
+  } else if (!mate_move.is_null() && !MateDfpnSolver::IsNoMate(mate_move)) {
     // Mate found.
     auto pv = solver.get_pv();
     std::string pv_str;
@@ -312,11 +363,19 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
       if (!pv_str.empty()) pv_str += " ";
       pv_str += m.ToString();
     }
+    Log("Mate found in " + std::to_string(pv.size()) + " ply, " +
+        std::to_string(solver.get_nodes_searched()) + " nodes, " +
+        std::to_string(elapsed) + " ms");
     Send("checkmate " + pv_str);
   } else if (MateDfpnSolver::IsNoMate(mate_move)) {
+    Log("No mate proven (" + std::to_string(solver.get_nodes_searched()) +
+        " nodes, " + std::to_string(elapsed) + " ms)");
     Send("checkmate nomate");
   } else {
-    Send("checkmate notimplemented");
+    // Unsolved (out of memory or nodes).
+    Log("Mate search unsolved (" + std::to_string(solver.get_nodes_searched()) +
+        " nodes, " + std::to_string(elapsed) + " ms)");
+    Send("checkmate timeout");
   }
 }
 
