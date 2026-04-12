@@ -348,49 +348,45 @@ class DirectionPolicyHead(nn.Module):
         scale = 1.0 / math.sqrt(d)
         board_logits = torch.matmul(Q, K.transpose(-2, -1)) * scale
 
-        # Initialize output policy
-        policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
-
         # Convert (from, to) → (direction, to) for non-promotion moves
         valid = self.from_to_dir >= 0  # (81*81,)
-        valid_indices = torch.where(valid)[0]  # indices into flat from*81+to
-        from_sqs = valid_indices // 81
-        to_sqs = valid_indices % 81
+        valid_indices = torch.where(valid)[0]
         dirs = self.from_to_dir[valid_indices]  # direction 0-9
-
-        # Policy index = direction * 81 + to_sq
+        to_sqs = valid_indices % 81
         policy_indices = dirs * 81 + to_sqs
 
-        # Gather board logits for valid (from, to) pairs.
-        # For each valid pair, take the max over all from squares with the same
-        # (direction, to) — handles multiple possible sources (sliding pieces).
         board_flat = board_logits.reshape(B, 81 * 81)  # (B, 6561)
         logit_values = board_flat[:, valid_indices]  # (B, num_valid_pairs)
 
-        # Scatter-max: for duplicate (direction, to) entries, keep the max logit
+        # Scatter-max into non-promotion channels (0-9)
+        nopromo_policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
         policy_indices_expanded = policy_indices.unsqueeze(0).expand(B, -1)
-        policy.scatter_reduce_(1, policy_indices_expanded, logit_values,
-                               reduce='amax', include_self=False)
+        nopromo_policy.scatter_reduce_(1, policy_indices_expanded, logit_values,
+                                       reduce='amax', include_self=False)
 
-        # Promotion moves: same attention logits, separate direction channels
+        # Promotion moves: same attention logits, channels 10-19
         promo_valid = valid & self.from_to_promo_eligible
         promo_indices = torch.where(promo_valid)[0]
-        promo_from = promo_indices // 81
         promo_to = promo_indices % 81
         promo_dirs = self.from_to_dir[promo_indices] + NUM_DIRECTIONS  # 10-19
         promo_policy_indices = promo_dirs * 81 + promo_to
-
         promo_logit_values = board_flat[:, promo_indices]
 
+        promo_policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
         promo_policy_expanded = promo_policy_indices.unsqueeze(0).expand(B, -1)
-        policy.scatter_reduce_(1, promo_policy_expanded, promo_logit_values,
-                               reduce='amax', include_self=False)
+        promo_policy.scatter_reduce_(1, promo_policy_expanded, promo_logit_values,
+                                     reduce='amax', include_self=False)
 
         # Drop logits: drop_queries @ K^T
         dq = self.drop_queries.unsqueeze(0).expand(B, -1, -1)
         drop_logits = torch.matmul(dq, K.transpose(-2, -1)) * scale  # (B, 7, 81)
-        drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81  # index 1620
-        policy[:, drop_start:drop_start + NUM_DROP_TYPES * 81] = drop_logits.reshape(B, -1)
+
+        drop_policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
+        drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81  # 1620
+        drop_policy[:, drop_start:drop_start + NUM_DROP_TYPES * 81] = drop_logits.reshape(B, -1)
+
+        # Combine: take max across the three (non-overlapping) contributions
+        policy = torch.maximum(torch.maximum(nopromo_policy, promo_policy), drop_policy)
 
         return policy
 
