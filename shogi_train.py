@@ -568,7 +568,7 @@ def train(args):
         # Save checkpoint
         if (epoch + 1) % args.save_every == 0:
             raw_model = model.module if hasattr(model, 'module') else model
-            path = f"shogi_bt4_epoch{epoch+1}.pt"
+            path = os.path.join(args.save_dir, f"shogi_bt4_epoch{epoch+1}.pt")
             torch.save({
                 'epoch': epoch + 1,
                 'model': raw_model.state_dict(),
@@ -636,6 +636,7 @@ if __name__ == "__main__":
     parser.add_argument("--encoders", type=int, default=None)
     parser.add_argument("--heads", type=int, default=None)
     parser.add_argument("--save-every", type=int, default=5)
+    parser.add_argument("--save-dir", default=".", help="Directory for checkpoint files")
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
