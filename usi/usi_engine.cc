@@ -262,18 +262,72 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   config_.max_nodes = nodes_limit;
   config_.max_time = max_time;
 
-  // Recreate search with updated config.
-  search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
+  // --- Launch root df-pn in parallel with MCTS (dlshogi-style) ---
+  // The df-pn runs in a background thread searching for forced mate.
+  // If it finds one before MCTS finishes (or within the minimum wait),
+  // we use the mate move instead of the MCTS result.
+  constexpr int kDfpnMinWaitMs = 300;  // minimum time to wait for df-pn
+  constexpr size_t kRootDfpnNodes = 1000000;  // 1M node budget for root df-pn
 
-  // Run search.
+  MateDfpnSolver root_dfpn(kRootDfpnNodes);
+  std::atomic<bool> dfpn_done{false};
+  Move dfpn_mate_move;
+  ShogiBoard dfpn_board = board_;  // copy for the df-pn thread
+
+  auto dfpn_thread = std::thread([&]() {
+    dfpn_mate_move = root_dfpn.search(dfpn_board, kRootDfpnNodes);
+    dfpn_done = true;
+  });
+
+  // --- Run MCTS concurrently ---
+  search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
   SearchResult result = search_->Search(board_, game_ply_);
 
+  // --- Wait for df-pn (up to minimum wait time after MCTS finishes) ---
+  auto mcts_done_time = std::chrono::steady_clock::now();
+  if (!dfpn_done) {
+    // MCTS finished first. Wait a bit more for df-pn.
+    while (!dfpn_done) {
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - mcts_done_time).count();
+      if (elapsed_ms >= kDfpnMinWaitMs) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    root_dfpn.stop();
+  }
+  dfpn_thread.join();
+
+  // --- Choose result: prefer mate if found ---
+  bool use_mate = dfpn_done &&
+                  !dfpn_mate_move.is_null() &&
+                  !MateDfpnSolver::IsNoMate(dfpn_mate_move);
+
+  if (use_mate) {
+    auto pv = root_dfpn.get_pv();
+    std::string pv_str;
+    for (const auto& m : pv) {
+      if (!pv_str.empty()) pv_str += " ";
+      pv_str += m.ToString();
+    }
+    if (pv_str.empty()) pv_str = dfpn_mate_move.ToString();
+
+    int mate_ply = (int)pv.size();
+    Log("Root df-pn found mate in " + std::to_string(mate_ply) + " ply (" +
+        std::to_string(root_dfpn.get_nodes_searched()) + " nodes)");
+
+    Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
+         " nodes " + std::to_string(root_dfpn.get_nodes_searched()) +
+         " pv " + pv_str);
+    Send("bestmove " + dfpn_mate_move.ToString());
+    return;
+  }
+
+  // --- Use MCTS result ---
   if (result.best_move.is_null()) {
     Send("bestmove resign");
     return;
   }
 
-  // Format info string.
   std::string pv_str;
   for (const auto& m : result.pv) {
     if (!pv_str.empty()) pv_str += " ";
@@ -281,7 +335,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
   if (pv_str.empty()) pv_str = result.best_move.ToString();
 
-  // Score: mate or centipawns.
   std::string score_str;
   if (result.mate_status == 1) {
     score_str = "score mate +";
