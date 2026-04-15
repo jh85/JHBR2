@@ -112,9 +112,9 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
     impl_->input_channels = static_cast<int>(input_shape[1]);
   }
 
-  // Batch support disabled for now — evaluates one at a time.
-  // TODO: enable when ONNX model batch inference is verified on CUDA.
-  supports_batch_ = false;
+  // Enable batch support — we use a fixed max batch size approach
+  // (pad input to max_batch_size) to avoid dynamic shape issues.
+  supports_batch_ = true;
 }
 
 NNEvaluator::~NNEvaluator() = default;
@@ -132,8 +132,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 
   const int batch_size = static_cast<int>(batch.size());
 
-  // If batch > 1, try batched inference. If the model doesn't support
-  // dynamic batch (e.g., old v1 models), fall back to one-at-a-time.
+  // Fall back to one-at-a-time for models that don't support batching.
   if (batch_size > 1 && !supports_batch_) {
     std::vector<NNOutput> results;
     results.reserve(batch_size);
@@ -146,8 +145,17 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   const int channels = impl_->input_channels;
   const int sq = 81;  // 9x9
 
-  // Encode input planes.
-  std::vector<float> input_data(batch_size * channels * sq, 0.0f);
+  // Use a fixed padded batch size to avoid dynamic shape issues with CUDA.
+  // Pad unused slots with zeros — their outputs are ignored.
+  const int padded_size = (batch_size <= 1) ? 1 :
+                          (batch_size <= 2) ? 2 :
+                          (batch_size <= 4) ? 4 :
+                          (batch_size <= 8) ? 8 :
+                          (batch_size <= 16) ? 16 :
+                          (batch_size <= 32) ? 32 : 64;
+
+  // Encode input planes (zero-padded for unused slots).
+  std::vector<float> input_data(padded_size * channels * sq, 0.0f);
 
   for (int b = 0; b < batch_size; b++) {
     auto planes = EncodeShogiPosition(batch[b].first);
@@ -157,8 +165,8 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     }
   }
 
-  // Create input tensor.
-  std::array<int64_t, 4> input_shape = {batch_size, channels, 9, 9};
+  // Create input tensor with padded batch size.
+  std::array<int64_t, 4> input_shape = {padded_size, channels, 9, 9};
   auto memory_info = Ort::MemoryInfo::CreateCpu(
       OrtArenaAllocator, OrtMemTypeDefault);
   auto input_tensor = Ort::Value::CreateTensor<float>(
@@ -166,10 +174,28 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
       input_shape.data(), input_shape.size());
 
   // Run inference.
-  auto outputs = impl_->session->Run(
-      Ort::RunOptions{nullptr},
-      impl_->input_names.data(), &input_tensor, 1,
-      impl_->output_names.data(), impl_->output_names.size());
+  std::vector<Ort::Value> outputs;
+  try {
+    outputs = impl_->session->Run(
+        Ort::RunOptions{nullptr},
+        impl_->input_names.data(), &input_tensor, 1,
+        impl_->output_names.data(), impl_->output_names.size());
+  } catch (const Ort::Exception& e) {
+    fprintf(stderr, "[NN] ONNX error (batch=%d, padded=%d): %s\n",
+            batch_size, padded_size, e.what());
+    // Fall back to one-at-a-time.
+    std::vector<NNOutput> results;
+    for (const auto& [board, moves] : batch) {
+      std::vector<std::pair<ShogiBoard, MoveList>> single;
+      single.emplace_back(board, moves);
+      // Temporarily set batch=1 to avoid recursion into padded path.
+      bool saved = supports_batch_;
+      supports_batch_ = false;
+      results.push_back(Evaluate(board, moves));
+      supports_batch_ = saved;
+    }
+    return results;
+  }
 
   // Parse outputs: [policy (batch, 3849), wdl (batch, 3), mlh (batch, 1)]
   float* policy_data = outputs[0].GetTensorMutableData<float>();
