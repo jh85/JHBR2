@@ -2,13 +2,19 @@
   JHBR2 Shogi Engine — Neural Network Evaluator (ONNX Runtime)
 
   Input:  (batch, 44, 9, 9) float32  [note: model uses 44 of 48 input planes]
-  Output: policy (batch, 3849), wdl (batch, 3), mlh (batch, 1)
+  Output: policy (batch, 2187), wdl (batch, 3), mlh (batch, 1)
+
+  Batching strategy: create separate ONNX sessions for fixed batch sizes
+  (1, 2, 4, 8, 16). At runtime, pick the smallest session that fits the
+  actual batch, pad with zeros. This avoids dynamic shape issues with CUDA.
 */
 
 #include "mcts/nn_eval.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <numeric>
 #include <stdexcept>
 
@@ -44,19 +50,26 @@ static void Softmax(float* data, int size) {
 
 #if HAS_ONNXRUNTIME
 
+// Fixed batch sizes we create sessions for.
+static constexpr int kBatchSizes[] = {1, 2, 4, 8, 16};
+static constexpr int kNumBatchSizes = 5;
+
 struct NNEvaluator::Impl {
   Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "jhbr2"};
   Ort::SessionOptions session_opts;
-  std::unique_ptr<Ort::Session> session;
 
-  // Input/output names (cached from model metadata).
+  // One session per fixed batch size. session[0]=batch1, session[1]=batch2, etc.
+  std::unique_ptr<Ort::Session> sessions[kNumBatchSizes];
+  bool session_valid[kNumBatchSizes] = {};  // true if session was created successfully
+
+  // Input/output names (shared across all sessions — same model).
   std::vector<std::string> input_names_str;
   std::vector<std::string> output_names_str;
   std::vector<const char*> input_names;
   std::vector<const char*> output_names;
 
   // Input shape: (batch, channels, 9, 9)
-  int input_channels = 44;  // Will be read from model
+  int input_channels = 44;
 };
 
 NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
@@ -79,42 +92,73 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
       using_gpu_ = true;
     } catch (...) {
       using_gpu_ = false;
-      // Fall back to CPU
     }
   }
 
-  impl_->session = std::make_unique<Ort::Session>(
+  // Create the batch=1 session first (always needed).
+  impl_->sessions[0] = std::make_unique<Ort::Session>(
       impl_->env, onnx_path.c_str(), opts);
+  impl_->session_valid[0] = true;
 
-  // Get input/output names.
+  // Get input/output names from the first session.
   Ort::AllocatorWithDefaultOptions alloc;
+  auto& session = *impl_->sessions[0];
 
-  size_t num_inputs = impl_->session->GetInputCount();
+  size_t num_inputs = session.GetInputCount();
   for (size_t i = 0; i < num_inputs; i++) {
-    auto name = impl_->session->GetInputNameAllocated(i, alloc);
+    auto name = session.GetInputNameAllocated(i, alloc);
     impl_->input_names_str.push_back(name.get());
   }
 
-  size_t num_outputs = impl_->session->GetOutputCount();
+  size_t num_outputs = session.GetOutputCount();
   for (size_t i = 0; i < num_outputs; i++) {
-    auto name = impl_->session->GetOutputNameAllocated(i, alloc);
+    auto name = session.GetOutputNameAllocated(i, alloc);
     impl_->output_names_str.push_back(name.get());
   }
 
-  // Cache char* pointers.
   for (auto& s : impl_->input_names_str) impl_->input_names.push_back(s.c_str());
   for (auto& s : impl_->output_names_str) impl_->output_names.push_back(s.c_str());
 
   // Detect input channels from model shape.
-  auto input_shape = impl_->session->GetInputTypeInfo(0)
+  auto input_shape = session.GetInputTypeInfo(0)
       .GetTensorTypeAndShapeInfo().GetShape();
   if (input_shape.size() >= 2) {
     impl_->input_channels = static_cast<int>(input_shape[1]);
   }
 
-  // Enable batch support — we use a fixed max batch size approach
-  // (pad input to max_batch_size) to avoid dynamic shape issues.
-  supports_batch_ = true;
+  // Try loading separate ONNX files for larger batch sizes.
+  // Convention: model.onnx → model_b2.onnx, model_b4.onnx, etc.
+  // Strip ".onnx" from the path and look for batch variants.
+  std::string base_path = onnx_path;
+  if (base_path.size() > 5 && base_path.substr(base_path.size() - 5) == ".onnx") {
+    base_path = base_path.substr(0, base_path.size() - 5);
+  }
+
+  for (int si = 1; si < kNumBatchSizes; si++) {
+    int bs = kBatchSizes[si];
+    std::string batch_path = base_path + "_b" + std::to_string(bs) + ".onnx";
+
+    // Check if the file exists.
+    std::ifstream test_file(batch_path);
+    if (!test_file.good()) continue;
+    test_file.close();
+
+    try {
+      impl_->sessions[si] = std::make_unique<Ort::Session>(
+          impl_->env, batch_path.c_str(), opts);
+      impl_->session_valid[si] = true;
+    } catch (...) {
+      impl_->sessions[si].reset();
+      impl_->session_valid[si] = false;
+    }
+  }
+
+  // Report batch support.
+  int max_batch = 1;
+  for (int si = 0; si < kNumBatchSizes; si++) {
+    if (impl_->session_valid[si]) max_batch = kBatchSizes[si];
+  }
+  supports_batch_ = (max_batch > 1);
 }
 
 NNEvaluator::~NNEvaluator() = default;
@@ -131,9 +175,21 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
 
   const int batch_size = static_cast<int>(batch.size());
+  const int channels = impl_->input_channels;
+  constexpr int sq = 81;
 
-  // Fall back to one-at-a-time for models that don't support batching.
-  if (batch_size > 1 && !supports_batch_) {
+  // Find the best session for this batch size.
+  int session_idx = 0;  // default: batch=1
+  for (int si = kNumBatchSizes - 1; si >= 0; si--) {
+    if (impl_->session_valid[si] && kBatchSizes[si] >= batch_size) {
+      session_idx = si;
+    }
+  }
+
+  int padded_size = kBatchSizes[session_idx];
+
+  // If no session can fit this batch, evaluate one at a time.
+  if (padded_size < batch_size) {
     std::vector<NNOutput> results;
     results.reserve(batch_size);
     for (const auto& [board, moves] : batch) {
@@ -141,18 +197,6 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     }
     return results;
   }
-
-  const int channels = impl_->input_channels;
-  const int sq = 81;  // 9x9
-
-  // Use a fixed padded batch size to avoid dynamic shape issues with CUDA.
-  // Pad unused slots with zeros — their outputs are ignored.
-  const int padded_size = (batch_size <= 1) ? 1 :
-                          (batch_size <= 2) ? 2 :
-                          (batch_size <= 4) ? 4 :
-                          (batch_size <= 8) ? 8 :
-                          (batch_size <= 16) ? 16 :
-                          (batch_size <= 32) ? 32 : 64;
 
   // Encode input planes (zero-padded for unused slots).
   std::vector<float> input_data(padded_size * channels * sq, 0.0f);
@@ -173,31 +217,26 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
       memory_info, input_data.data(), input_data.size(),
       input_shape.data(), input_shape.size());
 
-  // Run inference.
+  // Run inference on the selected session.
+  auto& session = *impl_->sessions[session_idx];
   std::vector<Ort::Value> outputs;
   try {
-    outputs = impl_->session->Run(
+    outputs = session.Run(
         Ort::RunOptions{nullptr},
         impl_->input_names.data(), &input_tensor, 1,
         impl_->output_names.data(), impl_->output_names.size());
   } catch (const Ort::Exception& e) {
     fprintf(stderr, "[NN] ONNX error (batch=%d, padded=%d): %s\n",
             batch_size, padded_size, e.what());
-    // Fall back to one-at-a-time.
+    // Fall back to one-at-a-time with batch=1 session.
     std::vector<NNOutput> results;
     for (const auto& [board, moves] : batch) {
-      std::vector<std::pair<ShogiBoard, MoveList>> single;
-      single.emplace_back(board, moves);
-      // Temporarily set batch=1 to avoid recursion into padded path.
-      bool saved = supports_batch_;
-      supports_batch_ = false;
       results.push_back(Evaluate(board, moves));
-      supports_batch_ = saved;
     }
     return results;
   }
 
-  // Parse outputs: [policy (batch, 3849), wdl (batch, 3), mlh (batch, 1)]
+  // Parse outputs.
   float* policy_data = outputs[0].GetTensorMutableData<float>();
   float* wdl_data = outputs[1].GetTensorMutableData<float>();
 
@@ -216,9 +255,9 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     std::copy(wdl_data + b * 3, wdl_data + b * 3 + 3, wdl);
     Softmax(wdl, 3);
 
-    result.wdl[0] = wdl[0];  // Win
-    result.wdl[1] = wdl[1];  // Draw
-    result.wdl[2] = wdl[2];  // Loss
+    result.wdl[0] = wdl[0];
+    result.wdl[1] = wdl[1];
+    result.wdl[2] = wdl[2];
     result.value = wdl[0] - wdl[2];
     result.draw = wdl[1];
 
@@ -226,9 +265,6 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     float* logits = policy_data + b * policy_size;
     bool is_white = (board.side_to_move() == lczero::WHITE);
 
-    // For each legal move, get its policy index.
-    // If WHITE to move, the board was flipped in EncodeShogiPosition(),
-    // so we need to flip the move too before indexing.
     std::vector<float> legal_logits(legal_moves.size());
     float max_logit = -1e10f;
 
@@ -239,12 +275,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
       if (idx >= 0 && idx < policy_size) {
         legal_logits[i] = logits[idx];
       } else {
-        legal_logits[i] = -1000.0f;  // Very unlikely
+        legal_logits[i] = -1000.0f;
       }
       max_logit = std::max(max_logit, legal_logits[i]);
     }
-
-
 
     // Softmax over legal moves.
     result.policy.resize(legal_moves.size());
@@ -264,7 +298,6 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 #else  // !HAS_ONNXRUNTIME
 
 // Stub implementation when ONNX Runtime is not available.
-// Returns random/uniform policy for testing.
 
 struct NNEvaluator::Impl {};
 
