@@ -211,9 +211,9 @@ class InputEmbedding(nn.Module):
 
     def forward(self, x):
         B = x.shape[0]
-        piece_planes = x[:, :28].reshape(B, -1)
-        other_planes = x[:, 28:].reshape(B, 81, -1)
-        dense = self.preproc(piece_planes).reshape(B, 81, -1)
+        piece_planes = torch.flatten(x[:, :28], 1)
+        other_planes = x[:, 28:].flatten(2).transpose(1, 2)  # (B, C-28, 81) -> (B, 81, C-28)
+        dense = self.preproc(piece_planes).unflatten(1, (81, -1))
         combined = torch.cat([dense, other_planes], dim=-1)
         h = self.act(self.embed(combined))
         h = h * self.mult_gate + self.add_gate
@@ -239,12 +239,12 @@ class Smolgen(nn.Module):
 
     def forward(self, x):
         B = x.shape[0]
-        h = self.act(self.compress(x)).reshape(B, -1)
+        h = torch.flatten(self.act(self.compress(x)), 1)
         h = self.act(self.ln1(self.dense1(h)))
         h = self.act(self.ln2(self.dense2(h)))
-        h = h.reshape(B, self.cfg.num_heads, self.cfg.smolgen_gen_size)
+        h = h.unflatten(1, (self.cfg.num_heads, self.cfg.smolgen_gen_size))
         w = self.global_gen(h)
-        return w.reshape(B, self.cfg.num_heads, 81, 81)
+        return w.unflatten(2, (81, 81))
 
 
 class EncoderBlock(nn.Module):
@@ -270,12 +270,12 @@ class EncoderBlock(nn.Module):
         heads = self.cfg.num_heads
         depth = D // heads
         smol_bias = self.smolgen(x)
-        Q = self.q_proj(x).reshape(B, S, heads, depth).permute(0, 2, 1, 3)
-        K = self.k_proj(x).reshape(B, S, heads, depth).permute(0, 2, 1, 3)
-        V = self.v_proj(x).reshape(B, S, heads, depth).permute(0, 2, 1, 3)
+        Q = self.q_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
+        K = self.k_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
+        V = self.v_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
         attn = (Q @ K.transpose(-2, -1)) / math.sqrt(depth) + smol_bias
         attn = F.softmax(attn, dim=-1)
-        out = (attn @ V).permute(0, 2, 1, 3).reshape(B, S, D)
+        out = (attn @ V).permute(0, 2, 1, 3).flatten(2)
         h = self.ln1(self.out_proj(out) + x)
         f = self.ffn_act(self.ffn1(h))
         h = self.ffn_ln(self.ffn2(f) + h)
@@ -315,25 +315,45 @@ class DirectionPolicyHead(nn.Module):
         # Drop move embeddings: 7 learned query vectors
         self.drop_queries = nn.Parameter(torch.randn(NUM_DROP_TYPES, d) * 0.02)
 
-        # Build the (from, to) → (direction, to) mapping table.
-        # For each valid (from, to) pair, store the direction index.
-        # from_to_dir[from * 81 + to] = direction (0-9), or -1 if invalid.
-        from_to_dir = torch.full((81 * 81,), -1, dtype=torch.long)
-        from_to_promo_eligible = torch.zeros(81 * 81, dtype=torch.bool)
+        # Build gather indices for ONNX-compatible (from,to) → (direction,to) mapping.
+        # For each of the 2187 policy slots, precompute which board_flat indices to
+        # gather and take max over (handles sliding pieces with multiple sources).
+        MAX_SOURCES = 8  # max sliding distance
+
+        # gather_idx[p][k] = index into board_flat (81*81), or 0 (masked out)
+        # gather_mask[p][k] = 1.0 if valid, 0.0 if padding
+        gather_idx = torch.zeros(POLICY_SIZE, MAX_SOURCES, dtype=torch.long)
+        gather_mask = torch.zeros(POLICY_SIZE, MAX_SOURCES)
+
+        # Build mapping: for each policy slot, collect all (from, to) pairs
+        from collections import defaultdict
+        policy_to_sources = defaultdict(list)  # policy_idx → [board_flat_idx, ...]
 
         for from_sq in range(81):
             for to_sq in range(81):
                 d_idx = move_to_direction(from_sq, to_sq)
-                if d_idx >= 0:
-                    from_to_dir[from_sq * 81 + to_sq] = d_idx
-                    # Check promotion eligibility
-                    from_r = from_sq % 9
-                    to_r = to_sq % 9
-                    if from_r <= 2 or to_r <= 2:
-                        from_to_promo_eligible[from_sq * 81 + to_sq] = True
+                if d_idx < 0:
+                    continue
+                flat_idx = from_sq * 81 + to_sq
+                from_r = from_sq % 9
+                to_r = to_sq % 9
 
-        self.register_buffer('from_to_dir', from_to_dir)
-        self.register_buffer('from_to_promo_eligible', from_to_promo_eligible)
+                # Non-promotion
+                p = d_idx * 81 + to_sq
+                policy_to_sources[p].append(flat_idx)
+
+                # Promotion (if eligible)
+                if from_r <= 2 or to_r <= 2:
+                    p_promo = (d_idx + NUM_DIRECTIONS) * 81 + to_sq
+                    policy_to_sources[p_promo].append(flat_idx)
+
+        for p, sources in policy_to_sources.items():
+            for k, src in enumerate(sources[:MAX_SOURCES]):
+                gather_idx[p][k] = src
+                gather_mask[p][k] = 1.0
+
+        self.register_buffer('gather_idx', gather_idx)
+        self.register_buffer('gather_mask', gather_mask)
 
     def forward(self, x):
         """x: (B, 81, d_model) → (B, 2187) policy logits"""
@@ -347,46 +367,30 @@ class DirectionPolicyHead(nn.Module):
         # Board move logits via attention: (B, 81, 81) = (from, to) scores
         scale = 1.0 / math.sqrt(d)
         board_logits = torch.matmul(Q, K.transpose(-2, -1)) * scale
+        board_flat = board_logits.flatten(1)  # (B, 6561)
 
-        # Convert (from, to) → (direction, to) for non-promotion moves
-        valid = self.from_to_dir >= 0  # (81*81,)
-        valid_indices = torch.where(valid)[0]
-        dirs = self.from_to_dir[valid_indices]  # direction 0-9
-        to_sqs = valid_indices % 81
-        policy_indices = dirs * 81 + to_sqs
+        # Gather candidate logits for each policy slot: (B, 2187, MAX_SOURCES)
+        # gather_idx is (2187, 8), expand to (B, 2187, 8)
+        idx = self.gather_idx.unsqueeze(0).expand(B, -1, -1)  # (B, 2187, 8)
+        idx_flat = idx.reshape(B, -1)  # (B, 2187*8)
+        gathered = torch.gather(board_flat, 1, idx_flat).reshape(B, POLICY_SIZE, -1)  # (B, 2187, 8)
 
-        board_flat = board_logits.reshape(B, 81 * 81)  # (B, 6561)
-        logit_values = board_flat[:, valid_indices]  # (B, num_valid_pairs)
+        # Apply mask: set padding positions to -inf so they don't affect max
+        mask = self.gather_mask.unsqueeze(0)  # (1, 2187, 8)
+        gathered = gathered * mask + (1.0 - mask) * (-1e10)
 
-        # Scatter-max into non-promotion channels (0-9)
-        nopromo_policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
-        policy_indices_expanded = policy_indices.unsqueeze(0).expand(B, -1)
-        nopromo_policy.scatter_reduce_(1, policy_indices_expanded, logit_values,
-                                       reduce='amax', include_self=False)
-
-        # Promotion moves: same attention logits, channels 10-19
-        promo_valid = valid & self.from_to_promo_eligible
-        promo_indices = torch.where(promo_valid)[0]
-        promo_to = promo_indices % 81
-        promo_dirs = self.from_to_dir[promo_indices] + NUM_DIRECTIONS  # 10-19
-        promo_policy_indices = promo_dirs * 81 + promo_to
-        promo_logit_values = board_flat[:, promo_indices]
-
-        promo_policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
-        promo_policy_expanded = promo_policy_indices.unsqueeze(0).expand(B, -1)
-        promo_policy.scatter_reduce_(1, promo_policy_expanded, promo_logit_values,
-                                     reduce='amax', include_self=False)
+        # Take max over sources: (B, 2187)
+        board_policy = gathered.max(dim=2).values
 
         # Drop logits: drop_queries @ K^T
         dq = self.drop_queries.unsqueeze(0).expand(B, -1, -1)
         drop_logits = torch.matmul(dq, K.transpose(-2, -1)) * scale  # (B, 7, 81)
 
-        drop_policy = torch.full((B, POLICY_SIZE), -1e10, device=x.device, dtype=x.dtype)
-        drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81  # 1620
-        drop_policy[:, drop_start:drop_start + NUM_DROP_TYPES * 81] = drop_logits.reshape(B, -1)
-
-        # Combine: take max across the three (non-overlapping) contributions
-        policy = torch.maximum(torch.maximum(nopromo_policy, promo_policy), drop_policy)
+        # Write drops into the policy (slots 1620-2186)
+        drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81
+        # Replace the drop portion of board_policy with drop logits
+        policy = board_policy.clone()
+        policy[:, drop_start:drop_start + NUM_DROP_TYPES * 81] = drop_logits.flatten(1)
 
         return policy
 
@@ -406,7 +410,7 @@ class ValueHead(nn.Module):
 
     def forward(self, x):
         h = self.act(self.embed(x))
-        h = h.reshape(x.shape[0], -1)
+        h = torch.flatten(h, 1)  # (B, 81, emb) -> (B, 81*emb)
         h = self.act(self.fc1(h))
         return self.fc2(h)
 
@@ -422,7 +426,7 @@ class MovesLeftHead(nn.Module):
 
     def forward(self, x):
         h = self.act(self.embed(x))
-        h = h.reshape(x.shape[0], -1)
+        h = torch.flatten(h, 1)  # (B, 81, emb) -> (B, 81*emb)
         h = self.act(self.fc1(h))
         return F.relu(self.fc2(h))
 
