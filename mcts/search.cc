@@ -12,7 +12,9 @@
 #include "mcts/search.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <thread>
 #include <chrono>
 #include <cmath>
 #include <random>
@@ -103,7 +105,12 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     AddDirichletNoise(root.get());
   }
 
-  // --- Main search loop ---
+  // Route to multi-threaded search if configured.
+  if (config_.num_search_threads > 1) {
+    return SearchMT(board, game_ply, root, legal_moves);
+  }
+
+  // --- Single-threaded search loop ---
   auto t0 = std::chrono::steady_clock::now();
   int nodes_expanded = 0;
 
@@ -640,6 +647,290 @@ Move MCTSSearch::Mate1Ply(ShogiBoard& board) {
     if (is_mate) return m;
   }
   return Move();  // No 1-ply mate
+}
+
+// =====================================================================
+// Multi-threaded search (lc0-style barrier)
+// =====================================================================
+
+void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* root,
+                                const ShogiBoard& root_board) {
+  ctx.Reset();
+  Node* node = root;
+  ShogiBoard board = root_board;
+  int vl = config_.virtual_loss_count;
+
+  while (node->is_expanded() && !node->is_terminal()) {
+    ctx.path.push_back(node);
+    node->AddVirtualLoss(vl);
+
+    int best = SelectBestChild(node, node == root);
+    if (best < 0) {
+      // All children are terminal wins for opponent.
+      ctx.leaf = node;
+      ctx.leaf_type = ThreadContext::kTerminal;
+      ctx.value = -1.0f;
+      ctx.draw = 0.0f;
+      return;
+    }
+
+    Move m = node->edge(best).move;
+    board.DoMove(m);
+    Node* child = node->GetOrCreateChild(best);
+    node = child;
+
+    if (!node->is_expanded()) break;
+  }
+
+  // Arrived at unexpanded or terminal node.
+  ctx.path.push_back(node);
+  node->AddVirtualLoss(vl);
+  ctx.leaf = node;
+  ctx.board = board;
+
+  if (node->is_terminal()) {
+    ctx.leaf_type = ThreadContext::kTerminal;
+    ctx.value = node->terminal_v();
+    ctx.draw = node->terminal_d();
+    return;
+  }
+
+  // Try to claim expansion.
+  if (!node->TryStartExpansion()) {
+    // Another thread is expanding this node — collision.
+    ctx.leaf_type = ThreadContext::kCollision;
+    ctx.value = node->parent() ? -node->parent()->q() : 0.0f;
+    ctx.draw = 0.0f;
+    return;
+  }
+
+  // We own expansion. Generate legal moves.
+  ctx.legal_moves = board.GenerateLegalMoves();
+
+  // No legal moves = checkmate.
+  if (ctx.legal_moves.empty()) {
+    node->SetTerminal(-1.0f);
+    node->set_mate_status(-1);
+    if (node->parent() && node->parent_edge_idx() >= 0) {
+      node->parent()->edge(node->parent_edge_idx()).SetWin();
+    }
+    node->FinishExpansion();
+    ctx.leaf_type = ThreadContext::kTerminal;
+    ctx.value = -1.0f;
+    ctx.draw = 0.0f;
+    return;
+  }
+
+  // Mate-in-1 check.
+  Move mate1 = Mate1Ply(ctx.board);
+  if (!mate1.is_null()) {
+    node->SetTerminal(1.0f);
+    node->set_mate_status(1);
+    if (node->parent() && node->parent_edge_idx() >= 0) {
+      node->parent()->edge(node->parent_edge_idx()).SetLose();
+    }
+    node->FinishExpansion();
+    ctx.leaf_type = ThreadContext::kTerminal;
+    ctx.value = 1.0f;
+    ctx.draw = 0.0f;
+    return;
+  }
+
+  // Entering-king declaration.
+  if (ctx.board.CanDeclareWin()) {
+    node->SetTerminal(1.0f);
+    if (node->parent() && node->parent_edge_idx() >= 0) {
+      node->parent()->edge(node->parent_edge_idx()).SetLose();
+    }
+    node->FinishExpansion();
+    ctx.leaf_type = ThreadContext::kTerminal;
+    ctx.value = 1.0f;
+    ctx.draw = 0.0f;
+    return;
+  }
+
+  // Repetition check.
+  auto rep = ctx.board.CheckRepetition();
+  if (rep != ShogiBoard::RepetitionResult::kNone) {
+    float rep_v = config_.draw_score, rep_d = 0.0f;
+    switch (rep) {
+      case ShogiBoard::RepetitionResult::kDraw: rep_v = config_.draw_score; rep_d = 1.0f; break;
+      case ShogiBoard::RepetitionResult::kWin: rep_v = 1.0f; break;
+      case ShogiBoard::RepetitionResult::kLoss: rep_v = -1.0f; break;
+      default: break;
+    }
+    node->SetTerminal(rep_v, rep_d);
+    node->FinishExpansion();
+    ctx.leaf_type = ThreadContext::kTerminal;
+    ctx.value = rep_v;
+    ctx.draw = rep_d;
+    return;
+  }
+
+  // This leaf needs NN evaluation.
+  ctx.leaf_type = ThreadContext::kNeedsNN;
+}
+
+void MCTSSearch::MTExpandAndBackprop(ThreadContext& ctx) {
+  float value, draw;
+
+  if (ctx.leaf_type == ThreadContext::kNeedsNN) {
+    // Expand the node with NN output.
+    Node* leaf = ctx.leaf;
+    const NNOutput& eval = ctx.nn_output;
+    std::vector<std::pair<Move, float>> priors;
+    priors.reserve(ctx.legal_moves.size());
+    for (int i = 0; i < ctx.legal_moves.size(); i++) {
+      priors.emplace_back(ctx.legal_moves[i], eval.policy[i]);
+    }
+    leaf->Expand(priors);
+    leaf->set_evaluated(true);
+    leaf->FinishExpansion();
+
+    value = eval.value;
+    draw = eval.draw;
+  } else if (ctx.leaf_type == ThreadContext::kTerminal) {
+    value = ctx.value;
+    draw = ctx.draw;
+  } else {
+    // Collision: use parent's Q as estimate.
+    value = ctx.value;
+    draw = ctx.draw;
+  }
+
+  // Remove virtual loss and backpropagate real value.
+  int vl = config_.virtual_loss_count;
+  float v = value, d = draw;
+  for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
+    Node* node = ctx.path[i];
+    node->RemoveVirtualLoss(vl);
+    node->AddVisit(v, d);
+    v = -v;
+  }
+}
+
+void MCTSSearch::MTRemoveVirtualLoss(ThreadContext& ctx) {
+  int vl = config_.virtual_loss_count;
+  for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
+    ctx.path[i]->RemoveVirtualLoss(vl);
+  }
+}
+
+SearchResult MCTSSearch::SearchMT(ShogiBoard board, int game_ply,
+                                   std::unique_ptr<Node>& root,
+                                   const MoveList& legal_moves) {
+  const int N = config_.num_search_threads;
+  SearchBarrier barrier1(N);  // Select → Eval
+  SearchBarrier barrier2(N);  // Eval → Expand
+  SearchBarrier barrier3(N);  // Expand → next iteration
+
+  std::vector<ThreadContext> contexts(N);
+  BatchQueue batch_queue;
+  batch_queue.Init(N);
+  for (int i = 0; i < N; i++) {
+    contexts[i].thread_id = i;
+    batch_queue.SetContext(i, &contexts[i]);
+  }
+
+  std::atomic<int> total_nodes{0};
+  std::atomic<bool> search_done{false};
+  auto t0 = std::chrono::steady_clock::now();
+
+  // Launch worker threads.
+  std::vector<std::thread> threads;
+  for (int t = 0; t < N; t++) {
+    threads.emplace_back([&, t]() {
+      ThreadContext& ctx = contexts[t];
+
+      while (!search_done.load(std::memory_order_relaxed)) {
+        // ===== PHASE 1: SELECT =====
+        MTSelectPhase(ctx, root.get(), board);
+
+        barrier1.Wait();
+
+        // ===== PHASE 2: NN EVAL (thread 0 only) =====
+        if (t == 0) {
+          auto nn_batch = batch_queue.BuildBatch();
+          if (!nn_batch.empty()) {
+            auto results = evaluator_.EvaluateBatch(nn_batch);
+            batch_queue.DistributeResults(results);
+          }
+
+          // Check termination.
+          int n = total_nodes.load(std::memory_order_relaxed);
+          if (n >= config_.max_nodes || stop_.load(std::memory_order_relaxed)) {
+            search_done.store(true, std::memory_order_relaxed);
+          }
+          if (config_.max_time > 0.0f) {
+            auto now = std::chrono::steady_clock::now();
+            float elapsed = std::chrono::duration<float>(now - t0).count();
+            if (elapsed >= config_.max_time) {
+              search_done.store(true, std::memory_order_relaxed);
+            }
+          }
+        }
+
+        barrier2.Wait();
+
+        // ===== PHASE 3: EXPAND + BACKPROP =====
+        if (search_done.load(std::memory_order_relaxed)) {
+          // Search is done — just remove virtual loss.
+          MTRemoveVirtualLoss(ctx);
+        } else {
+          MTExpandAndBackprop(ctx);
+          if (ctx.leaf_type == ThreadContext::kNeedsNN) {
+            total_nodes.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        barrier3.Wait();
+      }
+    });
+  }
+
+  for (auto& thread : threads) thread.join();
+
+  // --- Post-search: PV mate search ---
+  if (dfpn_pv_ && config_.pv_dfpn_nodes > 0) {
+    PvMateSearch(root.get(), board);
+  }
+
+  // --- Collect result ---
+  auto t1 = std::chrono::steady_clock::now();
+  float elapsed = std::chrono::duration<float>(t1 - t0).count();
+
+  SearchResult result;
+  result.best_move = SelectMove(root.get(), game_ply);
+  result.nodes = total_nodes.load();
+  result.time_sec = elapsed;
+  result.nps = elapsed > 0.001f ? total_nodes.load() / elapsed : 0.0f;
+  result.root_q = root->q();
+  result.root_d = root->d_avg();
+  result.score_cp = QToCentipawns(root->q());
+  result.mate_status = root->mate_status();
+  result.pv = GetPV(root.get());
+
+  // Top children.
+  std::vector<std::pair<int, int>> child_visits;
+  for (int i = 0; i < root->num_edges(); i++) {
+    Node* c = root->child(i);
+    int n = c ? c->n() : 0;
+    child_visits.push_back({n, i});
+  }
+  std::sort(child_visits.begin(), child_visits.end(),
+            [](auto& a, auto& b) { return a.first > b.first; });
+  for (int k = 0; k < std::min(5, (int)child_visits.size()); k++) {
+    int i = child_visits[k].second;
+    Node* c = root->child(i);
+    SearchResult::ChildInfo ci;
+    ci.move = root->edge(i).move;
+    ci.n = c ? c->n() : 0;
+    ci.q = c ? c->q() : 0.0f;
+    ci.p = root->edge(i).policy;
+    result.top_children.push_back(ci);
+  }
+
+  return result;
 }
 
 }  // namespace jhbr2

@@ -94,6 +94,7 @@ void USIEngine::CmdUsi() {
   Send("option name LeafDfpnNodes type spin default 100 min 0 max 100000");
   Send("option name PvDfpnNodes type spin default 100000 min 0 max 10000000");
   Send("option name UseGPU type check default true");
+  Send("option name Threads type spin default 1 min 1 max 64");
 
   Send("usiok");
 }
@@ -155,6 +156,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     config_.pv_dfpn_nodes = pv_dfpn_nodes_;
   } else if (name_lower == "usegpu") {
     use_gpu_ = (value == "true");
+  } else if (name_lower == "threads") {
+    config_.num_search_threads = std::stoi(value);
   }
 
   Log("Set " + name + " = " + value);
@@ -267,7 +270,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // If it finds one before MCTS finishes (or within the minimum wait),
   // we use the mate move instead of the MCTS result.
   constexpr int kDfpnMinWaitMs = 300;  // minimum time to wait for df-pn
-  constexpr size_t kRootDfpnNodes = 1000000;  // 1M node budget for root df-pn
+  // Reduce root df-pn budget when using multi-threaded search to avoid
+  // excessive memory allocation in the df-pn thread.
+  const size_t kRootDfpnNodes = (config_.num_search_threads > 1) ? 10000 : 1000000;
 
   MateDfpnSolver root_dfpn(kRootDfpnNodes);
   std::atomic<bool> dfpn_done{false};

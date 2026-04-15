@@ -25,6 +25,7 @@
 
 #include "mcts/node.h"
 #include "mcts/nn_eval.h"
+#include "mcts/search_mt.h"
 #include "shogi/board.h"
 
 namespace jhbr2 {
@@ -122,12 +123,28 @@ class MCTSSearch {
   // Add Dirichlet noise to root edges.
   void AddDirichletNoise(Node* root);
 
+  // --- Multi-threaded search ---
+
+  // Barrier-based multi-threaded search (used when num_search_threads > 1).
+  SearchResult SearchMT(ShogiBoard board, int game_ply,
+                        std::unique_ptr<Node>& root,
+                        const MoveList& legal_moves);
+
+  // Per-thread selection phase.
+  void MTSelectPhase(ThreadContext& ctx, Node* root, const ShogiBoard& root_board);
+
+  // Per-thread expand + backpropagate phase.
+  void MTExpandAndBackprop(ThreadContext& ctx);
+
+  // Remove virtual loss without backpropagating (for cleanup on search end).
+  void MTRemoveVirtualLoss(ThreadContext& ctx);
+
   // --- Members ---
   NNEvaluator& evaluator_;
   MCTSConfig config_;
   std::unique_ptr<MateDfpnSolver> dfpn_leaf_;
   std::unique_ptr<MateDfpnSolver> dfpn_pv_;
-  bool stop_ = false;
+  std::atomic<bool> stop_{false};
 };
 
 }  // namespace jhbr2

@@ -111,6 +111,10 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
   if (input_shape.size() >= 2) {
     impl_->input_channels = static_cast<int>(input_shape[1]);
   }
+
+  // Batch support disabled for now — evaluates one at a time.
+  // TODO: enable when ONNX model batch inference is verified on CUDA.
+  supports_batch_ = false;
 }
 
 NNEvaluator::~NNEvaluator() = default;
@@ -127,6 +131,18 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
 
   const int batch_size = static_cast<int>(batch.size());
+
+  // If batch > 1, try batched inference. If the model doesn't support
+  // dynamic batch (e.g., old v1 models), fall back to one-at-a-time.
+  if (batch_size > 1 && !supports_batch_) {
+    std::vector<NNOutput> results;
+    results.reserve(batch_size);
+    for (const auto& [board, moves] : batch) {
+      results.push_back(Evaluate(board, moves));
+    }
+    return results;
+  }
+
   const int channels = impl_->input_channels;
   const int sq = 81;  // 9x9
 

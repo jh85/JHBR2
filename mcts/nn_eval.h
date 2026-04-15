@@ -66,6 +66,7 @@ class NNEvaluator {
   struct Impl;
   std::unique_ptr<Impl> impl_;
   bool using_gpu_ = false;
+  bool supports_batch_ = false;  // True if ONNX model handles batch > 1
 };
 
 }  // namespace jhbr2
