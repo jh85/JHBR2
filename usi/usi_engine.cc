@@ -266,21 +266,43 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   config_.max_time = max_time;
 
   // --- Launch root df-pn in parallel with MCTS (dlshogi-style) ---
-  // The df-pn runs in a background thread searching for forced mate.
-  // If it finds one before MCTS finishes (or within the minimum wait),
-  // we use the mate move instead of the MCTS result.
-  constexpr int kDfpnMinWaitMs = 300;  // minimum time to wait for df-pn
-  // Reduce root df-pn budget when using multi-threaded search to avoid
-  // excessive memory allocation in the df-pn thread.
-  const size_t kRootDfpnNodes = (config_.num_search_threads > 1) ? 10000 : 1000000;
+  // Scale df-pn budget and wait time with available time.
+  // More time remaining → larger df-pn budget → find deeper mates.
+  int my_time_ms = (board_.side_to_move() == BLACK) ? btime : wtime;
+  int my_inc_ms = (board_.side_to_move() == BLACK) ? binc : winc;
+  int available_ms = my_time_ms + my_inc_ms + byoyomi;
 
-  MateDfpnSolver root_dfpn(kRootDfpnNodes);
+  int dfpn_min_wait_ms;
+  size_t root_dfpn_nodes;
+  if (available_ms <= 0) {
+    // No time info (go nodes, go infinite) — use defaults.
+    dfpn_min_wait_ms = 300;
+    root_dfpn_nodes = 100000;
+  } else if (available_ms < 10000) {
+    // Under 10 seconds — minimal df-pn.
+    dfpn_min_wait_ms = 100;
+    root_dfpn_nodes = 10000;
+  } else if (available_ms < 60000) {
+    // 10-60 seconds — moderate df-pn.
+    dfpn_min_wait_ms = 300;
+    root_dfpn_nodes = 100000;
+  } else if (available_ms < 300000) {
+    // 1-5 minutes — generous df-pn.
+    dfpn_min_wait_ms = 500;
+    root_dfpn_nodes = 500000;
+  } else {
+    // 5+ minutes — deep df-pn search.
+    dfpn_min_wait_ms = 1000;
+    root_dfpn_nodes = 2000000;
+  }
+
+  MateDfpnSolver root_dfpn(root_dfpn_nodes);
   std::atomic<bool> dfpn_done{false};
   Move dfpn_mate_move;
   ShogiBoard dfpn_board = board_;  // copy for the df-pn thread
 
   auto dfpn_thread = std::thread([&]() {
-    dfpn_mate_move = root_dfpn.search(dfpn_board, kRootDfpnNodes);
+    dfpn_mate_move = root_dfpn.search(dfpn_board, root_dfpn_nodes);
     dfpn_done = true;
   });
 
@@ -295,7 +317,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     while (!dfpn_done) {
       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - mcts_done_time).count();
-      if (elapsed_ms >= kDfpnMinWaitMs) break;
+      if (elapsed_ms >= dfpn_min_wait_ms) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     root_dfpn.stop();
