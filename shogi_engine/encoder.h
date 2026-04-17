@@ -56,12 +56,15 @@ struct ShogiInputPlane {
   void Clear() { SetAll(0.0f); }
 
   // Set from a Bitboard (1.0 where set, 0.0 elsewhere).
+  // Layout: data[rank * 9 + file] to match the training convention.
   void SetFromBitboard(const Bitboard& bb) {
     Clear();
     Bitboard tmp = bb;
     while (tmp.Any()) {
       Square sq = tmp.Pop();
-      data[sq.as_idx()] = 1.0f;
+      int f = sq.as_idx() / 9;
+      int r = sq.as_idx() % 9;
+      data[r * 9 + f] = 1.0f;
     }
   }
 };
