@@ -418,6 +418,9 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, last_epoch=start_epoch - 1 if start_epoch > 0 else -1)
 
+    # Mixed precision training (FP16 forward, FP32 gradients).
+    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+
     # --- Multi-GPU with DataParallel ---
     if num_gpus > 1:
         print(f"Using DataParallel across {num_gpus} GPUs")
@@ -463,22 +466,25 @@ def train(args):
                     policy_target = policy_target.to(device, non_blocking=True)
                     wdl_target = wdl_target.to(device, non_blocking=True)
 
-                    policy_logits, wdl_logits, mlh = model(planes)
+                    with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                        policy_logits, wdl_logits, mlh = model(planes)
 
-                    has_policy = policy_target >= 0
-                    if has_policy.any():
-                        policy_loss = F.cross_entropy(
-                            policy_logits[has_policy], policy_target[has_policy])
-                    else:
-                        policy_loss = torch.tensor(0.0, device=device)
+                        has_policy = policy_target >= 0
+                        if has_policy.any():
+                            policy_loss = F.cross_entropy(
+                                policy_logits[has_policy], policy_target[has_policy])
+                        else:
+                            policy_loss = torch.tensor(0.0, device=device)
 
-                    value_loss = F.cross_entropy(wdl_logits, wdl_target)
-                    loss = policy_loss + args.value_weight * value_loss
+                        value_loss = F.cross_entropy(wdl_logits, wdl_target)
+                        loss = policy_loss + args.value_weight * value_loss
 
                     optimizer.zero_grad()
-                    loss.backward()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
 
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
@@ -503,22 +509,25 @@ def train(args):
                 policy_target = policy_target.to(device, non_blocking=True)
                 wdl_target = wdl_target.to(device, non_blocking=True)
 
-                policy_logits, wdl_logits, mlh = model(planes)
+                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                    policy_logits, wdl_logits, mlh = model(planes)
 
-                has_policy = policy_target >= 0
-                if has_policy.any():
-                    policy_loss = F.cross_entropy(
-                        policy_logits[has_policy], policy_target[has_policy])
-                else:
-                    policy_loss = torch.tensor(0.0, device=device)
+                    has_policy = policy_target >= 0
+                    if has_policy.any():
+                        policy_loss = F.cross_entropy(
+                            policy_logits[has_policy], policy_target[has_policy])
+                    else:
+                        policy_loss = torch.tensor(0.0, device=device)
 
-                value_loss = F.cross_entropy(wdl_logits, wdl_target)
-                loss = policy_loss + args.value_weight * value_loss
+                    value_loss = F.cross_entropy(wdl_logits, wdl_target)
+                    loss = policy_loss + args.value_weight * value_loss
 
                 optimizer.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
                 total_loss += loss.item()
                 total_policy_loss += policy_loss.item()
