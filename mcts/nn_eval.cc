@@ -1,12 +1,13 @@
 /*
   JHBR2 Shogi Engine — Neural Network Evaluator (ONNX Runtime)
 
-  Input:  (batch, 44, 9, 9) float32  [note: model uses 44 of 48 input planes]
+  Input:  (batch, C, 9, 9) float32
   Output: policy (batch, 2187), wdl (batch, 3), mlh (batch, 1)
 
-  Batching strategy: create separate ONNX sessions for fixed batch sizes
-  (1, 2, 4, 8, 16). At runtime, pick the smallest session that fits the
-  actual batch, pad with zeros. This avoids dynamic shape issues with CUDA.
+  Execution provider priority:
+    1. TensorRT (FP16, dynamic batch, fastest)
+    2. CUDA (FP32, uses multi-ONNX-file batching)
+    3. CPU (fallback)
 */
 
 #include "mcts/nn_eval.h"
@@ -50,115 +51,162 @@ static void Softmax(float* data, int size) {
 
 #if HAS_ONNXRUNTIME
 
-// Fixed batch sizes we create sessions for.
-static constexpr int kBatchSizes[] = {1, 2, 4, 8, 16};
-static constexpr int kNumBatchSizes = 5;
+// Fixed batch sizes for the multi-ONNX-file fallback (CUDA without TensorRT).
+static constexpr int kBatchSizes[] = {1, 2, 4, 8, 16, 32};
+static constexpr int kNumBatchSizes = 6;
 
 struct NNEvaluator::Impl {
   Ort::Env env{ORT_LOGGING_LEVEL_WARNING, "jhbr2"};
   Ort::SessionOptions session_opts;
 
-  // One session per fixed batch size. session[0]=batch1, session[1]=batch2, etc.
-  std::unique_ptr<Ort::Session> sessions[kNumBatchSizes];
-  bool session_valid[kNumBatchSizes] = {};  // true if session was created successfully
+  // TensorRT mode: single session handles any batch size.
+  std::unique_ptr<Ort::Session> trt_session;
 
-  // Input/output names (shared across all sessions — same model).
+  // CUDA fallback mode: one session per fixed batch size.
+  std::unique_ptr<Ort::Session> sessions[kNumBatchSizes];
+  bool session_valid[kNumBatchSizes] = {};
+
+  // Input/output names (shared).
   std::vector<std::string> input_names_str;
   std::vector<std::string> output_names_str;
   std::vector<const char*> input_names;
   std::vector<const char*> output_names;
 
-  // Input shape: (batch, channels, 9, 9)
   int input_channels = 44;
+  bool use_tensorrt = false;
 };
 
 NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
     : impl_(std::make_unique<Impl>()) {
 
-  // Initialize encoder tables.
   ShogiEncoderTables::Init();
 
   auto& opts = impl_->session_opts;
   opts.SetIntraOpNumThreads(1);
   opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-  // Try GPU first if requested.
+  // --- Try TensorRT first (best performance, dynamic batch) ---
   if (use_gpu) {
+    try {
+      Ort::SessionOptions trt_opts;
+      trt_opts.SetIntraOpNumThreads(1);
+      trt_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+      // TensorRT provider options via C API.
+      OrtTensorRTProviderOptionsV2* trt_provider_opts = nullptr;
+      Ort::GetApi().CreateTensorRTProviderOptions(&trt_provider_opts);
+      std::vector<const char*> trt_keys = {
+        "trt_max_workspace_size",
+        "trt_fp16_enable",
+        "trt_engine_cache_enable",
+        "trt_engine_cache_path",
+      };
+      std::vector<const char*> trt_values = {
+        "2147483648",   // 2GB workspace
+        "1",            // Enable FP16
+        "1",            // Cache the TRT engine
+        ".",            // Cache directory
+      };
+      Ort::GetApi().UpdateTensorRTProviderOptions(
+          trt_provider_opts, trt_keys.data(), trt_values.data(), trt_keys.size());
+      trt_opts.AppendExecutionProvider_TensorRT_V2(*trt_provider_opts);
+      Ort::GetApi().ReleaseTensorRTProviderOptions(trt_provider_opts);
+
+      // Also add CUDA as fallback for ops TensorRT doesn't support.
+      OrtCUDAProviderOptionsV2* cuda_opts = nullptr;
+      Ort::GetApi().CreateCUDAProviderOptions(&cuda_opts);
+      trt_opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
+      Ort::GetApi().ReleaseCUDAProviderOptions(cuda_opts);
+
+      impl_->trt_session = std::make_unique<Ort::Session>(
+          impl_->env, onnx_path.c_str(), trt_opts);
+
+      impl_->use_tensorrt = true;
+      using_gpu_ = true;
+      supports_batch_ = true;  // TensorRT handles dynamic batch
+      fprintf(stderr, "[NN] Using TensorRT (FP16, dynamic batch)\n");
+    } catch (const std::exception& e) {
+      fprintf(stderr, "[NN] TensorRT not available: %s\n", e.what());
+      impl_->trt_session.reset();
+      impl_->use_tensorrt = false;
+    }
+  }
+
+  // --- Fall back to CUDA ---
+  if (!impl_->use_tensorrt && use_gpu) {
     try {
       OrtCUDAProviderOptionsV2* cuda_opts = nullptr;
       Ort::GetApi().CreateCUDAProviderOptions(&cuda_opts);
       opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
       Ort::GetApi().ReleaseCUDAProviderOptions(cuda_opts);
       using_gpu_ = true;
+      fprintf(stderr, "[NN] Using CUDA\n");
     } catch (...) {
       using_gpu_ = false;
+      fprintf(stderr, "[NN] Using CPU\n");
     }
   }
 
-  // Create the batch=1 session first (always needed).
-  impl_->sessions[0] = std::make_unique<Ort::Session>(
-      impl_->env, onnx_path.c_str(), opts);
-  impl_->session_valid[0] = true;
+  // --- Get session for metadata (TRT or batch=1 CUDA/CPU) ---
+  Ort::Session* meta_session = nullptr;
 
-  // Get input/output names from the first session.
+  if (impl_->use_tensorrt) {
+    meta_session = impl_->trt_session.get();
+  } else {
+    impl_->sessions[0] = std::make_unique<Ort::Session>(
+        impl_->env, onnx_path.c_str(), opts);
+    impl_->session_valid[0] = true;
+    meta_session = impl_->sessions[0].get();
+  }
+
+  // Get input/output names.
   Ort::AllocatorWithDefaultOptions alloc;
-  auto& session = *impl_->sessions[0];
-
-  size_t num_inputs = session.GetInputCount();
+  size_t num_inputs = meta_session->GetInputCount();
   for (size_t i = 0; i < num_inputs; i++) {
-    auto name = session.GetInputNameAllocated(i, alloc);
+    auto name = meta_session->GetInputNameAllocated(i, alloc);
     impl_->input_names_str.push_back(name.get());
   }
-
-  size_t num_outputs = session.GetOutputCount();
+  size_t num_outputs = meta_session->GetOutputCount();
   for (size_t i = 0; i < num_outputs; i++) {
-    auto name = session.GetOutputNameAllocated(i, alloc);
+    auto name = meta_session->GetOutputNameAllocated(i, alloc);
     impl_->output_names_str.push_back(name.get());
   }
-
   for (auto& s : impl_->input_names_str) impl_->input_names.push_back(s.c_str());
   for (auto& s : impl_->output_names_str) impl_->output_names.push_back(s.c_str());
 
-  // Detect input channels from model shape.
-  auto input_shape = session.GetInputTypeInfo(0)
+  // Detect input channels.
+  auto input_shape = meta_session->GetInputTypeInfo(0)
       .GetTensorTypeAndShapeInfo().GetShape();
   if (input_shape.size() >= 2) {
     impl_->input_channels = static_cast<int>(input_shape[1]);
   }
 
-  // Try loading separate ONNX files for larger batch sizes.
-  // Convention: model.onnx → model_b2.onnx, model_b4.onnx, etc.
-  // Strip ".onnx" from the path and look for batch variants.
-  std::string base_path = onnx_path;
-  if (base_path.size() > 5 && base_path.substr(base_path.size() - 5) == ".onnx") {
-    base_path = base_path.substr(0, base_path.size() - 5);
-  }
-
-  for (int si = 1; si < kNumBatchSizes; si++) {
-    int bs = kBatchSizes[si];
-    std::string batch_path = base_path + "_b" + std::to_string(bs) + ".onnx";
-
-    // Check if the file exists.
-    std::ifstream test_file(batch_path);
-    if (!test_file.good()) continue;
-    test_file.close();
-
-    try {
-      impl_->sessions[si] = std::make_unique<Ort::Session>(
-          impl_->env, batch_path.c_str(), opts);
-      impl_->session_valid[si] = true;
-    } catch (...) {
-      impl_->sessions[si].reset();
-      impl_->session_valid[si] = false;
+  // --- CUDA fallback: load multi-batch ONNX files ---
+  if (!impl_->use_tensorrt) {
+    std::string base_path = onnx_path;
+    if (base_path.size() > 5 && base_path.substr(base_path.size() - 5) == ".onnx") {
+      base_path = base_path.substr(0, base_path.size() - 5);
     }
+    for (int si = 1; si < kNumBatchSizes; si++) {
+      int bs = kBatchSizes[si];
+      std::string batch_path = base_path + "_b" + std::to_string(bs) + ".onnx";
+      std::ifstream test_file(batch_path);
+      if (!test_file.good()) continue;
+      test_file.close();
+      try {
+        impl_->sessions[si] = std::make_unique<Ort::Session>(
+            impl_->env, batch_path.c_str(), opts);
+        impl_->session_valid[si] = true;
+      } catch (...) {
+        impl_->sessions[si].reset();
+      }
+    }
+    int max_batch = 1;
+    for (int si = 0; si < kNumBatchSizes; si++) {
+      if (impl_->session_valid[si]) max_batch = kBatchSizes[si];
+    }
+    supports_batch_ = (max_batch > 1);
   }
-
-  // Report batch support.
-  int max_batch = 1;
-  for (int si = 0; si < kNumBatchSizes; si++) {
-    if (impl_->session_valid[si]) max_batch = kBatchSizes[si];
-  }
-  supports_batch_ = (max_batch > 1);
 }
 
 NNEvaluator::~NNEvaluator() = default;
@@ -178,29 +226,38 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   const int channels = impl_->input_channels;
   constexpr int sq = 81;
 
-  // Find the best session for this batch size.
-  int session_idx = 0;  // default: batch=1
-  for (int si = kNumBatchSizes - 1; si >= 0; si--) {
-    if (impl_->session_valid[si] && kBatchSizes[si] >= batch_size) {
-      session_idx = si;
+  // --- Select session and determine padded batch size ---
+  Ort::Session* session = nullptr;
+  int padded_size = batch_size;
+
+  if (impl_->use_tensorrt) {
+    // TensorRT: single session, use actual batch size (no padding needed).
+    session = impl_->trt_session.get();
+    padded_size = batch_size;
+  } else {
+    // CUDA fallback: find best matching fixed-batch session.
+    int session_idx = 0;
+    for (int si = kNumBatchSizes - 1; si >= 0; si--) {
+      if (impl_->session_valid[si] && kBatchSizes[si] >= batch_size) {
+        session_idx = si;
+      }
     }
+    padded_size = kBatchSizes[session_idx];
+
+    // If no session fits, evaluate one at a time.
+    if (padded_size < batch_size) {
+      std::vector<NNOutput> results;
+      results.reserve(batch_size);
+      for (const auto& [board, moves] : batch) {
+        results.push_back(Evaluate(board, moves));
+      }
+      return results;
+    }
+    session = impl_->sessions[session_idx].get();
   }
 
-  int padded_size = kBatchSizes[session_idx];
-
-  // If no session can fit this batch, evaluate one at a time.
-  if (padded_size < batch_size) {
-    std::vector<NNOutput> results;
-    results.reserve(batch_size);
-    for (const auto& [board, moves] : batch) {
-      results.push_back(Evaluate(board, moves));
-    }
-    return results;
-  }
-
-  // Encode input planes (zero-padded for unused slots).
+  // --- Encode input planes ---
   std::vector<float> input_data(padded_size * channels * sq, 0.0f);
-
   for (int b = 0; b < batch_size; b++) {
     auto planes = EncodeShogiPosition(batch[b].first);
     float* dst = input_data.data() + b * channels * sq;
@@ -209,26 +266,22 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     }
   }
 
-  // Create input tensor with padded batch size.
+  // --- Run inference ---
   std::array<int64_t, 4> input_shape = {padded_size, channels, 9, 9};
-  auto memory_info = Ort::MemoryInfo::CreateCpu(
-      OrtArenaAllocator, OrtMemTypeDefault);
+  auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
   auto input_tensor = Ort::Value::CreateTensor<float>(
       memory_info, input_data.data(), input_data.size(),
       input_shape.data(), input_shape.size());
 
-  // Run inference on the selected session.
-  auto& session = *impl_->sessions[session_idx];
   std::vector<Ort::Value> outputs;
   try {
-    outputs = session.Run(
+    outputs = session->Run(
         Ort::RunOptions{nullptr},
         impl_->input_names.data(), &input_tensor, 1,
         impl_->output_names.data(), impl_->output_names.size());
   } catch (const Ort::Exception& e) {
-    fprintf(stderr, "[NN] ONNX error (batch=%d, padded=%d): %s\n",
-            batch_size, padded_size, e.what());
-    // Fall back to one-at-a-time with batch=1 session.
+    fprintf(stderr, "[NN] ONNX error (batch=%d): %s\n", batch_size, e.what());
+    // Fall back to one-at-a-time.
     std::vector<NNOutput> results;
     for (const auto& [board, moves] : batch) {
       results.push_back(Evaluate(board, moves));
@@ -236,7 +289,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     return results;
   }
 
-  // Parse outputs.
+  // --- Parse outputs ---
   float* policy_data = outputs[0].GetTensorMutableData<float>();
   float* wdl_data = outputs[1].GetTensorMutableData<float>();
 
@@ -261,7 +314,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     result.value = wdl[0] - wdl[2];
     result.draw = wdl[1];
 
-    // Policy: extract logits for legal moves, then softmax.
+    // Policy
     float* logits = policy_data + b * policy_size;
     bool is_white = (board.side_to_move() == lczero::WHITE);
 
@@ -297,11 +350,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 
 #else  // !HAS_ONNXRUNTIME
 
-// Stub implementation when ONNX Runtime is not available.
-
+// Stub implementation.
 struct NNEvaluator::Impl {};
 
-NNEvaluator::NNEvaluator(const std::string& /*onnx_path*/, bool /*use_gpu*/)
+NNEvaluator::NNEvaluator(const std::string&, bool)
     : impl_(std::make_unique<Impl>()) {
   ShogiEncoderTables::Init();
 }
@@ -311,26 +363,20 @@ NNEvaluator::~NNEvaluator() = default;
 NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,
                                 const MoveList& legal_moves) {
   NNOutput result;
-  result.value = 0.0f;
-  result.draw = 0.1f;
-  result.wdl[0] = 0.45f;
-  result.wdl[1] = 0.1f;
-  result.wdl[2] = 0.45f;
-  float uniform = legal_moves.empty() ? 0.0f : 1.0f / legal_moves.size();
-  result.policy.assign(legal_moves.size(), uniform);
+  result.value = 0.0f; result.draw = 0.1f;
+  result.wdl[0] = 0.45f; result.wdl[1] = 0.1f; result.wdl[2] = 0.45f;
+  float u = legal_moves.empty() ? 0.0f : 1.0f / legal_moves.size();
+  result.policy.assign(legal_moves.size(), u);
   return result;
 }
 
 std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
   std::vector<NNOutput> results;
-  results.reserve(batch.size());
-  for (auto& [board, moves] : batch) {
-    results.push_back(Evaluate(board, moves));
-  }
+  for (auto& [board, moves] : batch) results.push_back(Evaluate(board, moves));
   return results;
 }
 
-#endif  // HAS_ONNXRUNTIME
+#endif
 
 }  // namespace jhbr2
