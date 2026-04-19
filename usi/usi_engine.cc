@@ -95,6 +95,7 @@ void USIEngine::CmdUsi() {
   Send("option name PvDfpnNodes type spin default 100000 min 0 max 10000000");
   Send("option name UseGPU type check default true");
   Send("option name Threads type spin default 1 min 1 max 64");
+  Send("option name ExpandDepth type spin default 1 min 1 max 8");
 
   Send("usiok");
 }
@@ -158,6 +159,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     use_gpu_ = (value == "true");
   } else if (name_lower == "threads") {
     config_.num_search_threads = std::stoi(value);
+  } else if (name_lower == "expanddepth") {
+    config_.expand_depth = std::stoi(value);
   }
 
   Log("Set " + name + " = " + value);

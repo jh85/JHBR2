@@ -653,18 +653,17 @@ Move MCTSSearch::Mate1Ply(ShogiBoard& board) {
 // Multi-threaded search (lc0-style barrier)
 // =====================================================================
 
-void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* root,
-                                const ShogiBoard& root_board) {
-  ctx.Reset();
-  Node* node = root;
-  ShogiBoard board = root_board;
+void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* start_node,
+                                const ShogiBoard& start_board) {
+  Node* node = start_node;
+  ShogiBoard board = start_board;
   int vl = config_.virtual_loss_count;
 
   while (node->is_expanded() && !node->is_terminal()) {
     ctx.path.push_back(node);
     node->AddVirtualLoss(vl);
 
-    int best = SelectBestChild(node, node == root);
+    int best = SelectBestChild(node, node == start_node && ctx.expand_records.empty());
     if (best < 0) {
       // All children are terminal wins for opponent.
       ctx.leaf = node;
@@ -820,9 +819,10 @@ SearchResult MCTSSearch::SearchMT(ShogiBoard board, int game_ply,
                                    std::unique_ptr<Node>& root,
                                    const MoveList& legal_moves) {
   const int N = config_.num_search_threads;
+  const int K = config_.expand_depth;  // expansions per simulation
   SearchBarrier barrier1(N);  // Select → Eval
   SearchBarrier barrier2(N);  // Eval → Expand
-  SearchBarrier barrier3(N);  // Expand → next iteration
+  SearchBarrier barrier3(N);  // Expand → next depth or next iteration
 
   std::vector<ThreadContext> contexts(N);
   BatchQueue batch_queue;
@@ -843,47 +843,128 @@ SearchResult MCTSSearch::SearchMT(ShogiBoard board, int game_ply,
       ThreadContext& ctx = contexts[t];
 
       while (!search_done.load(std::memory_order_relaxed)) {
-        // ===== PHASE 1: SELECT =====
-        MTSelectPhase(ctx, root.get(), board);
+        // Reset for new simulation.
+        ctx.Reset();
 
-        barrier1.Wait();
+        // ===== MULTI-EXPAND LOOP: K depths =====
+        for (int depth = 0; depth < K; depth++) {
 
-        // ===== PHASE 2: NN EVAL (thread 0 only) =====
-        if (t == 0) {
-          auto nn_batch = batch_queue.BuildBatch();
-          if (!nn_batch.empty()) {
-            auto results = evaluator_.EvaluateBatch(nn_batch);
-            batch_queue.DistributeResults(results);
+          // ===== PHASE 1: SELECT =====
+          if (depth == 0) {
+            // First depth: select from root.
+            MTSelectPhase(ctx, root.get(), board);
+          } else if (ctx.can_continue) {
+            // Deeper depths: continue from the just-expanded node.
+            Node* continue_from = ctx.leaf;
+            ShogiBoard continue_board = ctx.board;
+            ctx.ResetForNextDepth();
+            MTSelectPhase(ctx, continue_from, continue_board);
           }
+          // If can_continue is false (terminal/collision at previous depth),
+          // this thread is idle for remaining depths. It still participates
+          // in barriers but doesn't need NN evaluation.
 
-          // Check termination.
-          int n = total_nodes.load(std::memory_order_relaxed);
-          if (n >= config_.max_nodes || stop_.load(std::memory_order_relaxed)) {
-            search_done.store(true, std::memory_order_relaxed);
-          }
-          if (config_.max_time > 0.0f) {
-            auto now = std::chrono::steady_clock::now();
-            float elapsed = std::chrono::duration<float>(now - t0).count();
-            if (elapsed >= config_.max_time) {
+          barrier1.Wait();
+
+          // ===== PHASE 2: NN EVAL (thread 0 only) =====
+          if (t == 0) {
+            auto nn_batch = batch_queue.BuildBatch();
+            if (!nn_batch.empty()) {
+              auto results = evaluator_.EvaluateBatch(nn_batch);
+              batch_queue.DistributeResults(results);
+            }
+
+            // Check termination.
+            int n = total_nodes.load(std::memory_order_relaxed);
+            if (n >= config_.max_nodes || stop_.load(std::memory_order_relaxed)) {
               search_done.store(true, std::memory_order_relaxed);
+            }
+            if (config_.max_time > 0.0f) {
+              auto now = std::chrono::steady_clock::now();
+              float elapsed = std::chrono::duration<float>(now - t0).count();
+              if (elapsed >= config_.max_time) {
+                search_done.store(true, std::memory_order_relaxed);
+              }
+            }
+          }
+
+          barrier2.Wait();
+
+          // ===== PHASE 3: EXPAND (no backprop yet) =====
+          if (search_done.load(std::memory_order_relaxed)) {
+            ctx.can_continue = false;
+          } else if (ctx.can_continue) {
+            // Expand the node but DON'T backpropagate yet.
+            // Save the expansion record for later backprop.
+            float v = 0.0f, d = 0.0f;
+
+            if (ctx.leaf_type == ThreadContext::kNeedsNN) {
+              Node* leaf = ctx.leaf;
+              const NNOutput& eval = ctx.nn_output;
+              std::vector<std::pair<Move, float>> priors;
+              priors.reserve(ctx.legal_moves.size());
+              for (int i = 0; i < ctx.legal_moves.size(); i++) {
+                priors.emplace_back(ctx.legal_moves[i], eval.policy[i]);
+              }
+              leaf->Expand(priors);
+              leaf->set_evaluated(true);
+              leaf->FinishExpansion();
+              v = eval.value;
+              d = eval.draw;
+              total_nodes.fetch_add(1, std::memory_order_relaxed);
+              // Can continue deeper from this expanded node.
+              ctx.can_continue = true;
+            } else if (ctx.leaf_type == ThreadContext::kTerminal) {
+              v = ctx.value;
+              d = ctx.draw;
+              ctx.can_continue = false;  // Terminal — can't go deeper.
+            } else {
+              // Collision.
+              v = ctx.value;
+              d = ctx.draw;
+              ctx.can_continue = false;
+            }
+
+            // Record this expansion for backpropagation.
+            ctx.expand_records.push_back({
+              (int)ctx.path.size() - 1,  // path index of this leaf
+              v, d, ctx.leaf_type
+            });
+          }
+
+          barrier3.Wait();
+
+          // If search is done, break out of multi-expand loop.
+          if (search_done.load(std::memory_order_relaxed)) break;
+        }
+
+        // ===== BACKPROPAGATE all depths =====
+        // Walk from the deepest leaf back to root, removing virtual loss
+        // and adding real visit values at each expansion point.
+        if (!ctx.path.empty()) {
+          int vl = config_.virtual_loss_count;
+
+          if (ctx.expand_records.empty()) {
+            // No expansions happened (e.g., search_done on first depth).
+            // Just remove virtual loss.
+            for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
+              ctx.path[i]->RemoveVirtualLoss(vl);
+            }
+          } else {
+            // Backpropagate from deepest expansion to root.
+            // The last expand_record has the deepest value.
+            // Propagate its value all the way up, removing virtual loss.
+            auto& deepest = ctx.expand_records.back();
+            float v = deepest.value;
+            float d = deepest.draw;
+
+            for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
+              ctx.path[i]->RemoveVirtualLoss(vl);
+              ctx.path[i]->AddVisit(v, d);
+              v = -v;
             }
           }
         }
-
-        barrier2.Wait();
-
-        // ===== PHASE 3: EXPAND + BACKPROP =====
-        if (search_done.load(std::memory_order_relaxed)) {
-          // Search is done — just remove virtual loss.
-          MTRemoveVirtualLoss(ctx);
-        } else {
-          MTExpandAndBackprop(ctx);
-          if (ctx.leaf_type == ThreadContext::kNeedsNN) {
-            total_nodes.fetch_add(1, std::memory_order_relaxed);
-          }
-        }
-
-        barrier3.Wait();
       }
     });
   }

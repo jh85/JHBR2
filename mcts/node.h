@@ -275,6 +275,7 @@ struct MCTSConfig {
   // Threading
   int num_search_threads = 1;       // 1 = single-threaded (backward compatible)
   int virtual_loss_count = 3;       // Virtual visits per selection
+  int expand_depth = 1;             // Nodes to expand per simulation (1 = standard)
 };
 
 }  // namespace jhbr2

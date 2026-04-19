@@ -2,7 +2,7 @@
   JHBR2 Shogi Engine — Multi-Threaded MCTS Support
 
   Barrier synchronization, thread context, and batch queue for
-  lc0-style parallel MCTS search.
+  lc0-style parallel MCTS search with multi-expand support.
 */
 
 #pragma once
@@ -52,23 +52,22 @@ class SearchBarrier {
 // =====================================================================
 // ThreadContext — per-thread data for one search iteration
 // =====================================================================
+// Supports multi-expand: each thread can hold multiple leaves
+// from successive depths within one simulation.
 
 struct ThreadContext {
   int thread_id = 0;
 
-  // Selection result
+  // Current leaf (set during each select phase)
   Node* leaf = nullptr;
   ShogiBoard board;
   MoveList legal_moves;
 
-  // Path from root to leaf (for virtual loss tracking)
-  std::vector<Node*> path;
-
-  // Classification of the leaf
+  // Classification of the current leaf
   enum LeafType {
-    kNeedsNN,          // Normal leaf, needs NN evaluation
-    kTerminal,         // Terminal node (checkmate, repetition, etc.)
-    kCollision,        // Another thread is expanding this node
+    kNeedsNN,
+    kTerminal,
+    kCollision,
   };
   LeafType leaf_type = kNeedsNN;
 
@@ -76,15 +75,41 @@ struct ThreadContext {
   float value = 0.0f;
   float draw = 0.0f;
 
-  // Index into the NN batch results (-1 if not evaluated)
+  // NN batch index (-1 if not evaluated)
   int batch_index = -1;
 
   // NN output (set in Phase 2)
   NNOutput nn_output;
 
+  // --- Multi-expand tracking ---
+  // Full path from root through all expansion depths (virtual loss applied here).
+  std::vector<Node*> path;
+
+  // Per-depth expansion records (for multi-expand backpropagation).
+  struct ExpandRecord {
+    int path_index;      // Index into path[] where this expansion's leaf is
+    float value;         // NN value (or terminal value)
+    float draw;          // Draw probability
+    LeafType leaf_type;  // What happened at this depth
+  };
+  std::vector<ExpandRecord> expand_records;
+
+  // Whether this thread should continue deeper (set after each expand phase).
+  bool can_continue = true;
+
   void Reset() {
     leaf = nullptr;
     path.clear();
+    expand_records.clear();
+    leaf_type = kNeedsNN;
+    value = 0.0f;
+    draw = 0.0f;
+    batch_index = -1;
+    can_continue = true;
+  }
+
+  void ResetForNextDepth() {
+    leaf = nullptr;
     leaf_type = kNeedsNN;
     value = 0.0f;
     draw = 0.0f;
@@ -95,8 +120,6 @@ struct ThreadContext {
 // =====================================================================
 // BatchQueue — collects leaves for batched NN evaluation
 // =====================================================================
-// Each thread writes at its own index. Thread 0 builds the batch
-// after the barrier. No locking needed — indices are disjoint.
 
 class BatchQueue {
  public:
@@ -108,14 +131,12 @@ class BatchQueue {
     contexts_[thread_id] = ctx;
   }
 
-  // Build NN batch from all threads that need evaluation.
-  // Returns the batch and assigns batch_index to each context.
   std::vector<std::pair<ShogiBoard, MoveList>> BuildBatch() {
     std::vector<std::pair<ShogiBoard, MoveList>> batch;
     int idx = 0;
     for (auto* ctx : contexts_) {
       ctx->batch_index = -1;
-      if (ctx->leaf_type == ThreadContext::kNeedsNN) {
+      if (ctx->leaf_type == ThreadContext::kNeedsNN && ctx->can_continue) {
         ctx->batch_index = idx++;
         batch.emplace_back(ctx->board, ctx->legal_moves);
       }
@@ -123,7 +144,6 @@ class BatchQueue {
     return batch;
   }
 
-  // Distribute NN results back to each thread's context.
   void DistributeResults(const std::vector<NNOutput>& results) {
     for (auto* ctx : contexts_) {
       if (ctx->batch_index >= 0 && ctx->batch_index < (int)results.size()) {
