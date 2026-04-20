@@ -169,14 +169,23 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/)
     impl_->input_channels = input_dims.d[1];
   }
 
-  // Determine max batch size from profile.
-  impl_->max_batch_size = 32;  // default
-  int nb_profiles = impl_->engine->getNbOptimizationProfiles();
-  if (nb_profiles > 0) {
-    auto max_dims = impl_->engine->getProfileShape(
-        "input_planes", 0, nvinfer1::OptProfileSelector::kMAX);
-    if (max_dims.nbDims >= 1) {
-      impl_->max_batch_size = max_dims.d[0];
+  // Determine batch size from the engine's input shape.
+  // For static-batch engines, this is the fixed batch size.
+  // For dynamic-batch engines, use the max profile shape.
+  auto engine_input_dims = impl_->engine->getTensorShape("input_planes");
+  if (engine_input_dims.nbDims >= 1 && engine_input_dims.d[0] > 0) {
+    // Static batch — the batch dim is fixed.
+    impl_->max_batch_size = engine_input_dims.d[0];
+  } else {
+    // Dynamic batch — check optimization profile.
+    impl_->max_batch_size = 32;  // default
+    int nb_profiles = impl_->engine->getNbOptimizationProfiles();
+    if (nb_profiles > 0) {
+      auto max_dims = impl_->engine->getProfileShape(
+          "input_planes", 0, nvinfer1::OptProfileSelector::kMAX);
+      if (max_dims.nbDims >= 1) {
+        impl_->max_batch_size = max_dims.d[0];
+      }
     }
   }
 
@@ -239,12 +248,26 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     return results;
   }
 
-  // Clamp to max batch size.
-  assert(batch_size <= impl_->max_batch_size);
+  // For static-batch engines, always use the full batch size (pad with zeros).
+  // For dynamic-batch engines, use the actual batch size.
+  int run_batch = impl_->max_batch_size;
+  if (batch_size > run_batch) {
+    // Batch too large — evaluate in chunks.
+    std::vector<NNOutput> results;
+    results.reserve(batch_size);
+    for (int start = 0; start < batch_size; start += run_batch) {
+      int end = std::min(start + run_batch, batch_size);
+      std::vector<std::pair<ShogiBoard, MoveList>> chunk(
+          batch.begin() + start, batch.begin() + end);
+      auto chunk_results = EvaluateBatch(chunk);
+      results.insert(results.end(), chunk_results.begin(), chunk_results.end());
+    }
+    return results;
+  }
 
-  // Encode input planes.
+  // Encode input planes (zero-padded to run_batch).
   std::fill(impl_->h_input.begin(),
-            impl_->h_input.begin() + batch_size * C * sq, 0.0f);
+            impl_->h_input.begin() + run_batch * C * sq, 0.0f);
 
   for (int b = 0; b < batch_size; b++) {
     auto planes = EncodeShogiPosition(batch[b].first);
@@ -254,8 +277,8 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     }
   }
 
-  // Set input shape for this batch size.
-  nvinfer1::Dims4 input_dims{batch_size, C, 9, 9};
+  // Set input shape for this batch.
+  nvinfer1::Dims4 input_dims{run_batch, C, 9, 9};
   impl_->context->setInputShape("input_planes", input_dims);
 
   // Set tensor addresses.
@@ -266,9 +289,9 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     impl_->context->setTensorAddress("mlh", impl_->d_mlh);
   }
 
-  // Copy input to GPU.
+  // Copy input to GPU (full run_batch, including padding).
   CUDA_CHECK(cudaMemcpyAsync(impl_->d_input, impl_->h_input.data(),
-      batch_size * C * sq * sizeof(float),
+      run_batch * C * sq * sizeof(float),
       cudaMemcpyHostToDevice, impl_->stream));
 
   // Run inference.
@@ -277,12 +300,12 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     fprintf(stderr, "[TRT] Inference failed\n");
   }
 
-  // Copy outputs to host.
+  // Copy outputs to host (only need batch_size results, but copy run_batch for simplicity).
   CUDA_CHECK(cudaMemcpyAsync(impl_->h_policy.data(), impl_->d_policy,
-      batch_size * P * sizeof(float),
+      run_batch * P * sizeof(float),
       cudaMemcpyDeviceToHost, impl_->stream));
   CUDA_CHECK(cudaMemcpyAsync(impl_->h_wdl.data(), impl_->d_wdl,
-      batch_size * 3 * sizeof(float),
+      run_batch * 3 * sizeof(float),
       cudaMemcpyDeviceToHost, impl_->stream));
 
   // Wait for completion.
