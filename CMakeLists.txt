@@ -49,8 +49,10 @@ if(ONNXRUNTIME_ROOT)
     set(ORT_LIB ${ONNXRUNTIME_ROOT}/lib)
   endif()
 else()
-  message(WARNING "ONNXRUNTIME_ROOT not set. NN evaluator will not build. "
-    "Download from: https://github.com/microsoft/onnxruntime/releases")
+  if(NOT USE_TENSORRT)
+    message(WARNING "ONNXRUNTIME_ROOT not set. NN evaluator will not build. "
+      "Download from: https://github.com/microsoft/onnxruntime/releases")
+  endif()
   set(ORT_INCLUDE "")
   set(ORT_LIB "")
 endif()
@@ -118,8 +120,10 @@ target_link_libraries(mcts PUBLIC shogi_core mate_solver)
 
 if(USE_TENSORRT)
   # Native TensorRT backend.
+  find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(mcts PUBLIC USE_TENSORRT=1)
-  target_link_libraries(mcts PUBLIC nvinfer cudart)
+  target_include_directories(mcts PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(mcts PUBLIC nvinfer CUDA::cudart)
 elseif(ORT_INCLUDE)
   # ONNX Runtime backend.
   target_include_directories(mcts PUBLIC ${ORT_INCLUDE})
