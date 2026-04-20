@@ -24,7 +24,11 @@
 #include <vector>
 
 #include "mcts/node.h"
+#ifdef USE_TENSORRT
+#include "mcts/nn_tensorrt.h"
+#else
 #include "mcts/nn_eval.h"
+#endif
 #include "mcts/search_mt.h"
 #include "shogi/board.h"
 

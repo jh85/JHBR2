@@ -65,10 +65,19 @@ set(SHOGI_ENGINE_SRCS
 )
 
 # MCTS
-set(MCTS_SRCS
-  mcts/search.cc
-  mcts/nn_eval.cc
-)
+option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
+
+if(USE_TENSORRT)
+  set(MCTS_SRCS
+    mcts/search.cc
+    mcts/nn_tensorrt.cc
+  )
+else()
+  set(MCTS_SRCS
+    mcts/search.cc
+    mcts/nn_eval.cc
+  )
+endif()
 
 # Mate solver
 set(MATE_SRCS
@@ -106,7 +115,13 @@ target_link_libraries(mate_solver PUBLIC shogi_core)
 # ---- Library: mcts ----
 add_library(mcts STATIC ${MCTS_SRCS})
 target_link_libraries(mcts PUBLIC shogi_core mate_solver)
-if(ORT_INCLUDE)
+
+if(USE_TENSORRT)
+  # Native TensorRT backend.
+  target_compile_definitions(mcts PUBLIC USE_TENSORRT=1)
+  target_link_libraries(mcts PUBLIC nvinfer cudart)
+elseif(ORT_INCLUDE)
+  # ONNX Runtime backend.
   target_include_directories(mcts PUBLIC ${ORT_INCLUDE})
   target_link_directories(mcts PUBLIC ${ORT_LIB})
   target_link_libraries(mcts PUBLIC onnxruntime)
@@ -116,7 +131,7 @@ endif()
 # ---- Executable ----
 add_executable(jhbr2 main.cc ${USI_SRCS})
 target_link_libraries(jhbr2 PRIVATE mcts mate_solver shogi_core)
-if(ORT_INCLUDE)
+if(NOT USE_TENSORRT AND ORT_INCLUDE)
   target_include_directories(jhbr2 PRIVATE ${ORT_INCLUDE})
 endif()
 

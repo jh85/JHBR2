@@ -14,7 +14,11 @@
 #include <unordered_map>
 
 #include "mcts/node.h"
+#ifdef USE_TENSORRT
+#include "mcts/nn_tensorrt.h"
+#else
 #include "mcts/nn_eval.h"
+#endif
 #include "mcts/search.h"
 #include "shogi/board.h"
 
