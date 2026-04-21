@@ -415,8 +415,13 @@ def train(args):
         else:
             print(f"Checkpoint not found: {args.resume}, starting from scratch")
 
+    # Fresh cosine schedule for the remaining epochs.
+    # When resuming, the schedule runs from lr → 0 over (total_epochs - start_epoch) steps.
+    remaining_epochs = args.epochs - start_epoch
+    if remaining_epochs <= 0:
+        remaining_epochs = args.epochs  # safety fallback
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, last_epoch=start_epoch - 1 if start_epoch > 0 else -1)
+        optimizer, T_max=remaining_epochs, last_epoch=-1)
 
     # Mixed precision training (FP16 forward, FP32 gradients).
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
