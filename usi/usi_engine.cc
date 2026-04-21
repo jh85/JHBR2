@@ -319,10 +319,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       ? max_move_time_ms_
       : static_cast<int>(max_time * 1000) + 2000;  // clock time + 2s margin
 
-  // Cap df-pn time to be strictly less than the move deadline.
-  int dfpn_max_time_ms = std::min(dfpn_max_time_ms_,
-                                   std::max(hard_deadline_ms - 1000, 500));
-
   MateDfpnSolver root_dfpn(root_dfpn_nodes);
   std::atomic<bool> dfpn_done{false};
   Move dfpn_mate_move;
@@ -333,32 +329,19 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     dfpn_done = true;
   });
 
-  // Auto-stop df-pn after max time (runs alongside MCTS).
-  auto dfpn_timer_thread = std::thread([&]() {
-    while (!dfpn_done) {
-      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - move_start_time).count();
-      if (elapsed >= dfpn_max_time_ms) {
-        root_dfpn.stop();
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-  });
-
   // --- Run MCTS concurrently ---
   search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
   SearchResult result = search_->Search(board_, game_ply_);
 
-  // --- Stop df-pn immediately (don't wait extra if move deadline is near) ---
+  // --- Stop df-pn and wait for it to finish ---
   root_dfpn.stop();
-  auto mcts_done_time = std::chrono::steady_clock::now();
-  auto total_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      mcts_done_time - move_start_time).count();
 
-  // Only wait for df-pn if we have time remaining.
+  // Brief wait if we have time remaining before the hard deadline.
+  auto total_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - move_start_time).count();
   int remaining_ms = hard_deadline_ms - (int)total_elapsed_ms;
   int wait_ms = std::min(dfpn_min_wait_ms, std::max(remaining_ms - 500, 0));
+
   if (!dfpn_done && wait_ms > 0) {
     auto wait_start = std::chrono::steady_clock::now();
     while (!dfpn_done) {
@@ -367,9 +350,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       if (elapsed_ms >= wait_ms) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    root_dfpn.stop();  // ensure stopped if wait timed out
   }
   dfpn_thread.join();
-  dfpn_timer_thread.join();
 
   // --- Choose result: prefer mate if found ---
   bool use_mate = dfpn_done &&
