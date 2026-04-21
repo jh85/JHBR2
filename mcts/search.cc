@@ -766,6 +766,27 @@ void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* start_node,
     return;
   }
 
+  // Leaf df-pn: small-budget mate search (if enabled).
+  if (config_.leaf_dfpn_nodes > 0 && !node->dfpn_checked()) {
+    node->set_dfpn_checked(true);
+    MateDfpnSolver leaf_dfpn(config_.leaf_dfpn_nodes);
+    Move mate_move = leaf_dfpn.search(ctx.board, config_.leaf_dfpn_nodes);
+    if (MateDfpnSolver::IsNoMate(mate_move)) {
+      node->set_dfpn_proven_no_mate(true);
+    } else if (!mate_move.is_null()) {
+      node->SetTerminal(1.0f);
+      node->set_mate_status(1);
+      if (node->parent() && node->parent_edge_idx() >= 0) {
+        node->parent()->edge(node->parent_edge_idx()).SetLose();
+      }
+      node->FinishExpansion();
+      ctx.leaf_type = ThreadContext::kTerminal;
+      ctx.value = 1.0f;
+      ctx.draw = 0.0f;
+      return;
+    }
+  }
+
   // This leaf needs NN evaluation.
   ctx.leaf_type = ThreadContext::kNeedsNN;
 }
