@@ -94,7 +94,7 @@ void USIEngine::CmdUsi() {
   Send("option name LeafDfpnNodes type spin default 100 min 0 max 100000");
   Send("option name PvDfpnNodes type spin default 100000 min 0 max 10000000");
   Send("option name UseGPU type check default true");
-  Send("option name Threads type spin default 1 min 1 max 64");
+  Send("option name Threads type spin default 1 min 1 max 4096");
   Send("option name ExpandDepth type spin default 1 min 1 max 8");
 
   Send("usiok");
