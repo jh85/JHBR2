@@ -97,6 +97,9 @@ template<bool or_node>
 void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
                              uint32_t second_pn, uint32_t second_dn,
                              int ply) {
+  // Early exit if stopped.
+  if (stop_) return;
+
   // Expand if not yet expanded.
   if (!node.is_expanded()) {
     ExpandNode<or_node>(board, node, ply);
