@@ -97,6 +97,7 @@ void USIEngine::CmdUsi() {
   Send("option name Threads type spin default 1 min 1 max 4096");
   Send("option name ExpandDepth type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
+  Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
 
   Send("usiok");
 }
@@ -164,6 +165,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     config_.expand_depth = std::stoi(value);
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
+  } else if (name_lower == "maxmovetime") {
+    max_move_time_ms_ = std::stoi(value);
   }
 
   Log("Set " + name + " = " + value);
@@ -259,6 +262,14 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     int my_inc = (board_.side_to_move() == BLACK) ? binc : winc;
     max_time = (my_time * 0.05f + my_inc * 0.8f) / 1000.0f;
     max_time = std::max(max_time, 0.1f);
+  }
+
+  // Apply per-move time cap (MaxMoveTime option).
+  if (max_move_time_ms_ > 0) {
+    float cap = max_move_time_ms_ / 1000.0f;
+    if (max_time <= 0.0f || cap < max_time) {
+      max_time = cap;
+    }
   }
 
   // Check entering-king declaration.

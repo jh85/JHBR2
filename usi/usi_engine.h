@@ -66,6 +66,7 @@ class USIEngine {
   float noise_epsilon_ = 0.0f;
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;  // Max time for root df-pn (ms)
+  int max_move_time_ms_ = 0;     // Max time per move (ms), 0 = use clock
 };
 
 }  // namespace jhbr2
