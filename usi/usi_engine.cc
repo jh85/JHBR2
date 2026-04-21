@@ -96,6 +96,7 @@ void USIEngine::CmdUsi() {
   Send("option name UseGPU type check default true");
   Send("option name Threads type spin default 1 min 1 max 4096");
   Send("option name ExpandDepth type spin default 1 min 1 max 8");
+  Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
 
   Send("usiok");
 }
@@ -161,6 +162,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     config_.num_search_threads = std::stoi(value);
   } else if (name_lower == "expanddepth") {
     config_.expand_depth = std::stoi(value);
+  } else if (name_lower == "dfpnmaxtime") {
+    dfpn_max_time_ms_ = std::stoi(value);
   }
 
   Log("Set " + name + " = " + value);
@@ -299,24 +302,40 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     root_dfpn_nodes = 2000000;
   }
 
+  // Cap df-pn total time (configurable, default 4 seconds).
+  int dfpn_max_time_ms = dfpn_max_time_ms_;
+
   MateDfpnSolver root_dfpn(root_dfpn_nodes);
   std::atomic<bool> dfpn_done{false};
   Move dfpn_mate_move;
-  ShogiBoard dfpn_board = board_;  // copy for the df-pn thread
+  ShogiBoard dfpn_board = board_;
+  auto dfpn_start_time = std::chrono::steady_clock::now();
 
   auto dfpn_thread = std::thread([&]() {
     dfpn_mate_move = root_dfpn.search(dfpn_board, root_dfpn_nodes);
     dfpn_done = true;
   });
 
+  // Auto-stop df-pn after max time (runs alongside MCTS).
+  auto dfpn_timer_thread = std::thread([&]() {
+    while (!dfpn_done) {
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - dfpn_start_time).count();
+      if (elapsed >= dfpn_max_time_ms) {
+        root_dfpn.stop();
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+
   // --- Run MCTS concurrently ---
   search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
   SearchResult result = search_->Search(board_, game_ply_);
 
-  // --- Wait for df-pn (up to minimum wait time after MCTS finishes) ---
+  // --- Wait for df-pn (up to min wait time after MCTS finishes) ---
   auto mcts_done_time = std::chrono::steady_clock::now();
   if (!dfpn_done) {
-    // MCTS finished first. Wait a bit more for df-pn.
     while (!dfpn_done) {
       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - mcts_done_time).count();
@@ -326,6 +345,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     root_dfpn.stop();
   }
   dfpn_thread.join();
+  dfpn_timer_thread.join();
 
   // --- Choose result: prefer mate if found ---
   bool use_mate = dfpn_done &&

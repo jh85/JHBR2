@@ -65,6 +65,7 @@ class USIEngine {
   int pv_dfpn_nodes_ = 100000;
   float noise_epsilon_ = 0.0f;
   bool use_gpu_ = true;
+  int dfpn_max_time_ms_ = 4000;  // Max time for root df-pn (ms)
 };
 
 }  // namespace jhbr2
