@@ -688,6 +688,7 @@ void MCTSSearch::WarmupTree(Node* root, const ShogiBoard& root_board,
     };
     std::vector<LeafInfo> leaves;
 
+    int consecutive_failures = 0;
     for (int b = 0; b < batch_size && expanded + (int)leaves.size() < num_nodes; b++) {
       // Walk from root to an unexpanded leaf using PUCT.
       Node* node = root;
@@ -711,14 +712,22 @@ void MCTSSearch::WarmupTree(Node* root, const ShogiBoard& root_board,
       if (node->is_terminal() || node->is_expanded()) {
         // Can't expand — remove virtual loss and skip.
         for (auto* n : path) n->RemoveVirtualLoss(1);
+        consecutive_failures++;
+        // Stop collecting if too many consecutive failures
+        // (tree doesn't have enough unexpanded leaves for this batch).
+        if (consecutive_failures > 100) break;
         continue;
       }
+      consecutive_failures = 0;
 
       if (!node->TryStartExpansion()) {
-        // Collision (shouldn't happen in single-threaded, but safe).
+        // Collision — another selection in this batch claimed this node.
         for (auto* n : path) n->RemoveVirtualLoss(1);
+        consecutive_failures++;
+        if (consecutive_failures > 100) break;
         continue;
       }
+      consecutive_failures = 0;
 
       path.push_back(node);
       node->AddVirtualLoss(1);
