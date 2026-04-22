@@ -98,6 +98,7 @@ void USIEngine::CmdUsi() {
   Send("option name ExpandDepth type spin default 1 min 1 max 8");
   Send("option name SimsPerThread type spin default 1 min 1 max 10000");
   Send("option name WarmupNodes type spin default 0 min 0 max 100000");
+  Send("option name WarmupModel type string default ");
   Send("option name WarmupBatch type spin default 256 min 1 max 10000");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
@@ -114,12 +115,19 @@ void USIEngine::CmdIsReady() {
 
     evaluator_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_);
 
+    // Load separate warmup model if specified.
+    if (!warmup_model_path_.empty()) {
+      Log("Loading warmup model: " + warmup_model_path_);
+      warmup_evaluator_ = std::make_unique<NNEvaluator>(warmup_model_path_, use_gpu_);
+    }
+
     config_.max_nodes = max_nodes_;
     config_.noise_epsilon = noise_epsilon_;
     config_.leaf_dfpn_nodes = leaf_dfpn_nodes_;
     config_.pv_dfpn_nodes = pv_dfpn_nodes_;
 
-    search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
+    search_ = std::make_unique<MCTSSearch>(*evaluator_, config_,
+                                           warmup_evaluator_.get());
 
     Log("Model loaded, max_nodes=" + std::to_string(config_.max_nodes));
   }
@@ -176,6 +184,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     config_.warmup_nodes = std::stoi(value);
   } else if (name_lower == "warmupbatch") {
     config_.warmup_batch = std::stoi(value);
+  } else if (name_lower == "warmupmodel") {
+    warmup_model_path_ = value;
   }
 
   Log("Set " + name + " = " + value);
@@ -187,7 +197,8 @@ void USIEngine::CmdUsiNewGame() {
   game_ply_ = 0;
   // Recreate search with current config.
   if (evaluator_) {
-    search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
+    search_ = std::make_unique<MCTSSearch>(*evaluator_, config_,
+                                           warmup_evaluator_.get());
   }
 }
 
@@ -340,7 +351,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   });
 
   // --- Run MCTS concurrently ---
-  search_ = std::make_unique<MCTSSearch>(*evaluator_, config_);
+  search_ = std::make_unique<MCTSSearch>(*evaluator_, config_,
+                                         warmup_evaluator_.get());
   SearchResult result = search_->Search(board_, game_ply_);
 
   // --- Stop df-pn and wait for it to finish ---

@@ -70,7 +70,8 @@ struct SearchResult {
 
 class MCTSSearch {
  public:
-  MCTSSearch(NNEvaluator& evaluator, const MCTSConfig& config);
+  MCTSSearch(NNEvaluator& evaluator, const MCTSConfig& config,
+             NNEvaluator* warmup_evaluator = nullptr);
   ~MCTSSearch();
 
   // Run search from the given board position.
@@ -152,6 +153,7 @@ class MCTSSearch {
 
   // --- Members ---
   NNEvaluator& evaluator_;
+  NNEvaluator* warmup_evaluator_;  // Separate model for warmup (nullptr = use main)
   MCTSConfig config_;
   std::unique_ptr<MateDfpnSolver> dfpn_leaf_;
   std::unique_ptr<MateDfpnSolver> dfpn_pv_;

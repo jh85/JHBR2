@@ -29,8 +29,9 @@ using namespace lczero;
 // Constructor / Destructor
 // =====================================================================
 
-MCTSSearch::MCTSSearch(NNEvaluator& evaluator, const MCTSConfig& config)
-    : evaluator_(evaluator), config_(config) {
+MCTSSearch::MCTSSearch(NNEvaluator& evaluator, const MCTSConfig& config,
+                       NNEvaluator* warmup_evaluator)
+    : evaluator_(evaluator), warmup_evaluator_(warmup_evaluator), config_(config) {
   if (config_.leaf_dfpn_nodes > 0) {
     dfpn_leaf_ = std::make_unique<MateDfpnSolver>(config_.leaf_dfpn_nodes);
   }
@@ -781,7 +782,9 @@ void MCTSSearch::WarmupTree(Node* root, const ShogiBoard& root_board,
       nn_batch.emplace_back(leaf.board, leaf.legal_moves);
     }
 
-    auto results = evaluator_.EvaluateBatch(nn_batch);
+    // Use warmup evaluator if available (smaller batch engine).
+    NNEvaluator& warmup_eval = warmup_evaluator_ ? *warmup_evaluator_ : evaluator_;
+    auto results = warmup_eval.EvaluateBatch(nn_batch);
 
     // Expand and backpropagate each leaf.
     for (int i = 0; i < (int)leaves.size(); i++) {

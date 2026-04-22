@@ -54,12 +54,14 @@ class USIEngine {
   // --- Members ---
   lczero::ShogiBoard board_;
   std::unique_ptr<NNEvaluator> evaluator_;
+  std::unique_ptr<NNEvaluator> warmup_evaluator_;  // Separate model for warmup
   std::unique_ptr<MCTSSearch> search_;
   MCTSConfig config_;
   int game_ply_ = 0;
 
   // Options
   std::string onnx_path_ = "shogi_bt4.onnx";
+  std::string warmup_model_path_;  // Empty = use main model for warmup
   int max_nodes_ = 800;
   int leaf_dfpn_nodes_ = 40;
   int pv_dfpn_nodes_ = 100000;
