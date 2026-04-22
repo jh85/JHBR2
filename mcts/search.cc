@@ -753,12 +753,10 @@ void MCTSSearch::WarmupTree(Node* root, const ShogiBoard& root_board,
         continue;
       }
 
-      Move mate1 = Mate1Ply(board);
-      if (!mate1.is_null()) {
-        node->SetTerminal(1.0f);
-        node->set_mate_status(1);
-        if (node->parent() && node->parent_edge_idx() >= 0)
-          node->parent()->edge(node->parent_edge_idx()).SetLose();
+      // Skip Mate1Ply during warmup — too expensive per leaf.
+      // MCTS will catch mates later via leaf Mate1Ply and df-pn.
+      // Move mate1 = Mate1Ply(board);
+      if (false) {
         node->FinishExpansion();
         float v = 1.0f;
         for (int i = (int)path.size() - 1; i >= 0; i--) {
