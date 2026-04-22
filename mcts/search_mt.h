@@ -1,8 +1,8 @@
 /*
   JHBR2 Shogi Engine — Multi-Threaded MCTS Support
 
-  Barrier synchronization, thread context, and batch queue for
-  lc0-style parallel MCTS search with multi-expand support.
+  Barrier synchronization, thread context, and batch queue.
+  Supports multi-leaf (K sims per thread) and multi-expand (D depths).
 */
 
 #pragma once
@@ -25,7 +25,7 @@ using lczero::ShogiBoard;
 using lczero::MoveList;
 
 // =====================================================================
-// SearchBarrier — barrier synchronization for N threads
+// SearchBarrier
 // =====================================================================
 
 class SearchBarrier {
@@ -54,51 +54,33 @@ class SearchBarrier {
 };
 
 // =====================================================================
-// ThreadContext — per-thread data for one search iteration
+// SimContext — one independent simulation (leaf selection + path)
 // =====================================================================
-// Supports multi-expand: each thread can hold multiple leaves
-// from successive depths within one simulation.
 
-struct ThreadContext {
-  int thread_id = 0;
+struct SimContext {
+  enum LeafType { kNeedsNN, kTerminal, kCollision };
 
-  // Current leaf (set during each select phase)
   Node* leaf = nullptr;
   ShogiBoard board;
   MoveList legal_moves;
-
-  // Classification of the current leaf
-  enum LeafType {
-    kNeedsNN,
-    kTerminal,
-    kCollision,
-  };
   LeafType leaf_type = kNeedsNN;
-
-  // Terminal/collision value
   float value = 0.0f;
   float draw = 0.0f;
-
-  // NN batch index (-1 if not evaluated)
   int batch_index = -1;
-
-  // NN output (set in Phase 2)
   NNOutput nn_output;
 
-  // --- Multi-expand tracking ---
-  // Full path from root through all expansion depths (virtual loss applied here).
+  // Full path from root through all expansion depths.
   std::vector<Node*> path;
 
-  // Per-depth expansion records (for multi-expand backpropagation).
+  // Per-depth expansion records.
   struct ExpandRecord {
-    int path_index;      // Index into path[] where this expansion's leaf is
-    float value;         // NN value (or terminal value)
-    float draw;          // Draw probability
-    LeafType leaf_type;  // What happened at this depth
+    int path_length;    // path.size() at this expansion point
+    float value;
+    float draw;
+    LeafType leaf_type;
   };
   std::vector<ExpandRecord> expand_records;
 
-  // Whether this thread should continue deeper (set after each expand phase).
   bool can_continue = true;
 
   void Reset() {
@@ -122,7 +104,24 @@ struct ThreadContext {
 };
 
 // =====================================================================
-// BatchQueue — collects leaves for batched NN evaluation
+// ThreadContext — per-thread data holding K simulations
+// =====================================================================
+
+struct ThreadContext {
+  int thread_id = 0;
+  std::vector<SimContext> sims;  // K independent simulations
+
+  void Init(int num_sims) {
+    sims.resize(num_sims);
+  }
+
+  void ResetAll() {
+    for (auto& s : sims) s.Reset();
+  }
+};
+
+// =====================================================================
+// BatchQueue — collects leaves from all threads × all sims
 // =====================================================================
 
 class BatchQueue {
@@ -139,10 +138,12 @@ class BatchQueue {
     std::vector<std::pair<ShogiBoard, MoveList>> batch;
     int idx = 0;
     for (auto* ctx : contexts_) {
-      ctx->batch_index = -1;
-      if (ctx->leaf_type == ThreadContext::kNeedsNN && ctx->can_continue) {
-        ctx->batch_index = idx++;
-        batch.emplace_back(ctx->board, ctx->legal_moves);
+      for (auto& sim : ctx->sims) {
+        sim.batch_index = -1;
+        if (sim.leaf_type == SimContext::kNeedsNN && sim.can_continue) {
+          sim.batch_index = idx++;
+          batch.emplace_back(sim.board, sim.legal_moves);
+        }
       }
     }
     return batch;
@@ -150,8 +151,10 @@ class BatchQueue {
 
   void DistributeResults(const std::vector<NNOutput>& results) {
     for (auto* ctx : contexts_) {
-      if (ctx->batch_index >= 0 && ctx->batch_index < (int)results.size()) {
-        ctx->nn_output = results[ctx->batch_index];
+      for (auto& sim : ctx->sims) {
+        if (sim.batch_index >= 0 && sim.batch_index < (int)results.size()) {
+          sim.nn_output = results[sim.batch_index];
+        }
       }
     }
   }

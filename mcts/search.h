@@ -134,14 +134,11 @@ class MCTSSearch {
                         std::unique_ptr<Node>& root,
                         const MoveList& legal_moves);
 
-  // Per-thread selection phase.
-  void MTSelectPhase(ThreadContext& ctx, Node* root, const ShogiBoard& root_board);
+  // Select one leaf for a simulation context.
+  void MTSelectOne(SimContext& sim, Node* start_node, const ShogiBoard& start_board);
 
-  // Per-thread expand + backpropagate phase.
-  void MTExpandAndBackprop(ThreadContext& ctx);
-
-  // Remove virtual loss without backpropagating (for cleanup on search end).
-  void MTRemoveVirtualLoss(ThreadContext& ctx);
+  // Expand one simulation context with NN output.
+  void MTExpandOne(SimContext& sim);
 
   // --- Members ---
   NNEvaluator& evaluator_;

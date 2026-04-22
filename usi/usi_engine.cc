@@ -96,6 +96,7 @@ void USIEngine::CmdUsi() {
   Send("option name UseGPU type check default true");
   Send("option name Threads type spin default 1 min 1 max 4096");
   Send("option name ExpandDepth type spin default 1 min 1 max 8");
+  Send("option name SimsPerThread type spin default 1 min 1 max 10000");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
 
@@ -167,6 +168,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
     max_move_time_ms_ = std::stoi(value);
+  } else if (name_lower == "simsperthread") {
+    config_.sims_per_thread = std::stoi(value);
   }
 
   Log("Set " + name + " = " + value);

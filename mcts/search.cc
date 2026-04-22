@@ -650,26 +650,25 @@ Move MCTSSearch::Mate1Ply(ShogiBoard& board) {
 }
 
 // =====================================================================
-// Multi-threaded search (lc0-style barrier)
+// Multi-threaded search with multi-leaf and multi-expand
 // =====================================================================
 
-void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* start_node,
-                                const ShogiBoard& start_board) {
+void MCTSSearch::MTSelectOne(SimContext& sim, Node* start_node,
+                              const ShogiBoard& start_board) {
   Node* node = start_node;
   ShogiBoard board = start_board;
   int vl = config_.virtual_loss_count;
 
   while (node->is_expanded() && !node->is_terminal()) {
-    ctx.path.push_back(node);
+    sim.path.push_back(node);
     node->AddVirtualLoss(vl);
 
-    int best = SelectBestChild(node, node == start_node && ctx.expand_records.empty());
+    int best = SelectBestChild(node, node == start_node && sim.expand_records.empty());
     if (best < 0) {
-      // All children are terminal wins for opponent.
-      ctx.leaf = node;
-      ctx.leaf_type = ThreadContext::kTerminal;
-      ctx.value = -1.0f;
-      ctx.draw = 0.0f;
+      sim.leaf = node;
+      sim.leaf_type = SimContext::kTerminal;
+      sim.value = -1.0f;
+      sim.draw = 0.0f;
       return;
     }
 
@@ -677,79 +676,67 @@ void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* start_node,
     board.DoMove(m);
     Node* child = node->GetOrCreateChild(best);
     node = child;
-
     if (!node->is_expanded()) break;
   }
 
-  // Arrived at unexpanded or terminal node.
-  ctx.path.push_back(node);
+  sim.path.push_back(node);
   node->AddVirtualLoss(vl);
-  ctx.leaf = node;
-  ctx.board = board;
+  sim.leaf = node;
+  sim.board = board;
 
   if (node->is_terminal()) {
-    ctx.leaf_type = ThreadContext::kTerminal;
-    ctx.value = node->terminal_v();
-    ctx.draw = node->terminal_d();
+    sim.leaf_type = SimContext::kTerminal;
+    sim.value = node->terminal_v();
+    sim.draw = node->terminal_d();
     return;
   }
 
-  // Try to claim expansion.
   if (!node->TryStartExpansion()) {
-    // Another thread is expanding this node — collision.
-    ctx.leaf_type = ThreadContext::kCollision;
-    ctx.value = node->parent() ? -node->parent()->q() : 0.0f;
-    ctx.draw = 0.0f;
+    sim.leaf_type = SimContext::kCollision;
+    sim.value = node->parent() ? -node->parent()->q() : 0.0f;
+    sim.draw = 0.0f;
     return;
   }
 
-  // We own expansion. Generate legal moves.
-  ctx.legal_moves = board.GenerateLegalMoves();
+  sim.legal_moves = board.GenerateLegalMoves();
 
-  // No legal moves = checkmate.
-  if (ctx.legal_moves.empty()) {
+  if (sim.legal_moves.empty()) {
     node->SetTerminal(-1.0f);
     node->set_mate_status(-1);
-    if (node->parent() && node->parent_edge_idx() >= 0) {
+    if (node->parent() && node->parent_edge_idx() >= 0)
       node->parent()->edge(node->parent_edge_idx()).SetWin();
-    }
     node->FinishExpansion();
-    ctx.leaf_type = ThreadContext::kTerminal;
-    ctx.value = -1.0f;
-    ctx.draw = 0.0f;
+    sim.leaf_type = SimContext::kTerminal;
+    sim.value = -1.0f;
+    sim.draw = 0.0f;
     return;
   }
 
-  // Mate-in-1 check.
-  Move mate1 = Mate1Ply(ctx.board);
+  Move mate1 = Mate1Ply(sim.board);
   if (!mate1.is_null()) {
     node->SetTerminal(1.0f);
     node->set_mate_status(1);
-    if (node->parent() && node->parent_edge_idx() >= 0) {
+    if (node->parent() && node->parent_edge_idx() >= 0)
       node->parent()->edge(node->parent_edge_idx()).SetLose();
-    }
     node->FinishExpansion();
-    ctx.leaf_type = ThreadContext::kTerminal;
-    ctx.value = 1.0f;
-    ctx.draw = 0.0f;
+    sim.leaf_type = SimContext::kTerminal;
+    sim.value = 1.0f;
+    sim.draw = 0.0f;
     return;
   }
 
-  // Entering-king declaration.
-  if (ctx.board.CanDeclareWin()) {
+  if (sim.board.CanDeclareWin()) {
     node->SetTerminal(1.0f);
-    if (node->parent() && node->parent_edge_idx() >= 0) {
+    if (node->parent() && node->parent_edge_idx() >= 0)
       node->parent()->edge(node->parent_edge_idx()).SetLose();
-    }
     node->FinishExpansion();
-    ctx.leaf_type = ThreadContext::kTerminal;
-    ctx.value = 1.0f;
-    ctx.draw = 0.0f;
+    sim.leaf_type = SimContext::kTerminal;
+    sim.value = 1.0f;
+    sim.draw = 0.0f;
     return;
   }
 
-  // Repetition check.
-  auto rep = ctx.board.CheckRepetition();
+  auto rep = sim.board.CheckRepetition();
   if (rep != ShogiBoard::RepetitionResult::kNone) {
     float rep_v = config_.draw_score, rep_d = 0.0f;
     switch (rep) {
@@ -760,96 +747,82 @@ void MCTSSearch::MTSelectPhase(ThreadContext& ctx, Node* start_node,
     }
     node->SetTerminal(rep_v, rep_d);
     node->FinishExpansion();
-    ctx.leaf_type = ThreadContext::kTerminal;
-    ctx.value = rep_v;
-    ctx.draw = rep_d;
+    sim.leaf_type = SimContext::kTerminal;
+    sim.value = rep_v;
+    sim.draw = rep_d;
     return;
   }
 
-  // Leaf df-pn: small-budget mate search (if enabled).
   if (config_.leaf_dfpn_nodes > 0 && !node->dfpn_checked()) {
     node->set_dfpn_checked(true);
     MateDfpnSolver leaf_dfpn(config_.leaf_dfpn_nodes);
-    Move mate_move = leaf_dfpn.search(ctx.board, config_.leaf_dfpn_nodes);
+    Move mate_move = leaf_dfpn.search(sim.board, config_.leaf_dfpn_nodes);
     if (MateDfpnSolver::IsNoMate(mate_move)) {
       node->set_dfpn_proven_no_mate(true);
     } else if (!mate_move.is_null()) {
       node->SetTerminal(1.0f);
       node->set_mate_status(1);
-      if (node->parent() && node->parent_edge_idx() >= 0) {
+      if (node->parent() && node->parent_edge_idx() >= 0)
         node->parent()->edge(node->parent_edge_idx()).SetLose();
-      }
       node->FinishExpansion();
-      ctx.leaf_type = ThreadContext::kTerminal;
-      ctx.value = 1.0f;
-      ctx.draw = 0.0f;
+      sim.leaf_type = SimContext::kTerminal;
+      sim.value = 1.0f;
+      sim.draw = 0.0f;
       return;
     }
   }
 
-  // This leaf needs NN evaluation.
-  ctx.leaf_type = ThreadContext::kNeedsNN;
+  sim.leaf_type = SimContext::kNeedsNN;
 }
 
-void MCTSSearch::MTExpandAndBackprop(ThreadContext& ctx) {
-  float value, draw;
+void MCTSSearch::MTExpandOne(SimContext& sim) {
+  float v = 0.0f, d = 0.0f;
 
-  if (ctx.leaf_type == ThreadContext::kNeedsNN) {
-    // Expand the node with NN output.
-    Node* leaf = ctx.leaf;
-    const NNOutput& eval = ctx.nn_output;
+  if (sim.leaf_type == SimContext::kNeedsNN) {
+    Node* leaf = sim.leaf;
+    const NNOutput& eval = sim.nn_output;
     std::vector<std::pair<Move, float>> priors;
-    priors.reserve(ctx.legal_moves.size());
-    for (int i = 0; i < ctx.legal_moves.size(); i++) {
-      priors.emplace_back(ctx.legal_moves[i], eval.policy[i]);
+    priors.reserve(sim.legal_moves.size());
+    for (int i = 0; i < sim.legal_moves.size(); i++) {
+      priors.emplace_back(sim.legal_moves[i], eval.policy[i]);
     }
     leaf->Expand(priors);
     leaf->set_evaluated(true);
     leaf->FinishExpansion();
-
-    value = eval.value;
-    draw = eval.draw;
-  } else if (ctx.leaf_type == ThreadContext::kTerminal) {
-    value = ctx.value;
-    draw = ctx.draw;
+    v = eval.value;
+    d = eval.draw;
+    sim.can_continue = true;
+  } else if (sim.leaf_type == SimContext::kTerminal) {
+    v = sim.value;
+    d = sim.draw;
+    sim.can_continue = false;
   } else {
-    // Collision: use parent's Q as estimate.
-    value = ctx.value;
-    draw = ctx.draw;
+    v = sim.value;
+    d = sim.draw;
+    sim.can_continue = false;
   }
 
-  // Remove virtual loss and backpropagate real value.
-  int vl = config_.virtual_loss_count;
-  float v = value, d = draw;
-  for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
-    Node* node = ctx.path[i];
-    node->RemoveVirtualLoss(vl);
-    node->AddVisit(v, d);
-    v = -v;
-  }
-}
-
-void MCTSSearch::MTRemoveVirtualLoss(ThreadContext& ctx) {
-  int vl = config_.virtual_loss_count;
-  for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
-    ctx.path[i]->RemoveVirtualLoss(vl);
-  }
+  sim.expand_records.push_back({
+    (int)sim.path.size(), v, d, sim.leaf_type
+  });
 }
 
 SearchResult MCTSSearch::SearchMT(ShogiBoard board, int game_ply,
                                    std::unique_ptr<Node>& root,
                                    const MoveList& legal_moves) {
   const int N = config_.num_search_threads;
-  const int K = config_.expand_depth;  // expansions per simulation
-  SearchBarrier barrier1(N);  // Select → Eval
-  SearchBarrier barrier2(N);  // Eval → Expand
-  SearchBarrier barrier3(N);  // Expand → next depth or next iteration
+  const int K = config_.sims_per_thread;
+  const int D = config_.expand_depth;
+  SearchBarrier barrier1(N);
+  SearchBarrier barrier2(N);
+  SearchBarrier barrier3(N);
 
   std::vector<ThreadContext> contexts(N);
   BatchQueue batch_queue;
   batch_queue.Init(N);
   for (int i = 0; i < N; i++) {
     contexts[i].thread_id = i;
+    contexts[i].Init(K);
     batch_queue.SetContext(i, &contexts[i]);
   }
 
@@ -857,37 +830,32 @@ SearchResult MCTSSearch::SearchMT(ShogiBoard board, int game_ply,
   std::atomic<bool> search_done{false};
   auto t0 = std::chrono::steady_clock::now();
 
-  // Launch worker threads.
   std::vector<std::thread> threads;
   for (int t = 0; t < N; t++) {
     threads.emplace_back([&, t]() {
       ThreadContext& ctx = contexts[t];
 
       while (!search_done.load(std::memory_order_relaxed)) {
-        // Reset for new simulation.
-        ctx.Reset();
+        ctx.ResetAll();
 
-        // ===== MULTI-EXPAND LOOP: K depths =====
-        for (int depth = 0; depth < K; depth++) {
+        for (int depth = 0; depth < D; depth++) {
 
-          // ===== PHASE 1: SELECT =====
-          if (depth == 0) {
-            // First depth: select from root.
-            MTSelectPhase(ctx, root.get(), board);
-          } else if (ctx.can_continue) {
-            // Deeper depths: continue from the just-expanded node.
-            Node* continue_from = ctx.leaf;
-            ShogiBoard continue_board = ctx.board;
-            ctx.ResetForNextDepth();
-            MTSelectPhase(ctx, continue_from, continue_board);
+          // ===== PHASE 1: SELECT K leaves per thread =====
+          for (int k = 0; k < K; k++) {
+            SimContext& sim = ctx.sims[k];
+            if (depth == 0) {
+              MTSelectOne(sim, root.get(), board);
+            } else if (sim.can_continue) {
+              Node* cont_node = sim.leaf;
+              ShogiBoard cont_board = sim.board;
+              sim.ResetForNextDepth();
+              MTSelectOne(sim, cont_node, cont_board);
+            }
           }
-          // If can_continue is false (terminal/collision at previous depth),
-          // this thread is idle for remaining depths. It still participates
-          // in barriers but doesn't need NN evaluation.
 
           barrier1.Wait();
 
-          // ===== PHASE 2: NN EVAL (thread 0 only) =====
+          // ===== PHASE 2: GPU EVAL (thread 0) =====
           if (t == 0) {
             auto nn_batch = batch_queue.BuildBatch();
             if (!nn_batch.empty()) {
@@ -895,93 +863,53 @@ SearchResult MCTSSearch::SearchMT(ShogiBoard board, int game_ply,
               batch_queue.DistributeResults(results);
             }
 
-            // Check termination.
             int n = total_nodes.load(std::memory_order_relaxed);
             if (n >= config_.max_nodes || stop_.load(std::memory_order_relaxed)) {
               search_done.store(true, std::memory_order_relaxed);
             }
             if (config_.max_time > 0.0f) {
-              auto now = std::chrono::steady_clock::now();
-              float elapsed = std::chrono::duration<float>(now - t0).count();
-              if (elapsed >= config_.max_time) {
+              float elapsed = std::chrono::duration<float>(
+                  std::chrono::steady_clock::now() - t0).count();
+              if (elapsed >= config_.max_time)
                 search_done.store(true, std::memory_order_relaxed);
-              }
             }
           }
 
           barrier2.Wait();
 
-          // ===== PHASE 3: EXPAND (no backprop yet) =====
+          // ===== PHASE 3: EXPAND K leaves per thread =====
           if (search_done.load(std::memory_order_relaxed)) {
-            ctx.can_continue = false;
-          } else if (ctx.can_continue) {
-            // Expand the node but DON'T backpropagate yet.
-            // Save the expansion record for later backprop.
-            float v = 0.0f, d = 0.0f;
-
-            if (ctx.leaf_type == ThreadContext::kNeedsNN) {
-              Node* leaf = ctx.leaf;
-              const NNOutput& eval = ctx.nn_output;
-              std::vector<std::pair<Move, float>> priors;
-              priors.reserve(ctx.legal_moves.size());
-              for (int i = 0; i < ctx.legal_moves.size(); i++) {
-                priors.emplace_back(ctx.legal_moves[i], eval.policy[i]);
+            for (auto& sim : ctx.sims) sim.can_continue = false;
+          } else {
+            for (int k = 0; k < K; k++) {
+              SimContext& sim = ctx.sims[k];
+              if (sim.can_continue || (depth == 0 && sim.leaf_type == SimContext::kNeedsNN)) {
+                MTExpandOne(sim);
+                if (sim.leaf_type == SimContext::kNeedsNN)
+                  total_nodes.fetch_add(1, std::memory_order_relaxed);
               }
-              leaf->Expand(priors);
-              leaf->set_evaluated(true);
-              leaf->FinishExpansion();
-              v = eval.value;
-              d = eval.draw;
-              total_nodes.fetch_add(1, std::memory_order_relaxed);
-              // Can continue deeper from this expanded node.
-              ctx.can_continue = true;
-            } else if (ctx.leaf_type == ThreadContext::kTerminal) {
-              v = ctx.value;
-              d = ctx.draw;
-              ctx.can_continue = false;  // Terminal — can't go deeper.
-            } else {
-              // Collision.
-              v = ctx.value;
-              d = ctx.draw;
-              ctx.can_continue = false;
             }
-
-            // Record this expansion for backpropagation.
-            ctx.expand_records.push_back({
-              (int)ctx.path.size() - 1,  // path index of this leaf
-              v, d, ctx.leaf_type
-            });
           }
 
           barrier3.Wait();
-
-          // If search is done, break out of multi-expand loop.
           if (search_done.load(std::memory_order_relaxed)) break;
         }
 
-        // ===== BACKPROPAGATE all depths =====
-        // Walk from the deepest leaf back to root, removing virtual loss
-        // and adding real visit values at each expansion point.
-        if (!ctx.path.empty()) {
-          int vl = config_.virtual_loss_count;
+        // ===== BACKPROPAGATE all K sims =====
+        int vl = config_.virtual_loss_count;
+        for (int k = 0; k < K; k++) {
+          SimContext& sim = ctx.sims[k];
+          if (sim.path.empty()) continue;
 
-          if (ctx.expand_records.empty()) {
-            // No expansions happened (e.g., search_done on first depth).
-            // Just remove virtual loss.
-            for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
-              ctx.path[i]->RemoveVirtualLoss(vl);
-            }
+          if (sim.expand_records.empty()) {
+            for (int i = (int)sim.path.size() - 1; i >= 0; i--)
+              sim.path[i]->RemoveVirtualLoss(vl);
           } else {
-            // Backpropagate from deepest expansion to root.
-            // The last expand_record has the deepest value.
-            // Propagate its value all the way up, removing virtual loss.
-            auto& deepest = ctx.expand_records.back();
-            float v = deepest.value;
-            float d = deepest.draw;
-
-            for (int i = (int)ctx.path.size() - 1; i >= 0; i--) {
-              ctx.path[i]->RemoveVirtualLoss(vl);
-              ctx.path[i]->AddVisit(v, d);
+            auto& deepest = sim.expand_records.back();
+            float v = deepest.value, d = deepest.draw;
+            for (int i = (int)sim.path.size() - 1; i >= 0; i--) {
+              sim.path[i]->RemoveVirtualLoss(vl);
+              sim.path[i]->AddVisit(v, d);
               v = -v;
             }
           }
