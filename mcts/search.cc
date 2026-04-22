@@ -105,6 +105,11 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     AddDirichletNoise(root.get());
   }
 
+  // Tree warmup: build initial tree with batch GPU eval before multi-threaded search.
+  if (config_.warmup_nodes > 0) {
+    WarmupTree(root.get(), board, config_.warmup_nodes);
+  }
+
   // Route to multi-threaded search if configured.
   if (config_.num_search_threads > 1) {
     return SearchMT(board, game_ply, root, legal_moves);
@@ -650,6 +655,146 @@ Move MCTSSearch::Mate1Ply(ShogiBoard& board) {
 }
 
 // =====================================================================
+// Shared helper: expand a node with NN output
+// =====================================================================
+
+void MCTSSearch::ExpandNodeWithNN(Node* node, const NNOutput& eval,
+                                   const MoveList& legal_moves) {
+  std::vector<std::pair<Move, float>> priors;
+  priors.reserve(legal_moves.size());
+  for (int i = 0; i < legal_moves.size(); i++) {
+    priors.emplace_back(legal_moves[i], eval.policy[i]);
+  }
+  node->Expand(priors);
+  node->set_evaluated(true);
+}
+
+// =====================================================================
+// Tree warmup: single-threaded BFS with batch GPU evaluation
+// =====================================================================
+
+void MCTSSearch::WarmupTree(Node* root, const ShogiBoard& root_board,
+                             int num_nodes) {
+  int expanded = 0;
+  int batch_size = config_.warmup_batch;
+
+  while (expanded < num_nodes && !stop_) {
+    // Collect a batch of unexpanded leaves via policy-guided selection.
+    struct LeafInfo {
+      Node* node;
+      ShogiBoard board;
+      MoveList legal_moves;
+      std::vector<Node*> path;  // for backpropagation
+    };
+    std::vector<LeafInfo> leaves;
+
+    for (int b = 0; b < batch_size && expanded + (int)leaves.size() < num_nodes; b++) {
+      // Walk from root to an unexpanded leaf using PUCT.
+      Node* node = root;
+      ShogiBoard board = root_board;
+      std::vector<Node*> path;
+
+      while (node->is_expanded() && !node->is_terminal()) {
+        path.push_back(node);
+        // Add virtual loss so subsequent selections in this batch diverge.
+        node->AddVirtualLoss(1);
+
+        int best = SelectBestChild(node, node == root);
+        if (best < 0) break;
+
+        board.DoMove(node->edge(best).move);
+        Node* child = node->GetOrCreateChild(best);
+        node = child;
+        if (!node->is_expanded()) break;
+      }
+
+      if (node->is_terminal() || node->is_expanded()) {
+        // Can't expand — remove virtual loss and skip.
+        for (auto* n : path) n->RemoveVirtualLoss(1);
+        continue;
+      }
+
+      if (!node->TryStartExpansion()) {
+        // Collision (shouldn't happen in single-threaded, but safe).
+        for (auto* n : path) n->RemoveVirtualLoss(1);
+        continue;
+      }
+
+      path.push_back(node);
+      node->AddVirtualLoss(1);
+
+      MoveList legal = board.GenerateLegalMoves();
+
+      // Terminal checks.
+      if (legal.empty()) {
+        node->SetTerminal(-1.0f);
+        node->set_mate_status(-1);
+        if (node->parent() && node->parent_edge_idx() >= 0)
+          node->parent()->edge(node->parent_edge_idx()).SetWin();
+        node->FinishExpansion();
+        // Backprop terminal value.
+        float v = -1.0f;
+        for (int i = (int)path.size() - 1; i >= 0; i--) {
+          path[i]->RemoveVirtualLoss(1);
+          path[i]->AddVisit(v, 0.0f);
+          v = -v;
+        }
+        expanded++;
+        continue;
+      }
+
+      Move mate1 = Mate1Ply(board);
+      if (!mate1.is_null()) {
+        node->SetTerminal(1.0f);
+        node->set_mate_status(1);
+        if (node->parent() && node->parent_edge_idx() >= 0)
+          node->parent()->edge(node->parent_edge_idx()).SetLose();
+        node->FinishExpansion();
+        float v = 1.0f;
+        for (int i = (int)path.size() - 1; i >= 0; i--) {
+          path[i]->RemoveVirtualLoss(1);
+          path[i]->AddVisit(v, 0.0f);
+          v = -v;
+        }
+        expanded++;
+        continue;
+      }
+
+      leaves.push_back({node, board, legal, path});
+    }
+
+    if (leaves.empty()) break;
+
+    // Batch evaluate all collected leaves.
+    std::vector<std::pair<ShogiBoard, MoveList>> nn_batch;
+    nn_batch.reserve(leaves.size());
+    for (auto& leaf : leaves) {
+      nn_batch.emplace_back(leaf.board, leaf.legal_moves);
+    }
+
+    auto results = evaluator_.EvaluateBatch(nn_batch);
+
+    // Expand and backpropagate each leaf.
+    for (int i = 0; i < (int)leaves.size(); i++) {
+      auto& leaf = leaves[i];
+      auto& eval = results[i];
+
+      ExpandNodeWithNN(leaf.node, eval, leaf.legal_moves);
+      leaf.node->FinishExpansion();
+
+      // Backpropagate NN value through the path.
+      float v = eval.value, d = eval.draw;
+      for (int j = (int)leaf.path.size() - 1; j >= 0; j--) {
+        leaf.path[j]->RemoveVirtualLoss(1);
+        leaf.path[j]->AddVisit(v, d);
+        v = -v;
+      }
+      expanded++;
+    }
+  }
+}
+
+// =====================================================================
 // Multi-threaded search with multi-leaf and multi-expand
 // =====================================================================
 
@@ -781,13 +926,7 @@ void MCTSSearch::MTExpandOne(SimContext& sim) {
   if (sim.leaf_type == SimContext::kNeedsNN) {
     Node* leaf = sim.leaf;
     const NNOutput& eval = sim.nn_output;
-    std::vector<std::pair<Move, float>> priors;
-    priors.reserve(sim.legal_moves.size());
-    for (int i = 0; i < sim.legal_moves.size(); i++) {
-      priors.emplace_back(sim.legal_moves[i], eval.policy[i]);
-    }
-    leaf->Expand(priors);
-    leaf->set_evaluated(true);
+    ExpandNodeWithNN(leaf, eval, sim.legal_moves);
     leaf->FinishExpansion();
     v = eval.value;
     d = eval.draw;

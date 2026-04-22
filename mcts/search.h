@@ -105,6 +105,16 @@ class MCTSSearch {
   // Select the final move (by visit count, with temperature).
   Move SelectMove(Node* root, int game_ply);
 
+  // --- Tree warmup ---
+
+  // Build initial tree via policy-guided selection + batch GPU eval.
+  // Expands warmup_nodes before multi-threaded search starts.
+  void WarmupTree(Node* root, const ShogiBoard& root_board, int num_nodes);
+
+  // Expand a node using NN output (shared by warmup and MCTS).
+  static void ExpandNodeWithNN(Node* node, const NNOutput& eval,
+                               const MoveList& legal_moves);
+
   // --- Mate search ---
 
   // Check for 1-ply mate (essentially free).
