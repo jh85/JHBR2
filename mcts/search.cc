@@ -972,6 +972,15 @@ void MCTSSearch::AsyncWorker(int worker_id, Node* root,
 
     if (batch.leaves.empty()) continue;
 
+    // Check search_done before submitting — GPU thread may have already exited.
+    if (search_done.load(std::memory_order_relaxed)) {
+      // Remove virtual loss from gathered leaves and exit.
+      for (auto& req : batch.leaves) {
+        for (auto* n : req.path) n->RemoveVirtualLoss(vl);
+      }
+      break;
+    }
+
     // Save leaf/path data locally — SubmitBatchAndWait moves the batch away.
     struct LocalLeaf {
       Node* leaf;
@@ -1032,7 +1041,7 @@ SearchResult MCTSSearch::SearchAsync(ShogiBoard board, int game_ply,
 
   // Launch GPU thread.
   auto gpu_thread = std::thread([&]() {
-    queue.GPULoop(search_done);
+    queue.GPULoop();
   });
 
   // Launch worker threads.
@@ -1064,8 +1073,11 @@ SearchResult MCTSSearch::SearchAsync(ShogiBoard board, int game_ply,
 
   search_done.store(true, std::memory_order_relaxed);
 
-  // Wait for all threads.
+  // Wait for workers first — they'll exit due to search_done.
   for (auto& w : workers) w.join();
+
+  // Now stop the GPU thread — workers are done, no more submissions.
+  queue.NotifyStop();
   gpu_thread.join();
 
   // --- PV mate search ---

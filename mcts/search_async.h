@@ -64,6 +64,12 @@ class AsyncBatchQueue {
     worker_cvs_ = std::make_unique<std::condition_variable[]>(num_workers);
   }
 
+  // Signal the GPU thread to stop (call after all workers have joined).
+  void NotifyStop() {
+    gpu_stop_.store(true, std::memory_order_relaxed);
+    queue_cv_.notify_one();
+  }
+
   // Called by worker: submit a batch of leaves and wait for NN results.
   // Returns one NNOutput per leaf, in the same order.
   std::vector<NNOutput> SubmitBatchAndWait(WorkerBatch& batch) {
@@ -84,19 +90,33 @@ class AsyncBatchQueue {
     return std::move(worker_results_[wid]);
   }
 
-  // Called by GPU thread: process batches until stopped.
-  void GPULoop(std::atomic<bool>& stop) {
-    while (!stop.load(std::memory_order_relaxed)) {
+  // Called by GPU thread: process batches until NotifyStop() is called.
+  void GPULoop() {
+    while (!gpu_stop_.load(std::memory_order_relaxed)) {
       std::vector<WorkerBatch> batches;
 
-      // Wait for pending work.
+      // Wait for enough leaves to fill a batch, or a short timeout.
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait_for(lock, std::chrono::milliseconds(1), [&] {
-          return !pending_.empty() || stop.load(std::memory_order_relaxed);
+
+        // First wait: block until at least one worker submits or stop.
+        queue_cv_.wait(lock, [&] {
+          return !pending_.empty() || gpu_stop_.load(std::memory_order_relaxed);
         });
 
-        if (pending_.empty()) continue;
+        if (pending_.empty()) {
+          if (gpu_stop_.load(std::memory_order_relaxed)) break;
+          continue;
+        }
+
+        // Second wait: give other workers a chance to submit (up to 500μs)
+        // so we can build a full batch and avoid padding waste.
+        if (CountPendingLeaves() < max_batch_size_) {
+          queue_cv_.wait_for(lock, std::chrono::microseconds(500), [&] {
+            return CountPendingLeaves() >= max_batch_size_ ||
+                   gpu_stop_.load(std::memory_order_relaxed);
+          });
+        }
 
         // Take all pending worker batches.
         batches = std::move(pending_);
@@ -185,10 +205,21 @@ class AsyncBatchQueue {
   int max_batch_size_;
   int num_workers_;
 
+  // Count total leaves across all pending worker batches.
+  // Must be called with queue_mutex_ held.
+  int CountPendingLeaves() const {
+    int count = 0;
+    for (auto& wb : pending_) count += (int)wb.leaves.size();
+    return count;
+  }
+
   // Pending worker batches.
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
   std::vector<WorkerBatch> pending_;
+
+  // GPU thread stop flag (set by NotifyStop after workers have joined).
+  std::atomic<bool> gpu_stop_{false};
 
   // Per-worker results.
   std::mutex result_mutex_;
