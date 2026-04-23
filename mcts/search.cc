@@ -874,18 +874,9 @@ void MCTSSearch::MTSelectOne(SimContext& sim, Node* start_node,
     return;
   }
 
-  Move mate1 = Mate1Ply(sim.board);
-  if (!mate1.is_null()) {
-    node->SetTerminal(1.0f);
-    node->set_mate_status(1);
-    if (node->parent() && node->parent_edge_idx() >= 0)
-      node->parent()->edge(node->parent_edge_idx()).SetLose();
-    node->FinishExpansion();
-    sim.leaf_type = SimContext::kTerminal;
-    sim.value = 1.0f;
-    sim.draw = 0.0f;
-    return;
-  }
+  // Mate1Ply skipped in MT path — too expensive (~2.5ms per leaf).
+  // Mates are caught by: root df-pn, leaf df-pn, and terminal detection
+  // (child with no legal moves → checkmate on next visit).
 
   if (sim.board.CanDeclareWin()) {
     node->SetTerminal(1.0f);
