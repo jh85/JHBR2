@@ -123,138 +123,130 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
     return SearchAsync(board, game_ply, root, legal_moves);
   }
 
-  // --- Single-threaded search loop ---
+  // --- Single-threaded batch search ---
+  // One thread selects multiple leaves, sends batch to GPU, expands all.
+  // No concurrency = no data races. GPU fully utilized via batching.
   auto t0 = std::chrono::steady_clock::now();
   int nodes_expanded = 0;
+  const int batch_target = config_.minibatch_size;
 
   while (nodes_expanded < config_.max_nodes && !stop_) {
     // Check time limit.
     if (config_.max_time > 0.0f) {
-      auto now = std::chrono::steady_clock::now();
-      float elapsed = std::chrono::duration<float>(now - t0).count();
+      float elapsed = std::chrono::duration<float>(
+          std::chrono::steady_clock::now() - t0).count();
       if (elapsed >= config_.max_time) break;
     }
 
-    // 1. Select: walk from root to a leaf.
-    auto sel = Select(root.get(), board);
-    Node* leaf = sel.node;
+    // --- Gather phase: select up to batch_target leaves ---
+    struct PendingLeaf {
+      Node* node;
+      ShogiBoard board;
+      MoveList legal_moves;
+    };
+    std::vector<PendingLeaf> pending;
 
-    // 2. If terminal, backpropagate known value.
-    if (leaf->is_terminal()) {
-      Backpropagate(leaf, leaf->terminal_v(), leaf->terminal_d());
-      continue;
-    }
+    for (int g = 0; g < batch_target && nodes_expanded + (int)pending.size() < config_.max_nodes; g++) {
+      auto sel = Select(root.get(), board);
+      Node* leaf = sel.node;
 
-    // 3. Generate legal moves at the leaf.
-    ShogiBoard& leaf_board = sel.board;
-    MoveList leaf_legal = leaf_board.GenerateLegalMoves();
-
-    // --- Mate detection (before NN eval, following dlshogi) ---
-
-    // No legal moves = checkmate.
-    // The leaf's side is mated (value -1). Parent played the mating move = parent WINS.
-    if (leaf_legal.empty()) {
-      leaf->SetTerminal(-1.0f);
-      leaf->set_mate_status(-1);
-      if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).SetWin();
+      // Terminal: backpropagate immediately.
+      if (leaf->is_terminal()) {
+        Backpropagate(leaf, leaf->terminal_v(), leaf->terminal_d());
+        continue;
       }
-      Backpropagate(leaf, -1.0f, 0.0f);
-      PropagateMateUp(leaf);
-      continue;
-    }
 
-    // Tier 1: 1-ply mate check (essentially free).
-    // The leaf can deliver mate-in-1 (value +1). Parent's move led to this = parent LOSES.
-    Move mate1 = Mate1Ply(leaf_board);
-    if (!mate1.is_null()) {
-      leaf->SetTerminal(1.0f);
-      leaf->set_mate_status(1);
-      if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
+      ShogiBoard& leaf_board = sel.board;
+      MoveList leaf_legal = leaf_board.GenerateLegalMoves();
+
+      // Checkmate.
+      if (leaf_legal.empty()) {
+        leaf->SetTerminal(-1.0f);
+        leaf->set_mate_status(-1);
+        if (leaf->parent() && leaf->parent_edge_idx() >= 0)
+          leaf->parent()->edge(leaf->parent_edge_idx()).SetWin();
+        Backpropagate(leaf, -1.0f, 0.0f);
+        PropagateMateUp(leaf);
+        continue;
       }
-      Backpropagate(leaf, 1.0f, 0.0f);
-      PropagateMateUp(leaf);
-      continue;
-    }
 
-    // Tier 2: Shallow df-pn mate search.
-    // Same as Mate1Ply: leaf can force mate = parent LOSES.
-    if (dfpn_leaf_ && !leaf->dfpn_checked()) {
-      leaf->set_dfpn_checked(true);
-      Move mate_move = dfpn_leaf_->search(leaf_board, config_.leaf_dfpn_nodes);
-      if (MateDfpnSolver::IsNoMate(mate_move)) {
-        leaf->set_dfpn_proven_no_mate(true);
-      } else if (!mate_move.is_null()) {
+      // Mate-in-1.
+      Move mate1 = Mate1Ply(leaf_board);
+      if (!mate1.is_null()) {
         leaf->SetTerminal(1.0f);
         leaf->set_mate_status(1);
-        if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
+        if (leaf->parent() && leaf->parent_edge_idx() >= 0)
           leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
-        }
         Backpropagate(leaf, 1.0f, 0.0f);
         PropagateMateUp(leaf);
         continue;
       }
-    }
 
-    // Check entering-king declaration.
-    // Leaf can declare win = parent LOSES.
-    if (leaf_board.CanDeclareWin()) {
-      leaf->SetTerminal(1.0f);
-      leaf->set_mate_status(1);
-      if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
+      // Leaf df-pn.
+      if (dfpn_leaf_ && !leaf->dfpn_checked()) {
+        leaf->set_dfpn_checked(true);
+        Move mate_move = dfpn_leaf_->search(leaf_board, config_.leaf_dfpn_nodes);
+        if (MateDfpnSolver::IsNoMate(mate_move)) {
+          leaf->set_dfpn_proven_no_mate(true);
+        } else if (!mate_move.is_null()) {
+          leaf->SetTerminal(1.0f);
+          leaf->set_mate_status(1);
+          if (leaf->parent() && leaf->parent_edge_idx() >= 0)
+            leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
+          Backpropagate(leaf, 1.0f, 0.0f);
+          PropagateMateUp(leaf);
+          continue;
+        }
       }
-      Backpropagate(leaf, 1.0f, 0.0f);
-      continue;
-    }
 
-    // Check repetition.
-    auto rep = leaf_board.CheckRepetition();
-    if (rep != ShogiBoard::RepetitionResult::kNone) {
-      float rep_v = 0.0f;
-      float rep_d = 0.0f;
-      Edge::MateFlag rep_flag = Edge::kDraw;
-      switch (rep) {
-        case ShogiBoard::RepetitionResult::kDraw:
-          rep_v = config_.draw_score;
-          rep_d = 1.0f;
-          rep_flag = Edge::kDraw;
-          break;
-        case ShogiBoard::RepetitionResult::kWin:
-          rep_v = 1.0f;
-          rep_flag = Edge::kWin;
-          break;
-        case ShogiBoard::RepetitionResult::kLoss:
-          rep_v = -1.0f;
-          rep_flag = Edge::kLose;
-          break;
-        default:
-          break;
+      // Declare win.
+      if (leaf_board.CanDeclareWin()) {
+        leaf->SetTerminal(1.0f);
+        leaf->set_mate_status(1);
+        if (leaf->parent() && leaf->parent_edge_idx() >= 0)
+          leaf->parent()->edge(leaf->parent_edge_idx()).SetLose();
+        Backpropagate(leaf, 1.0f, 0.0f);
+        continue;
       }
-      leaf->SetTerminal(rep_v, rep_d);
-      if (leaf->parent() && leaf->parent_edge_idx() >= 0) {
-        leaf->parent()->edge(leaf->parent_edge_idx()).mate_flag = rep_flag;
+
+      // Repetition.
+      auto rep = leaf_board.CheckRepetition();
+      if (rep != ShogiBoard::RepetitionResult::kNone) {
+        float rep_v = 0.0f, rep_d = 0.0f;
+        Edge::MateFlag rep_flag = Edge::kDraw;
+        switch (rep) {
+          case ShogiBoard::RepetitionResult::kDraw: rep_v = config_.draw_score; rep_d = 1.0f; rep_flag = Edge::kDraw; break;
+          case ShogiBoard::RepetitionResult::kWin: rep_v = 1.0f; rep_flag = Edge::kWin; break;
+          case ShogiBoard::RepetitionResult::kLoss: rep_v = -1.0f; rep_flag = Edge::kLose; break;
+          default: break;
+        }
+        leaf->SetTerminal(rep_v, rep_d);
+        if (leaf->parent() && leaf->parent_edge_idx() >= 0)
+          leaf->parent()->edge(leaf->parent_edge_idx()).mate_flag = rep_flag;
+        Backpropagate(leaf, rep_v, rep_d);
+        continue;
       }
-      Backpropagate(leaf, rep_v, rep_d);
-      continue;
+
+      // This leaf needs NN eval — add to batch.
+      pending.push_back({leaf, leaf_board, std::move(leaf_legal)});
     }
 
-    // 4. Evaluate with NN.
-    NNOutput eval = evaluator_.Evaluate(leaf_board, leaf_legal);
+    if (pending.empty()) continue;
 
-    // 5. Expand leaf.
-    std::vector<std::pair<Move, float>> leaf_priors;
-    leaf_priors.reserve(leaf_legal.size());
-    for (size_t i = 0; i < leaf_legal.size(); i++) {
-      leaf_priors.emplace_back(leaf_legal[i], eval.policy[i]);
+    // --- GPU batch eval ---
+    std::vector<std::pair<ShogiBoard, MoveList>> nn_batch;
+    nn_batch.reserve(pending.size());
+    for (auto& p : pending) {
+      nn_batch.emplace_back(p.board, p.legal_moves);
     }
-    leaf->Expand(leaf_priors);
-    leaf->set_evaluated(true);
+    auto results = evaluator_.EvaluateBatch(nn_batch);
 
-    // 6. Backpropagate.
-    Backpropagate(leaf, eval.value, eval.draw);
-    nodes_expanded++;
+    // --- Expand and backpropagate all ---
+    for (int i = 0; i < (int)pending.size(); i++) {
+      ExpandNodeWithNN(pending[i].node, results[i], pending[i].legal_moves);
+      Backpropagate(pending[i].node, results[i].value, results[i].draw);
+    }
+    nodes_expanded += (int)pending.size();
   }
 
   // --- PV mate search (Tier 3) ---
