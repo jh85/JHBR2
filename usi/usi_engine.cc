@@ -97,6 +97,7 @@ void USIEngine::CmdUsi() {
   Send("option name Threads type spin default 1 min 1 max 4096");
   Send("option name ExpandDepth type spin default 1 min 1 max 8");
   Send("option name SimsPerThread type spin default 1 min 1 max 10000");
+  Send("option name BatchSize type spin default 32 min 1 max 10000");
   Send("option name WarmupNodes type spin default 0 min 0 max 100000");
   Send("option name WarmupModel type string default ");
   Send("option name WarmupBatch type spin default 256 min 1 max 10000");
@@ -184,6 +185,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     config_.warmup_nodes = std::stoi(value);
   } else if (name_lower == "warmupbatch") {
     config_.warmup_batch = std::stoi(value);
+  } else if (name_lower == "batchsize") {
+    config_.warmup_batch = std::stoi(value);  // reuses warmup_batch field
   } else if (name_lower == "warmupmodel") {
     warmup_model_path_ = value;
   }

@@ -120,7 +120,7 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
 
   // Route to multi-threaded search if configured.
   if (config_.num_search_threads > 1) {
-    return SearchMT(board, game_ply, root, legal_moves);
+    return SearchAsync(board, game_ply, root, legal_moves);
   }
 
   // --- Single-threaded search loop ---
@@ -812,7 +812,267 @@ void MCTSSearch::WarmupTree(Node* root, const ShogiBoard& root_board,
 }
 
 // =====================================================================
-// Multi-threaded search with multi-leaf and multi-expand
+// Async queue search (lc0-style)
+// =====================================================================
+
+MCTSSearch::LeafSelectResult MCTSSearch::SelectLeaf(
+    Node* root, const ShogiBoard& root_board) {
+  LeafSelectResult res;
+  res.needs_nn = false;
+  res.value = 0.0f;
+  res.draw = 0.0f;
+
+  Node* node = root;
+  ShogiBoard board = root_board;
+  int vl = config_.virtual_loss_count;
+
+  while (node->is_expanded() && !node->is_terminal()) {
+    res.path.push_back(node);
+    node->AddVirtualLoss(vl);
+
+    int best = SelectBestChild(node, node == root);
+    if (best < 0) {
+      res.leaf = node;
+      res.value = -1.0f;
+      return res;
+    }
+
+    board.DoMove(node->edge(best).move);
+    Node* child = node->GetOrCreateChild(best);
+    node = child;
+    if (!node->is_expanded()) break;
+  }
+
+  res.path.push_back(node);
+  node->AddVirtualLoss(vl);
+  res.leaf = node;
+  res.board = board;
+
+  if (node->is_terminal()) {
+    res.value = node->terminal_v();
+    res.draw = node->terminal_d();
+    return res;
+  }
+
+  if (!node->TryStartExpansion()) {
+    // Collision — use parent Q as estimate.
+    res.value = node->parent() ? -node->parent()->q() : 0.0f;
+    return res;
+  }
+
+  res.legal_moves = board.GenerateLegalMoves();
+
+  // Terminal checks.
+  if (res.legal_moves.empty()) {
+    node->SetTerminal(-1.0f);
+    node->set_mate_status(-1);
+    if (node->parent() && node->parent_edge_idx() >= 0)
+      node->parent()->edge(node->parent_edge_idx()).SetWin();
+    node->FinishExpansion();
+    res.value = -1.0f;
+    return res;
+  }
+
+  if (res.board.CanDeclareWin()) {
+    node->SetTerminal(1.0f);
+    if (node->parent() && node->parent_edge_idx() >= 0)
+      node->parent()->edge(node->parent_edge_idx()).SetLose();
+    node->FinishExpansion();
+    res.value = 1.0f;
+    return res;
+  }
+
+  auto rep = res.board.CheckRepetition();
+  if (rep != ShogiBoard::RepetitionResult::kNone) {
+    float rep_v = config_.draw_score, rep_d = 0.0f;
+    switch (rep) {
+      case ShogiBoard::RepetitionResult::kDraw: rep_v = config_.draw_score; rep_d = 1.0f; break;
+      case ShogiBoard::RepetitionResult::kWin: rep_v = 1.0f; break;
+      case ShogiBoard::RepetitionResult::kLoss: rep_v = -1.0f; break;
+      default: break;
+    }
+    node->SetTerminal(rep_v, rep_d);
+    node->FinishExpansion();
+    res.value = rep_v;
+    res.draw = rep_d;
+    return res;
+  }
+
+  // Leaf df-pn with tiny budget.
+  if (config_.leaf_dfpn_nodes > 0 && !node->dfpn_checked()) {
+    node->set_dfpn_checked(true);
+    MateDfpnSolver leaf_dfpn(config_.leaf_dfpn_nodes);
+    Move mate_move = leaf_dfpn.search(res.board, config_.leaf_dfpn_nodes);
+    if (MateDfpnSolver::IsNoMate(mate_move)) {
+      node->set_dfpn_proven_no_mate(true);
+    } else if (!mate_move.is_null()) {
+      node->SetTerminal(1.0f);
+      node->set_mate_status(1);
+      if (node->parent() && node->parent_edge_idx() >= 0)
+        node->parent()->edge(node->parent_edge_idx()).SetLose();
+      node->FinishExpansion();
+      res.value = 1.0f;
+      return res;
+    }
+  }
+
+  // This leaf needs NN evaluation.
+  res.needs_nn = true;
+  return res;
+}
+
+void MCTSSearch::AsyncWorker(int worker_id, Node* root,
+                              const ShogiBoard& root_board,
+                              AsyncBatchQueue& queue,
+                              std::atomic<int>& total_nodes,
+                              std::atomic<bool>& search_done) {
+  int vl = config_.virtual_loss_count;
+
+  while (!search_done.load(std::memory_order_relaxed)) {
+    // Check node limit in worker too (reduces overshoot).
+    if (total_nodes.load(std::memory_order_relaxed) >= config_.max_nodes) break;
+
+    // 1. Select a leaf.
+    auto sel = SelectLeaf(root, root_board);
+
+    if (sel.needs_nn) {
+      // 2. Submit to GPU batch queue and wait.
+      LeafRequest req;
+      req.worker_id = worker_id;
+      req.board = std::move(sel.board);
+      req.legal_moves = std::move(sel.legal_moves);
+      req.leaf = sel.leaf;
+      req.path = std::move(sel.path);
+
+      NNOutput eval = queue.SubmitAndWait(req);
+
+      // Check if we were woken due to search_done.
+      if (search_done.load(std::memory_order_relaxed)) {
+        // Remove virtual loss and exit.
+        for (auto* n : req.path) n->RemoveVirtualLoss(vl);
+        break;
+      }
+
+      // 3. Expand the node.
+      ExpandNodeWithNN(sel.leaf, eval, req.legal_moves);
+      sel.leaf->FinishExpansion();
+
+      // 4. Backpropagate.
+      float v = eval.value, d = eval.draw;
+      for (int i = (int)req.path.size() - 1; i >= 0; i--) {
+        req.path[i]->RemoveVirtualLoss(vl);
+        req.path[i]->AddVisit(v, d);
+        v = -v;
+      }
+      total_nodes.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      // Terminal or collision — backpropagate immediately.
+      float v = sel.value, d = sel.draw;
+      for (int i = (int)sel.path.size() - 1; i >= 0; i--) {
+        sel.path[i]->RemoveVirtualLoss(vl);
+        sel.path[i]->AddVisit(v, d);
+        v = -v;
+      }
+    }
+  }
+}
+
+SearchResult MCTSSearch::SearchAsync(ShogiBoard board, int game_ply,
+                                      std::unique_ptr<Node>& root,
+                                      const MoveList& legal_moves) {
+  const int N = config_.num_search_threads;
+  const int batch = config_.warmup_batch > 0 ? config_.warmup_batch : N;
+
+  std::atomic<int> total_nodes{0};
+  std::atomic<bool> search_done{false};
+  auto t0 = std::chrono::steady_clock::now();
+
+  // Create batch queue.
+  AsyncBatchQueue queue(evaluator_, batch, N);
+
+  // Launch GPU thread.
+  auto gpu_thread = std::thread([&]() {
+    queue.GPULoop(search_done);
+  });
+
+  // Launch worker threads.
+  std::vector<std::thread> workers;
+  for (int w = 0; w < N; w++) {
+    workers.emplace_back([&, w]() {
+      AsyncWorker(w, root.get(), board, queue, total_nodes, search_done);
+    });
+  }
+
+  // Monitor: stop when time or node limit reached.
+  while (!search_done.load(std::memory_order_relaxed)) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    int n = total_nodes.load(std::memory_order_relaxed);
+    if (n >= config_.max_nodes || stop_.load(std::memory_order_relaxed)) {
+      search_done.store(true, std::memory_order_relaxed);
+      break;
+    }
+    if (config_.max_time > 0.0f) {
+      float elapsed = std::chrono::duration<float>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (elapsed >= config_.max_time) {
+        search_done.store(true, std::memory_order_relaxed);
+        break;
+      }
+    }
+  }
+
+  search_done.store(true, std::memory_order_relaxed);
+
+  // Wait for all threads.
+  for (auto& w : workers) w.join();
+  gpu_thread.join();
+
+  // --- PV mate search ---
+  if (dfpn_pv_ && config_.pv_dfpn_nodes > 0) {
+    PvMateSearch(root.get(), board);
+  }
+
+  // --- Collect result ---
+  auto t1 = std::chrono::steady_clock::now();
+  float elapsed = std::chrono::duration<float>(t1 - t0).count();
+
+  SearchResult result;
+  result.best_move = SelectMove(root.get(), game_ply);
+  result.nodes = total_nodes.load();
+  result.time_sec = elapsed;
+  result.nps = elapsed > 0.001f ? total_nodes.load() / elapsed : 0.0f;
+  result.root_q = root->q();
+  result.root_d = root->d_avg();
+  result.score_cp = QToCentipawns(root->q());
+  result.mate_status = root->mate_status();
+  result.pv = GetPV(root.get());
+
+  // Top children.
+  std::vector<std::pair<int, int>> child_visits;
+  for (int i = 0; i < root->num_edges(); i++) {
+    Node* c = root->child(i);
+    int n = c ? c->n() : 0;
+    child_visits.push_back({n, i});
+  }
+  std::sort(child_visits.begin(), child_visits.end(),
+            [](auto& a, auto& b) { return a.first > b.first; });
+  for (int k = 0; k < std::min(5, (int)child_visits.size()); k++) {
+    int i = child_visits[k].second;
+    Node* c = root->child(i);
+    SearchResult::ChildInfo ci;
+    ci.move = root->edge(i).move;
+    ci.n = c ? c->n() : 0;
+    ci.q = c ? c->q() : 0.0f;
+    ci.p = root->edge(i).policy;
+    result.top_children.push_back(ci);
+  }
+
+  return result;
+}
+
+// =====================================================================
+// Multi-threaded search with multi-leaf and multi-expand (legacy barrier)
 // =====================================================================
 
 void MCTSSearch::MTSelectOne(SimContext& sim, Node* start_node,

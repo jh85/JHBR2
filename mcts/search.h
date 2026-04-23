@@ -29,6 +29,7 @@
 #else
 #include "mcts/nn_eval.h"
 #endif
+#include "mcts/search_async.h"
 #include "mcts/search_mt.h"
 #include "shogi/board.h"
 
@@ -138,9 +139,31 @@ class MCTSSearch {
   // Add Dirichlet noise to root edges.
   void AddDirichletNoise(Node* root);
 
-  // --- Multi-threaded search ---
+  // --- Async queue search (lc0-style) ---
 
-  // Barrier-based multi-threaded search (used when num_search_threads > 1).
+  SearchResult SearchAsync(ShogiBoard board, int game_ply,
+                            std::unique_ptr<Node>& root,
+                            const MoveList& legal_moves);
+
+  // Worker thread: select → submit → wait → expand → backprop → repeat.
+  void AsyncWorker(int worker_id, Node* root, const ShogiBoard& root_board,
+                   AsyncBatchQueue& queue, std::atomic<int>& total_nodes,
+                   std::atomic<bool>& search_done);
+
+  // Select a leaf from the tree (shared by async and barrier paths).
+  struct LeafSelectResult {
+    Node* leaf;
+    ShogiBoard board;
+    MoveList legal_moves;
+    std::vector<Node*> path;
+    bool needs_nn;     // true = needs GPU eval, false = terminal/collision
+    float value;       // terminal/collision value
+    float draw;
+  };
+  LeafSelectResult SelectLeaf(Node* root, const ShogiBoard& root_board);
+
+  // --- Barrier-based multi-threaded search (legacy) ---
+
   SearchResult SearchMT(ShogiBoard board, int game_ply,
                         std::unique_ptr<Node>& root,
                         const MoveList& legal_moves);
