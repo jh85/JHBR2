@@ -341,10 +341,13 @@ MCTSSearch::SelectResult MCTSSearch::Select(Node* root,
 // Reference: dlshogi UctSearch.cpp:772-906
 
 int MCTSSearch::SelectBestChild(Node* node, bool is_root) {
-  const float cpuct = Cpuct(node->n());
-  const float sqrt_parent = std::sqrt(std::max(node->n(), 1u));
+  // Use n_started (N + in-flight) for parent visit count in exploration.
+  const uint32_t parent_n = node->n_started();
+  const float cpuct = Cpuct(parent_n);
+  const float sqrt_parent = std::sqrt(std::max(parent_n, 1u));
 
   // FPU (First Play Urgency) with relative reduction.
+  // Use real Q (unaffected by virtual loss) for FPU baseline.
   float visited_policy = 0.0f;
   for (int i = 0; i < node->num_edges(); i++) {
     Node* c = node->child(i);
@@ -377,15 +380,19 @@ int MCTSSearch::SelectBestChild(Node* node, bool is_root) {
     all_children_win = false;
 
     // Standard PUCT score.
+    // Q uses real visits only (never corrupted by virtual loss).
+    // U uses n_started (N + in-flight) to reduce exploration for in-flight nodes.
     Node* c = node->child(i);
     float q;
     float u;
     if (c && c->n() > 0) {
       q = -c->q();  // Negate: child's value is from child's perspective
-      u = cpuct * edge.policy * sqrt_parent / (1.0f + c->n());
+      u = cpuct * edge.policy * sqrt_parent / (1.0f + c->n_started());
     } else {
       q = fpu;
-      u = cpuct * edge.policy * sqrt_parent;  // denominator is 1
+      // Unvisited but possibly in-flight: use n_started in denominator.
+      uint32_t child_started = c ? c->n_started() : 0;
+      u = cpuct * edge.policy * sqrt_parent / (1.0f + child_started);
     }
 
     float score = q + u;

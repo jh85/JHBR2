@@ -142,15 +142,22 @@ class Node {
     d_.store(draw, std::memory_order_relaxed);
   }
 
-  // --- Virtual loss (for multi-threaded search) ---
+  // --- Virtual loss (for multi-threaded search, lc0-style) ---
+  // VL uses a separate in-flight counter so Q = W/N is never corrupted.
+  // Only the PUCT exploration term is affected (via n_started).
 
   void AddVirtualLoss(int count = 1) {
-    // Add pessimistic visits (N increases, W unchanged → Q drops)
-    n_.fetch_add(count, std::memory_order_relaxed);
+    n_in_flight_.fetch_add(count, std::memory_order_relaxed);
   }
 
   void RemoveVirtualLoss(int count = 1) {
-    n_.fetch_sub(count, std::memory_order_relaxed);
+    n_in_flight_.fetch_sub(count, std::memory_order_relaxed);
+  }
+
+  // N + in-flight — used in PUCT denominator for exploration.
+  uint32_t n_started() const {
+    return n_.load(std::memory_order_relaxed) +
+           n_in_flight_.load(std::memory_order_relaxed);
   }
 
   // --- Expansion lock (prevents two threads expanding same node) ---
@@ -217,6 +224,7 @@ class Node {
   std::atomic<uint32_t> n_{0};
   std::atomic<float> w_{0.0f};
   std::atomic<float> d_{0.0f};
+  std::atomic<uint32_t> n_in_flight_{0};  // Virtual loss counter (lc0-style)
 
   // Expansion lock
   std::atomic<bool> expanding_{false};
