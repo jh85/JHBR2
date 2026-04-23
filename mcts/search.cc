@@ -951,18 +951,19 @@ void MCTSSearch::AsyncWorker(int worker_id, Node* root,
         req.leaf = sel.leaf;
         req.path = std::move(sel.path);
         batch.leaves.push_back(std::move(req));
-      } else {
-        // Terminal or collision — backpropagate immediately.
-        if (!sel.needs_nn && sel.leaf && sel.leaf->is_terminal()) {
-          // Terminal: count as a node.
-        } else {
-          collisions++;
-        }
+      } else if (sel.leaf && sel.leaf->is_terminal()) {
+        // Terminal — backpropagate real value.
         float v = sel.value, d = sel.draw;
         for (int i = (int)sel.path.size() - 1; i >= 0; i--) {
           sel.path[i]->RemoveVirtualLoss(vl);
           sel.path[i]->AddVisit(v, d);
           v = -v;
+        }
+      } else {
+        // Collision — only remove virtual loss, don't add fake visits.
+        collisions++;
+        for (int i = (int)sel.path.size() - 1; i >= 0; i--) {
+          sel.path[i]->RemoveVirtualLoss(vl);
         }
       }
 
