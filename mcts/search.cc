@@ -107,8 +107,15 @@ SearchResult MCTSSearch::Search(ShogiBoard board, int game_ply) {
   }
 
   // Tree warmup: build initial tree with batch GPU eval before multi-threaded search.
+  auto pre_search_start = std::chrono::steady_clock::now();
   if (config_.warmup_nodes > 0) {
     WarmupTree(root.get(), board, config_.warmup_nodes);
+  }
+  // Subtract warmup + root eval time from the MCTS time budget.
+  if (config_.max_time > 0.0f) {
+    float pre_search_time = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - pre_search_start).count();
+    config_.max_time = std::max(config_.max_time - pre_search_time, 0.1f);
   }
 
   // Route to multi-threaded search if configured.

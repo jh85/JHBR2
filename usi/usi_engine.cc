@@ -285,9 +285,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   // Apply per-move time cap (MaxMoveTime option).
-  // Reserve 2 seconds for overhead (root eval, df-pn, thread join).
+  // Reserve 3 seconds for overhead (warmup, root eval, df-pn, thread join).
   if (max_move_time_ms_ > 0) {
-    float cap = std::max(max_move_time_ms_ / 1000.0f - 2.0f, 0.5f);
+    float cap = std::max(max_move_time_ms_ / 1000.0f - 3.0f, 0.5f);
     if (max_time <= 0.0f || cap < max_time) {
       max_time = cap;
     }
