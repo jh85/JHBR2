@@ -101,6 +101,7 @@ struct NNEvaluator::Impl {
 
   // Output sizes per sample.
   int policy_size = 0;
+  bool dynamic_batch = false;
 
   cudaStream_t stream = nullptr;
 
@@ -176,9 +177,11 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/)
   if (engine_input_dims.nbDims >= 1 && engine_input_dims.d[0] > 0) {
     // Static batch — the batch dim is fixed.
     impl_->max_batch_size = engine_input_dims.d[0];
+    impl_->dynamic_batch = false;
   } else {
     // Dynamic batch — check optimization profile.
     impl_->max_batch_size = 32;  // default
+    impl_->dynamic_batch = true;
     int nb_profiles = impl_->engine->getNbOptimizationProfiles();
     if (nb_profiles > 0) {
       auto max_dims = impl_->engine->getProfileShape(
@@ -193,8 +196,9 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/)
   auto policy_dims = impl_->engine->getTensorShape("policy");
   impl_->policy_size = (policy_dims.nbDims >= 2) ? policy_dims.d[1] : 2187;
 
-  fprintf(stderr, "[TRT] Engine loaded: channels=%d, max_batch=%d, policy_size=%d\n",
-          impl_->input_channels, impl_->max_batch_size, impl_->policy_size);
+  fprintf(stderr, "[TRT] Engine loaded: channels=%d, max_batch=%d, policy_size=%d, dynamic=%s\n",
+          impl_->input_channels, impl_->max_batch_size, impl_->policy_size,
+          impl_->dynamic_batch ? "yes" : "no");
 
   // Create CUDA stream.
   CUDA_CHECK(cudaStreamCreate(&impl_->stream));
@@ -248,9 +252,9 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     return results;
   }
 
+  // For dynamic-batch engines, use the actual batch size (no padding waste).
   // For static-batch engines, always use the full batch size (pad with zeros).
-  // For dynamic-batch engines, use the actual batch size.
-  int run_batch = impl_->max_batch_size;
+  int run_batch = impl_->dynamic_batch ? batch_size : impl_->max_batch_size;
   if (batch_size > run_batch) {
     // Batch too large — evaluate in chunks.
     std::vector<NNOutput> results;

@@ -10,7 +10,11 @@ def main():
         return
     pt_name = sys.argv[1]
     batch_size = int(sys.argv[2])
-    onnx_name = Path(pt_name).stem + f"_b{batch_size}.onnx"
+    dynamic = "--dynamic" in sys.argv
+    if dynamic:
+        onnx_name = Path(pt_name).stem + "_dynamic.onnx"
+    else:
+        onnx_name = Path(pt_name).stem + f"_b{batch_size}.onnx"
 
     ckpt = torch.load(pt_name, map_location="cpu", weights_only=False)
     cfg = ShogiBT4v2Config()
@@ -20,10 +24,21 @@ def main():
     model = ShogiBT4v2(cfg)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()
+
+    dynamic_axes = None
+    if dynamic:
+        dynamic_axes = {
+            "input_planes": {0: "batch"},
+            "policy": {0: "batch"},
+            "wdl": {0: "batch"},
+            "mlh": {0: "batch"},
+        }
+
     torch.onnx.export(model, torch.randn(batch_size,48,9,9),
                       onnx_name,
                       input_names=["input_planes"],
                       output_names=["policy","wdl","mlh"],
+                      dynamic_axes=dynamic_axes,
                       opset_version=18)
     print("done")
 
