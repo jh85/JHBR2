@@ -69,12 +69,15 @@ class Node {
   Node* parent() const { return parent_; }
   void set_parent(Node* p) { parent_ = p; }
 
-  int num_edges() const { return num_edges_; }
+  int num_edges() const { return num_edges_.load(std::memory_order_acquire); }
   Edge& edge(int i) { return edges_[i]; }
   const Edge& edge(int i) const { return edges_[i]; }
 
   // Does this node have children allocated?
-  bool is_expanded() const { return num_edges_ > 0; }
+  // Acquire ensures edge data written before the release store is visible.
+  bool is_expanded() const {
+    return num_edges_.load(std::memory_order_acquire) > 0;
+  }
 
   // Get child node for edge i. May be nullptr if not yet created.
   Node* child(int i) const {
@@ -108,9 +111,9 @@ class Node {
       edges_[i].move = move_priors[i].first;
       edges_[i].policy = move_priors[i].second;
     }
-    // Set num_edges_ last — this makes is_expanded() true,
-    // and other threads can now see the edges.
-    num_edges_ = n;
+    // Release store — ensures all edge data is visible to threads
+    // that load num_edges_ with acquire (is_expanded(), num_edges()).
+    num_edges_.store(n, std::memory_order_release);
   }
 
   // --- MCTS statistics (thread-safe with atomics) ---
@@ -218,7 +221,7 @@ class Node {
   std::unique_ptr<Edge[]> edges_;
   std::unique_ptr<std::unique_ptr<Node>[]> children_;
   std::mutex children_mutex_;
-  int num_edges_ = 0;
+  std::atomic<int> num_edges_{0};
 
   // MCTS stats (atomic for thread safety)
   std::atomic<uint32_t> n_{0};
