@@ -13,13 +13,12 @@
 #include <string>
 #include <unordered_map>
 
-#include "mcts/node.h"
 #ifdef USE_TENSORRT
 #include "mcts/nn_tensorrt.h"
 #else
 #include "mcts/nn_eval.h"
 #endif
-#include "mcts/search.h"
+#include "lc0_mcts/search.h"
 #include "shogi/board.h"
 
 namespace jhbr2 {
@@ -54,21 +53,17 @@ class USIEngine {
   // --- Members ---
   lczero::ShogiBoard board_;
   std::unique_ptr<NNEvaluator> evaluator_;
-  std::unique_ptr<NNEvaluator> warmup_evaluator_;  // Separate model for warmup
-  std::unique_ptr<MCTSSearch> search_;
-  MCTSConfig config_;
+  std::unique_ptr<lc0_shogi::Search> lc0_search_;
+  lc0_shogi::SearchConfig lc0_config_;
   int game_ply_ = 0;
 
   // Options
   std::string onnx_path_ = "shogi_bt4.onnx";
-  std::string warmup_model_path_;  // Empty = use main model for warmup
   int max_nodes_ = 800;
-  int leaf_dfpn_nodes_ = 40;
-  int pv_dfpn_nodes_ = 100000;
   float noise_epsilon_ = 0.0f;
   bool use_gpu_ = true;
-  int dfpn_max_time_ms_ = 4000;  // Max time for root df-pn (ms)
-  int max_move_time_ms_ = 0;     // Max time per move (ms), 0 = use clock
+  int dfpn_max_time_ms_ = 4000;
+  int max_move_time_ms_ = 0;
 };
 
 }  // namespace jhbr2

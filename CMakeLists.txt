@@ -66,17 +66,22 @@ set(SHOGI_ENGINE_SRCS
   shogi_engine/encoder.cc
 )
 
-# MCTS
+# MCTS (lc0-style port + NN backend)
 option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
+
+set(LC0_MCTS_SRCS
+  lc0_mcts/node.cc
+  lc0_mcts/search.cc
+)
 
 if(USE_TENSORRT)
   set(MCTS_SRCS
-    mcts/search.cc
+    ${LC0_MCTS_SRCS}
     mcts/nn_tensorrt.cc
   )
 else()
   set(MCTS_SRCS
-    mcts/search.cc
+    ${LC0_MCTS_SRCS}
     mcts/nn_eval.cc
   )
 endif()

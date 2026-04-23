@@ -1,7 +1,6 @@
 /*
   JHBR2 Shogi Engine — USI Protocol Implementation
-
-  Reference: JHBR2/shogi_usi.py (Python prototype)
+  Now using lc0-style MCTS search.
 */
 
 #include "usi/usi_engine.h"
@@ -34,6 +33,13 @@ static std::vector<std::string> Split(const std::string& s) {
   return parts;
 }
 
+static std::string ToLower(const std::string& s) {
+  std::string r = s;
+  std::transform(r.begin(), r.end(), r.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+  return r;
+}
+
 // =====================================================================
 // Constructor
 // =====================================================================
@@ -49,7 +55,6 @@ USIEngine::USIEngine() {
 void USIEngine::Run() {
   std::string line;
   while (std::getline(std::cin, line)) {
-    // Trim whitespace.
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
       line.pop_back();
     if (line.empty()) continue;
@@ -88,20 +93,12 @@ void USIEngine::CmdUsi() {
   Send(std::string("id name ") + ENGINE_NAME);
   Send(std::string("id author ") + ENGINE_AUTHOR);
 
-  Send("option name MaxNodes type spin default 800 min 1 max 1000000");
+  Send("option name MaxNodes type spin default 800 min 1 max 10000000");
   Send("option name OnnxModel type string default shogi_bt4.onnx");
   Send("option name NoiseEpsilon type string default 0.0");
-  Send("option name LeafDfpnNodes type spin default 100 min 0 max 100000");
-  Send("option name PvDfpnNodes type spin default 100000 min 0 max 10000000");
   Send("option name UseGPU type check default true");
-  Send("option name Threads type spin default 1 min 1 max 4096");
-  Send("option name ExpandDepth type spin default 1 min 1 max 8");
-  Send("option name SimsPerThread type spin default 1 min 1 max 10000");
-  Send("option name BatchSize type spin default 32 min 1 max 10000");
-  Send("option name MinibatchSize type spin default 32 min 1 max 10000");
-  Send("option name WarmupNodes type spin default 0 min 0 max 100000");
-  Send("option name WarmupModel type string default ");
-  Send("option name WarmupBatch type spin default 256 min 1 max 10000");
+  Send("option name Threads type spin default 1 min 1 max 128");
+  Send("option name MinibatchSize type spin default 32 min 1 max 256");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
 
@@ -112,39 +109,16 @@ void USIEngine::CmdIsReady() {
   if (!evaluator_) {
     Log("Loading model: " + onnx_path_);
 
-    // Initialize encoder tables.
     ShogiEncoderTables::Init();
 
     evaluator_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_);
 
-    // Load separate warmup model if specified.
-    if (!warmup_model_path_.empty()) {
-      Log("Loading warmup model: " + warmup_model_path_);
-      warmup_evaluator_ = std::make_unique<NNEvaluator>(warmup_model_path_, use_gpu_);
-    }
-
-    config_.max_nodes = max_nodes_;
-    config_.noise_epsilon = noise_epsilon_;
-    config_.leaf_dfpn_nodes = leaf_dfpn_nodes_;
-    config_.pv_dfpn_nodes = pv_dfpn_nodes_;
-
-    search_ = std::make_unique<MCTSSearch>(*evaluator_, config_,
-                                           warmup_evaluator_.get());
-
-    Log("Model loaded, max_nodes=" + std::to_string(config_.max_nodes));
+    Log("Model loaded, max_nodes=" + std::to_string(max_nodes_));
   }
   Send("readyok");
 }
 
-static std::string ToLower(const std::string& s) {
-  std::string r = s;
-  std::transform(r.begin(), r.end(), r.begin(),
-                 [](unsigned char c) { return std::tolower(c); });
-  return r;
-}
-
 void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
-  // Parse: setoption name <NAME> value <VALUE>
   std::string name, value;
   for (size_t i = 1; i < parts.size(); i++) {
     if (parts[i] == "name" && i + 1 < parts.size()) {
@@ -158,40 +132,21 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
 
   if (name_lower == "maxnodes") {
     max_nodes_ = std::stoi(value);
-    config_.max_nodes = max_nodes_;
   } else if (name_lower == "onnxmodel") {
     onnx_path_ = value;
   } else if (name_lower == "noiseepsilon") {
     noise_epsilon_ = std::stof(value);
-    config_.noise_epsilon = noise_epsilon_;
-  } else if (name_lower == "leafdfpnnodes") {
-    leaf_dfpn_nodes_ = std::stoi(value);
-    config_.leaf_dfpn_nodes = leaf_dfpn_nodes_;
-  } else if (name_lower == "pvdfpnnodes") {
-    pv_dfpn_nodes_ = std::stoi(value);
-    config_.pv_dfpn_nodes = pv_dfpn_nodes_;
+    lc0_config_.noise_epsilon = noise_epsilon_;
   } else if (name_lower == "usegpu") {
     use_gpu_ = (value == "true");
   } else if (name_lower == "threads") {
-    config_.num_search_threads = std::stoi(value);
-  } else if (name_lower == "expanddepth") {
-    config_.expand_depth = std::stoi(value);
+    lc0_config_.num_threads = std::stoi(value);
+  } else if (name_lower == "minibatchsize") {
+    lc0_config_.minibatch_size = std::stoi(value);
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
     max_move_time_ms_ = std::stoi(value);
-  } else if (name_lower == "simsperthread") {
-    config_.sims_per_thread = std::stoi(value);
-  } else if (name_lower == "warmupnodes") {
-    config_.warmup_nodes = std::stoi(value);
-  } else if (name_lower == "warmupbatch") {
-    config_.warmup_batch = std::stoi(value);
-  } else if (name_lower == "batchsize") {
-    config_.warmup_batch = std::stoi(value);  // reuses warmup_batch field
-  } else if (name_lower == "warmupmodel") {
-    warmup_model_path_ = value;
-  } else if (name_lower == "minibatchsize") {
-    config_.minibatch_size = std::stoi(value);
   }
 
   Log("Set " + name + " = " + value);
@@ -201,11 +156,6 @@ void USIEngine::CmdUsiNewGame() {
   board_.SetStartPos();
   board_.ClearHistory();
   game_ply_ = 0;
-  // Recreate search with current config.
-  if (evaluator_) {
-    search_ = std::make_unique<MCTSSearch>(*evaluator_, config_,
-                                           warmup_evaluator_.get());
-  }
 }
 
 void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
@@ -219,7 +169,6 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
     idx++;
   } else if (parts[idx] == "sfen") {
     idx++;
-    // Collect SFEN parts until "moves" or end.
     std::string sfen;
     while (idx < parts.size() && parts[idx] != "moves") {
       if (!sfen.empty()) sfen += " ";
@@ -229,7 +178,6 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
     board_.SetFromSfen(sfen);
   }
 
-  // Apply moves.
   if (idx < parts.size() && parts[idx] == "moves") {
     idx++;
     while (idx < parts.size()) {
@@ -239,11 +187,11 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
     }
   }
 
-  game_ply_ = board_.RepetitionCount();  // Approximate ply from history
+  game_ply_ = board_.RepetitionCount();
 }
 
 void USIEngine::CmdGo(const std::vector<std::string>& parts) {
-  if (!search_) {
+  if (!evaluator_) {
     Send("bestmove resign");
     return;
   }
@@ -268,13 +216,12 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     } else if (parts[i] == "nodes" && i + 1 < parts.size()) {
       nodes_limit = std::stoi(parts[i + 1]); i += 2;
     } else if (parts[i] == "infinite") {
-      max_time = 0; nodes_limit = 1000000; i++;
+      max_time = 0; nodes_limit = 10000000; i++;
     } else if (parts[i] == "mate") {
-      // Delegate to go mate handler.
       CmdGoMate(parts);
       return;
     } else if (parts[i] == "ponder") {
-      i++;  // Ignore ponder
+      i++;
     } else {
       i++;
     }
@@ -290,13 +237,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     max_time = std::max(max_time, 0.1f);
   }
 
-  // Apply per-move time cap (MaxMoveTime option).
-  // Reserve 3 seconds for overhead (warmup, root eval, df-pn, thread join).
   if (max_move_time_ms_ > 0) {
     float cap = std::max(max_move_time_ms_ / 1000.0f - 3.0f, 0.5f);
-    if (max_time <= 0.0f || cap < max_time) {
-      max_time = cap;
-    }
+    if (max_time <= 0.0f || cap < max_time) max_time = cap;
   }
 
   // Check entering-king declaration.
@@ -305,13 +248,11 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     return;
   }
 
-  // Set search limits.
-  config_.max_nodes = nodes_limit;
-  config_.max_time = max_time;
+  // Configure lc0 MCTS search.
+  lc0_config_.max_nodes = nodes_limit;
+  lc0_config_.max_time = max_time;
 
-  // --- Launch root df-pn in parallel with MCTS (dlshogi-style) ---
-  // Scale df-pn budget and wait time with available time.
-  // More time remaining → larger df-pn budget → find deeper mates.
+  // --- Launch root df-pn in parallel ---
   int my_time_ms = (board_.side_to_move() == BLACK) ? btime : wtime;
   int my_inc_ms = (board_.side_to_move() == BLACK) ? binc : winc;
   int available_ms = my_time_ms + my_inc_ms + byoyomi;
@@ -319,32 +260,21 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   int dfpn_min_wait_ms;
   size_t root_dfpn_nodes;
   if (available_ms <= 0) {
-    // No time info (go nodes, go infinite) — use defaults.
-    dfpn_min_wait_ms = 300;
-    root_dfpn_nodes = 100000;
+    dfpn_min_wait_ms = 300; root_dfpn_nodes = 100000;
   } else if (available_ms < 10000) {
-    // Under 10 seconds — minimal df-pn.
-    dfpn_min_wait_ms = 100;
-    root_dfpn_nodes = 10000;
+    dfpn_min_wait_ms = 100; root_dfpn_nodes = 10000;
   } else if (available_ms < 60000) {
-    // 10-60 seconds — moderate df-pn.
-    dfpn_min_wait_ms = 300;
-    root_dfpn_nodes = 100000;
+    dfpn_min_wait_ms = 300; root_dfpn_nodes = 100000;
   } else if (available_ms < 300000) {
-    // 1-5 minutes — generous df-pn.
-    dfpn_min_wait_ms = 500;
-    root_dfpn_nodes = 500000;
+    dfpn_min_wait_ms = 500; root_dfpn_nodes = 500000;
   } else {
-    // 5+ minutes — deep df-pn search.
-    dfpn_min_wait_ms = 1000;
-    root_dfpn_nodes = 2000000;
+    dfpn_min_wait_ms = 1000; root_dfpn_nodes = 2000000;
   }
 
-  // Hard wall-clock deadline for the entire move (MCTS + df-pn + everything).
   auto move_start_time = std::chrono::steady_clock::now();
   int hard_deadline_ms = (max_move_time_ms_ > 0)
       ? max_move_time_ms_
-      : static_cast<int>(max_time * 1000) + 2000;  // clock time + 2s margin
+      : static_cast<int>(max_time * 1000) + 2000;
 
   MateDfpnSolver root_dfpn(root_dfpn_nodes);
   std::atomic<bool> dfpn_done{false};
@@ -356,15 +286,13 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     dfpn_done = true;
   });
 
-  // --- Run MCTS concurrently ---
-  search_ = std::make_unique<MCTSSearch>(*evaluator_, config_,
-                                         warmup_evaluator_.get());
-  SearchResult result = search_->Search(board_, game_ply_);
+  // --- Run lc0-style MCTS ---
+  lc0_search_ = std::make_unique<lc0_shogi::Search>(*evaluator_, lc0_config_);
+  auto result = lc0_search_->Run(board_, game_ply_);
 
-  // --- Stop df-pn and wait for it to finish ---
+  // --- Stop df-pn and wait ---
   root_dfpn.stop();
 
-  // Brief wait if we have time remaining before the hard deadline.
   auto total_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - move_start_time).count();
   int remaining_ms = hard_deadline_ms - (int)total_elapsed_ms;
@@ -378,11 +306,11 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       if (elapsed_ms >= wait_ms) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    root_dfpn.stop();  // ensure stopped if wait timed out
+    root_dfpn.stop();
   }
   dfpn_thread.join();
 
-  // --- Choose result: prefer mate if found ---
+  // --- Choose result ---
   bool use_mate = dfpn_done &&
                   !dfpn_mate_move.is_null() &&
                   !MateDfpnSolver::IsNoMate(dfpn_mate_move);
@@ -397,8 +325,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     if (pv_str.empty()) pv_str = dfpn_mate_move.ToString();
 
     int mate_ply = (int)pv.size();
-    Log("Root df-pn found mate in " + std::to_string(mate_ply) + " ply (" +
-        std::to_string(root_dfpn.get_nodes_searched()) + " nodes)");
+    Log("Root df-pn found mate in " + std::to_string(mate_ply) + " ply");
 
     Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
          " nodes " + std::to_string(root_dfpn.get_nodes_searched()) +
@@ -420,16 +347,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
   if (pv_str.empty()) pv_str = result.best_move.ToString();
 
-  std::string score_str;
-  if (result.mate_status == 1) {
-    score_str = "score mate +";
-  } else if (result.mate_status == -1) {
-    score_str = "score mate -";
-  } else {
-    score_str = "score cp " + std::to_string(result.score_cp);
-  }
-
-  Send("info depth 1 " + score_str +
+  Send("info depth 1 score cp " + std::to_string(result.score_cp) +
        " nodes " + std::to_string(result.nodes) +
        " time " + std::to_string(static_cast<int>(result.time_sec * 1000)) +
        " nps " + std::to_string(static_cast<int>(result.nps)) +
@@ -439,8 +357,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 }
 
 void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
-  // Parse: go mate <time_ms> | go mate infinite
-  int time_limit_ms = 0;  // 0 = infinite
+  int time_limit_ms = 0;
   for (size_t i = 1; i < parts.size(); i++) {
     if (parts[i] == "mate") {
       if (i + 1 < parts.size() && parts[i + 1] != "infinite") {
@@ -450,16 +367,14 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
     }
   }
 
-  // Scale node budget with time limit. The df-pn can search ~50K-200K nodes/sec.
   size_t max_nodes;
   if (time_limit_ms <= 0) {
-    max_nodes = 10000000;  // infinite: 10M nodes
+    max_nodes = 10000000;
   } else {
-    max_nodes = std::max((size_t)(time_limit_ms * 200), (size_t)100000);  // ~200K nodes/sec
+    max_nodes = std::max((size_t)(time_limit_ms * 200), (size_t)100000);
   }
   MateDfpnSolver solver(max_nodes);
 
-  // Run df-pn in a separate thread so we can enforce the time limit.
   std::atomic<bool> search_done{false};
   Move mate_move;
 
@@ -468,7 +383,6 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
     search_done = true;
   });
 
-  // Wait for completion or time limit.
   auto t0 = std::chrono::steady_clock::now();
   while (!search_done) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -481,50 +395,36 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
       }
     }
   }
-
   search_thread.join();
 
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0).count();
 
-  // Report result.
   if (!search_done && time_limit_ms > 0) {
-    // Time's up before search completed.
-    Log("Mate search timeout after " + std::to_string(elapsed) + " ms, " +
-        std::to_string(solver.get_nodes_searched()) + " nodes");
+    Log("Mate search timeout after " + std::to_string(elapsed) + " ms");
     Send("checkmate timeout");
   } else if (!mate_move.is_null() && !MateDfpnSolver::IsNoMate(mate_move)) {
-    // Mate found.
     auto pv = solver.get_pv();
     std::string pv_str;
     for (const auto& m : pv) {
       if (!pv_str.empty()) pv_str += " ";
       pv_str += m.ToString();
     }
-    Log("Mate found in " + std::to_string(pv.size()) + " ply, " +
-        std::to_string(solver.get_nodes_searched()) + " nodes, " +
-        std::to_string(elapsed) + " ms");
+    Log("Mate found in " + std::to_string(pv.size()) + " ply");
     Send("checkmate " + pv_str);
   } else if (MateDfpnSolver::IsNoMate(mate_move)) {
-    Log("No mate proven (" + std::to_string(solver.get_nodes_searched()) +
-        " nodes, " + std::to_string(elapsed) + " ms)");
     Send("checkmate nomate");
   } else {
-    // Unsolved (out of memory or nodes).
-    Log("Mate search unsolved (" + std::to_string(solver.get_nodes_searched()) +
-        " nodes, " + std::to_string(elapsed) + " ms)");
     Send("checkmate timeout");
   }
 }
 
 void USIEngine::CmdStop() {
-  if (search_) search_->Stop();
+  if (lc0_search_) lc0_search_->Stop();
 }
 
 void USIEngine::CmdGameOver(const std::vector<std::string>& parts) {
-  if (parts.size() > 1) {
-    Log("Game over: " + parts[1]);
-  }
+  if (parts.size() > 1) Log("Game over: " + parts[1]);
 }
 
 void USIEngine::CmdDebug() {
