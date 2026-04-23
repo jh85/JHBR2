@@ -1,11 +1,13 @@
 /*
-  JHBR2 Shogi Engine — Async Queue MCTS (lc0-style)
+  JHBR2 Shogi Engine — Async Multi-Gather MCTS (lc0-style)
 
-  Workers submit leaves to a shared batch queue. A dedicated GPU thread
-  collects batches and evaluates them. Workers wait for their specific
-  result via condition variables.
+  Each worker thread gathers multiple leaves (minibatch), then submits
+  them all to a shared GPU queue. A dedicated GPU thread collects
+  leaves from all workers, evaluates in large batches, and distributes
+  results back. Workers wait for their batch via condition variables.
 
-  Supports multi-GPU: one GPU thread per GPU, workers assigned to a GPU.
+  With 2-4 workers each gathering 32-64 leaves, the GPU sees batches
+  of 64-128 — full utilization with minimal virtual loss.
 */
 
 #pragma once
@@ -29,42 +31,51 @@ using lczero::ShogiBoard;
 using lczero::MoveList;
 
 // =====================================================================
-// LeafRequest — a leaf submitted by a worker for GPU evaluation
+// LeafRequest — a single leaf submitted for GPU evaluation
 // =====================================================================
 
 struct LeafRequest {
-  int worker_id;
   ShogiBoard board;
   MoveList legal_moves;
   Node* leaf;
-  std::vector<Node*> path;  // for virtual loss removal + backprop
+  std::vector<Node*> path;
 };
 
 // =====================================================================
-// AsyncBatchQueue — collects leaves and triggers GPU evaluation
+// WorkerBatch — a batch of leaves from one worker
+// =====================================================================
+
+struct WorkerBatch {
+  int worker_id;
+  std::vector<LeafRequest> leaves;
+};
+
+// =====================================================================
+// AsyncBatchQueue — multi-gather batch queue
 // =====================================================================
 
 class AsyncBatchQueue {
  public:
-  AsyncBatchQueue(NNEvaluator& evaluator, int batch_size, int num_workers)
-      : evaluator_(evaluator), batch_size_(batch_size), num_workers_(num_workers) {
+  AsyncBatchQueue(NNEvaluator& evaluator, int max_batch_size, int num_workers)
+      : evaluator_(evaluator), max_batch_size_(max_batch_size),
+        num_workers_(num_workers) {
     worker_results_.resize(num_workers);
     worker_ready_.resize(num_workers, false);
     worker_cvs_ = std::make_unique<std::condition_variable[]>(num_workers);
   }
 
-  // Called by worker: submit a leaf and wait for the NN result.
-  NNOutput SubmitAndWait(LeafRequest& req) {
-    int wid = req.worker_id;
+  // Called by worker: submit a batch of leaves and wait for NN results.
+  // Returns one NNOutput per leaf, in the same order.
+  std::vector<NNOutput> SubmitBatchAndWait(WorkerBatch& batch) {
+    int wid = batch.worker_id;
 
     {
       std::lock_guard<std::mutex> lock(queue_mutex_);
-      pending_.push_back(std::move(req));
+      pending_.push_back(std::move(batch));
     }
-    // Notify GPU thread that a new leaf is available.
     queue_cv_.notify_one();
 
-    // Wait for this worker's result.
+    // Wait for results.
     {
       std::unique_lock<std::mutex> lock(result_mutex_);
       worker_cvs_[wid].wait(lock, [&] { return worker_ready_[wid]; });
@@ -76,49 +87,84 @@ class AsyncBatchQueue {
   // Called by GPU thread: process batches until stopped.
   void GPULoop(std::atomic<bool>& stop) {
     while (!stop.load(std::memory_order_relaxed)) {
-      std::vector<LeafRequest> batch;
+      std::vector<WorkerBatch> batches;
 
-      // Wait for enough leaves or timeout.
+      // Wait for pending work.
       {
         std::unique_lock<std::mutex> lock(queue_mutex_);
         queue_cv_.wait_for(lock, std::chrono::milliseconds(1), [&] {
-          return (int)pending_.size() >= batch_size_ ||
-                 stop.load(std::memory_order_relaxed);
+          return !pending_.empty() || stop.load(std::memory_order_relaxed);
         });
 
         if (pending_.empty()) continue;
 
-        // Take all pending leaves (up to batch_size).
-        int take = std::min((int)pending_.size(), batch_size_);
-        batch.assign(
-            std::make_move_iterator(pending_.begin()),
-            std::make_move_iterator(pending_.begin() + take));
-        pending_.erase(pending_.begin(), pending_.begin() + take);
+        // Take all pending worker batches.
+        batches = std::move(pending_);
+        pending_.clear();
       }
 
-      if (batch.empty()) continue;
+      if (batches.empty()) continue;
 
-      // Build NN batch.
+      // Flatten all leaves into one big NN batch.
+      // Track which worker each leaf belongs to and its index within that worker's batch.
+      struct LeafInfo {
+        int worker_id;
+        int leaf_idx;  // index within the worker's batch
+      };
       std::vector<std::pair<ShogiBoard, MoveList>> nn_batch;
-      nn_batch.reserve(batch.size());
-      for (auto& req : batch) {
-        nn_batch.emplace_back(std::move(req.board), std::move(req.legal_moves));
-      }
+      std::vector<LeafInfo> leaf_map;
 
-      // Evaluate.
-      auto results = evaluator_.EvaluateBatch(nn_batch);
-
-      // Distribute results to waiting workers.
-      {
-        std::lock_guard<std::mutex> lock(result_mutex_);
-        for (int i = 0; i < (int)batch.size(); i++) {
-          int wid = batch[i].worker_id;
-          worker_results_[wid] = std::move(results[i]);
-          worker_ready_[wid] = true;
+      for (auto& wb : batches) {
+        for (int i = 0; i < (int)wb.leaves.size(); i++) {
+          nn_batch.emplace_back(std::move(wb.leaves[i].board),
+                                std::move(wb.leaves[i].legal_moves));
+          leaf_map.push_back({wb.worker_id, i});
         }
       }
-      for (int i = 0; i < (int)batch.size(); i++) {
-        worker_cvs_[batch[i].worker_id].notify_one();
+
+      // Evaluate in sub-batches if needed.
+      std::vector<NNOutput> all_results;
+      int total = (int)nn_batch.size();
+      for (int start = 0; start < total; start += max_batch_size_) {
+        int end = std::min(start + max_batch_size_, total);
+        std::vector<std::pair<ShogiBoard, MoveList>> sub(
+            std::make_move_iterator(nn_batch.begin() + start),
+            std::make_move_iterator(nn_batch.begin() + end));
+        auto sub_results = evaluator_.EvaluateBatch(sub);
+        all_results.insert(all_results.end(),
+                           std::make_move_iterator(sub_results.begin()),
+                           std::make_move_iterator(sub_results.end()));
+      }
+
+      // Prepare per-worker result vectors.
+      // First, count leaves per worker to pre-allocate.
+      std::vector<int> worker_leaf_count(num_workers_, 0);
+      for (auto& wb : batches) {
+        worker_leaf_count[wb.worker_id] = (int)wb.leaves.size();
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(result_mutex_);
+        for (int w = 0; w < num_workers_; w++) {
+          if (worker_leaf_count[w] > 0) {
+            worker_results_[w].resize(worker_leaf_count[w]);
+          }
+        }
+
+        // Distribute results.
+        for (int i = 0; i < (int)leaf_map.size(); i++) {
+          int wid = leaf_map[i].worker_id;
+          int idx = leaf_map[i].leaf_idx;
+          worker_results_[wid][idx] = std::move(all_results[i]);
+        }
+
+        // Signal all workers that submitted batches.
+        for (auto& wb : batches) {
+          worker_ready_[wb.worker_id] = true;
+        }
+      }
+      for (auto& wb : batches) {
+        worker_cvs_[wb.worker_id].notify_one();
       }
     }
 
@@ -136,17 +182,17 @@ class AsyncBatchQueue {
 
  private:
   NNEvaluator& evaluator_;
-  int batch_size_;
+  int max_batch_size_;
   int num_workers_;
 
-  // Pending leaves queue.
+  // Pending worker batches.
   std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
-  std::vector<LeafRequest> pending_;
+  std::vector<WorkerBatch> pending_;
 
   // Per-worker results.
   std::mutex result_mutex_;
-  std::vector<NNOutput> worker_results_;
+  std::vector<std::vector<NNOutput>> worker_results_;
   std::vector<bool> worker_ready_;
   std::unique_ptr<std::condition_variable[]> worker_cvs_;
 };

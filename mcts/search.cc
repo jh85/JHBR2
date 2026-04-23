@@ -927,53 +927,90 @@ void MCTSSearch::AsyncWorker(int worker_id, Node* root,
                               std::atomic<int>& total_nodes,
                               std::atomic<bool>& search_done) {
   int vl = config_.virtual_loss_count;
+  int gather_target = config_.minibatch_size;
 
   while (!search_done.load(std::memory_order_relaxed)) {
-    // Check node limit in worker too (reduces overshoot).
     if (total_nodes.load(std::memory_order_relaxed) >= config_.max_nodes) break;
 
-    // 1. Select a leaf.
-    auto sel = SelectLeaf(root, root_board);
+    // --- Phase 1: Gather multiple leaves ---
+    // Leaves needing NN eval are collected; terminals are backpropagated immediately.
+    WorkerBatch batch;
+    batch.worker_id = worker_id;
 
-    if (sel.needs_nn) {
-      // 2. Submit to GPU batch queue and wait.
-      LeafRequest req;
-      req.worker_id = worker_id;
-      req.board = std::move(sel.board);
-      req.legal_moves = std::move(sel.legal_moves);
-      req.leaf = sel.leaf;
-      req.path = std::move(sel.path);
+    int collisions = 0;
+    for (int g = 0; g < gather_target; g++) {
+      if (search_done.load(std::memory_order_relaxed)) break;
+      if (total_nodes.load(std::memory_order_relaxed) >= config_.max_nodes) break;
 
-      NNOutput eval = queue.SubmitAndWait(req);
+      auto sel = SelectLeaf(root, root_board);
 
-      // Check if we were woken due to search_done.
-      if (search_done.load(std::memory_order_relaxed)) {
-        // Remove virtual loss and exit.
-        for (auto* n : req.path) n->RemoveVirtualLoss(vl);
-        break;
+      if (sel.needs_nn) {
+        LeafRequest req;
+        req.board = std::move(sel.board);
+        req.legal_moves = std::move(sel.legal_moves);
+        req.leaf = sel.leaf;
+        req.path = std::move(sel.path);
+        batch.leaves.push_back(std::move(req));
+      } else {
+        // Terminal or collision — backpropagate immediately.
+        if (!sel.needs_nn && sel.leaf && sel.leaf->is_terminal()) {
+          // Terminal: count as a node.
+        } else {
+          collisions++;
+        }
+        float v = sel.value, d = sel.draw;
+        for (int i = (int)sel.path.size() - 1; i >= 0; i--) {
+          sel.path[i]->RemoveVirtualLoss(vl);
+          sel.path[i]->AddVisit(v, d);
+          v = -v;
+        }
       }
 
-      // 3. Expand the node.
-      ExpandNodeWithNN(sel.leaf, eval, req.legal_moves);
-      sel.leaf->FinishExpansion();
+      // If too many collisions, stop gathering early — tree is congested.
+      if (collisions > gather_target / 2) break;
+    }
 
-      // 4. Backpropagate.
+    if (batch.leaves.empty()) continue;
+
+    // Save leaf/path data locally — SubmitBatchAndWait moves the batch away.
+    struct LocalLeaf {
+      Node* leaf;
+      MoveList legal_moves;
+      std::vector<Node*> path;
+    };
+    std::vector<LocalLeaf> local;
+    local.reserve(batch.leaves.size());
+    for (auto& req : batch.leaves) {
+      local.push_back({req.leaf, req.legal_moves, req.path});
+    }
+
+    // --- Phase 2: Submit batch to GPU and wait ---
+    auto results = queue.SubmitBatchAndWait(batch);
+
+    if (search_done.load(std::memory_order_relaxed)) {
+      // Remove virtual loss from all pending leaves and exit.
+      for (auto& ll : local) {
+        for (auto* n : ll.path) n->RemoveVirtualLoss(vl);
+      }
+      break;
+    }
+
+    // --- Phase 3: Expand and backpropagate all leaves ---
+    for (int i = 0; i < (int)local.size(); i++) {
+      auto& ll = local[i];
+      auto& eval = results[i];
+
+      ExpandNodeWithNN(ll.leaf, eval, ll.legal_moves);
+      ll.leaf->FinishExpansion();
+
       float v = eval.value, d = eval.draw;
-      for (int i = (int)req.path.size() - 1; i >= 0; i--) {
-        req.path[i]->RemoveVirtualLoss(vl);
-        req.path[i]->AddVisit(v, d);
-        v = -v;
-      }
-      total_nodes.fetch_add(1, std::memory_order_relaxed);
-    } else {
-      // Terminal or collision — backpropagate immediately.
-      float v = sel.value, d = sel.draw;
-      for (int i = (int)sel.path.size() - 1; i >= 0; i--) {
-        sel.path[i]->RemoveVirtualLoss(vl);
-        sel.path[i]->AddVisit(v, d);
+      for (int j = (int)ll.path.size() - 1; j >= 0; j--) {
+        ll.path[j]->RemoveVirtualLoss(vl);
+        ll.path[j]->AddVisit(v, d);
         v = -v;
       }
     }
+    total_nodes.fetch_add((int)local.size(), std::memory_order_relaxed);
   }
 }
 
@@ -981,14 +1018,17 @@ SearchResult MCTSSearch::SearchAsync(ShogiBoard board, int game_ply,
                                       std::unique_ptr<Node>& root,
                                       const MoveList& legal_moves) {
   const int N = config_.num_search_threads;
-  const int batch = config_.warmup_batch > 0 ? config_.warmup_batch : N;
+  // Max GPU batch = sum of all workers' minibatches.
+  // warmup_batch acts as the TensorRT engine batch size limit.
+  const int max_gpu_batch = config_.warmup_batch > 0 ? config_.warmup_batch
+                            : N * config_.minibatch_size;
 
   std::atomic<int> total_nodes{0};
   std::atomic<bool> search_done{false};
   auto t0 = std::chrono::steady_clock::now();
 
   // Create batch queue.
-  AsyncBatchQueue queue(evaluator_, batch, N);
+  AsyncBatchQueue queue(evaluator_, max_gpu_batch, N);
 
   // Launch GPU thread.
   auto gpu_thread = std::thread([&]() {

@@ -277,6 +277,7 @@ struct MCTSConfig {
   int virtual_loss_count = 3;       // Virtual visits per selection
   int expand_depth = 1;             // Nodes to expand per simulation (1 = standard)
   int sims_per_thread = 1;          // Independent leaves per thread per barrier phase
+  int minibatch_size = 32;           // Leaves per worker per gather round
   int warmup_nodes = 0;             // Nodes to expand in single-threaded warmup (0=disabled)
   int warmup_batch = 256;           // Batch size for warmup GPU evaluation
 };
