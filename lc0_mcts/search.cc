@@ -278,126 +278,324 @@ void SearchWorker::ExecuteOneIteration() {
 }
 
 // =====================================================================
-// GatherMinibatch
+// GatherMinibatch — lc0-style bulk visit distribution
 // =====================================================================
 
 void SearchWorker::GatherMinibatch() {
-  int target = config_.minibatch_size;
-  // Collision budget: stop early if tree can't provide enough leaves.
-  // Too many collisions = wasted CPU time + inflated n_in_flight.
-  int max_collisions = target * 2;
-  int collisions = 0;
-  int gathered = 0;
+  int collision_limit = config_.minibatch_size;
 
-  while (gathered < target && collisions < max_collisions) {
-    if (search_->stop_.load(std::memory_order_acquire)) break;
+  // Bulk pick: one recursive tree walk distributes all visits.
+  PickNodesToExtend(collision_limit);
 
-    auto ntp = PickNodeToExtend();
+  // Process picked nodes: extend and add to NN batch.
+  ProcessPickedNodes();
+}
 
-    if (ntp.is_collision) {
-      collisions += ntp.multivisit;
-      minibatch_.push_back(std::move(ntp));
-      continue;
+void SearchWorker::PickNodesToExtend(int collision_limit) {
+  std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
+  std::vector<Move> empty;
+  PickNodesToExtendTask(search_->root_node_, 0, collision_limit,
+                        empty, &minibatch_);
+}
+
+// =====================================================================
+// PickNodesToExtendTask — ported from lc0 with minimal changes
+// =====================================================================
+// Distributes collision_limit visits down the tree in ONE recursive walk.
+// At each internal node, PUCT determines how many visits each child gets.
+// Leaves become Visit entries; nodes being expanded become Collisions.
+
+void SearchWorker::PickNodesToExtendTask(
+    Node* node, int base_depth, int collision_limit,
+    const std::vector<Move>& moves_to_base,
+    std::vector<NodeToProcess>* receiver) {
+
+  // Workspace arrays (reused via vtp_buffer_).
+  std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
+  std::vector<int> vtp_last_filled;
+  std::vector<int> current_path;
+  std::vector<Move> moves_to_path = moves_to_base;
+
+  std::array<float, 256> current_pol;
+  std::array<float, 256> current_util;
+  std::array<float, 256> current_score;
+  std::array<int, 256> current_nstarted;
+
+  Node::Iterator best_edge;
+  Node::Iterator second_best_edge;
+
+  bool is_root_node = (node == search_->root_node_);
+  const float even_draw_score = search_->GetDrawScore(false);
+  const float odd_draw_score = search_->GetDrawScore(true);
+
+  int max_limit = std::numeric_limits<int>::max();
+
+  current_path.push_back(-1);
+  while (current_path.size() > 0) {
+    if (current_path.back() == -1) {
+      // Determine how many visits this node should receive.
+      int cur_limit = collision_limit;
+      if (current_path.size() > 1) {
+        cur_limit =
+            (*visits_to_perform.back())[current_path[current_path.size() - 2]];
+      }
+
+      // Terminal or unexpanded node → collision.
+      if (node->GetN() == 0 || node->IsTerminal()) {
+        if (is_root_node) {
+          if (node->TryStartScoreUpdate()) {
+            cur_limit -= 1;
+            auto ntp = NodeToProcess::Visit(
+                node, static_cast<uint16_t>(current_path.size() + base_depth));
+            ntp.moves_to_node = moves_to_path;
+            minibatch_.push_back(std::move(ntp));
+          }
+        }
+        if (cur_limit > 0) {
+          if (is_root_node) node->IncrementNInFlight(cur_limit);
+          receiver->push_back(NodeToProcess::Collision(
+              node, static_cast<uint16_t>(current_path.size() + base_depth),
+              cur_limit, 0));
+        }
+        node = node->GetParent();
+        current_path.pop_back();
+        continue;
+      }
+
+      // Root VL: increment n_in_flight for all visits being distributed.
+      if (is_root_node) {
+        node->IncrementNInFlight(cur_limit);
+      }
+
+      // Allocate visits_to_perform array for this depth level.
+      if (vtp_buffer_.size() > 0) {
+        visits_to_perform.push_back(std::move(vtp_buffer_.back()));
+        vtp_buffer_.pop_back();
+      } else {
+        visits_to_perform.push_back(std::make_unique<std::array<int, 256>>());
+      }
+      vtp_last_filled.push_back(-1);
+
+      // Cache PUCT parameters.
+      int max_needed = node->GetNumEdges();
+      max_needed =
+          std::min(max_needed, std::max(0, node->GetNStarted()) + cur_limit + 2);
+      if (max_needed <= 0) {
+        receiver->push_back(NodeToProcess::Collision(
+            node, static_cast<uint16_t>(current_path.size() + base_depth),
+            cur_limit, 0));
+        node = node->GetParent();
+        current_path.pop_back();
+        continue;
+      }
+      node->CopyPolicy(max_needed, current_pol.data());
+      for (int i = 0; i < max_needed; i++) {
+        current_util[i] = std::numeric_limits<float>::lowest();
+      }
+
+      const float draw_score = ((current_path.size() + base_depth) % 2 == 0)
+                                   ? odd_draw_score : even_draw_score;
+      float visited_pol = 0.0f;
+      for (Node* child : node->VisitedNodes()) {
+        int index = child->Index();
+        visited_pol += current_pol[index];
+        float child_q = child->GetQ(draw_score);
+        current_util[index] = std::isfinite(child_q) ? child_q : 0.0f;
+      }
+      float fpu = GetFpu(config_, node, is_root_node, draw_score, visited_pol);
+      if (!std::isfinite(fpu)) fpu = 0.0f;
+      for (int i = 0; i < max_needed; i++) {
+        if (current_util[i] == std::numeric_limits<float>::lowest()) {
+          current_util[i] = fpu;
+        }
+      }
+
+      const float cpuct = ComputeCpuct(config_, node->GetN(), is_root_node);
+      const float puct_mult =
+          cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
+      int cache_filled_idx = -1;
+
+      // Distribute visits to children via PUCT.
+      while (cur_limit > 0) {
+        float best = std::numeric_limits<float>::lowest();
+        int best_idx = -1;
+        float best_without_u = std::numeric_limits<float>::lowest();
+        float second_best = std::numeric_limits<float>::lowest();
+        bool can_exit = false;
+        best_edge.Reset();
+
+        for (int idx = 0; idx < max_needed; ++idx) {
+          if (idx > cache_filled_idx) {
+            if (idx == 0) {
+              cur_iters_[idx] = node->Edges();
+            } else {
+              cur_iters_[idx] = cur_iters_[idx - 1];
+              ++cur_iters_[idx];
+            }
+            current_nstarted[idx] = cur_iters_[idx].GetNStarted();
+          }
+          int nstarted = current_nstarted[idx];
+          const float util = current_util[idx];
+          if (idx > cache_filled_idx) {
+            current_score[idx] =
+                current_pol[idx] * puct_mult / (1 + nstarted) + util;
+            cache_filled_idx++;
+          }
+
+          float score = current_score[idx];
+          if (!std::isfinite(score)) {
+            score = std::numeric_limits<float>::lowest();
+          }
+          if (best_idx < 0 || score > best) {
+            second_best = best;
+            second_best_edge = best_edge;
+            best = score;
+            best_idx = idx;
+            best_without_u = util;
+            best_edge = cur_iters_[idx];
+          } else if (score > second_best) {
+            second_best = score;
+            second_best_edge = cur_iters_[idx];
+          }
+          if (can_exit) break;
+          if (nstarted == 0) can_exit = true;
+        }
+
+        if (best_idx < 0 || !best_edge) {
+          receiver->push_back(NodeToProcess::Collision(
+              node, static_cast<uint16_t>(current_path.size() + base_depth),
+              cur_limit, 0));
+          cur_limit = 0;
+          break;
+        }
+
+        // Determine how many visits go to best child before second-best
+        // becomes better.
+        int new_visits = 0;
+        if (second_best_edge) {
+          int estimated_visits_to_change_best = std::numeric_limits<int>::max();
+          if (best_without_u < second_best) {
+            const auto n1 = current_nstarted[best_idx] + 1;
+            estimated_visits_to_change_best = static_cast<int>(
+                std::max(1.0f, std::min(current_pol[best_idx] * puct_mult /
+                                                (second_best - best_without_u) -
+                                            n1 + 1,
+                                        1e9f)));
+          }
+          second_best_edge.Reset();
+          max_limit = std::min(max_limit, estimated_visits_to_change_best);
+          new_visits = std::min(cur_limit, estimated_visits_to_change_best);
+        } else {
+          new_visits = cur_limit;
+        }
+
+        // Record visits for this child.
+        if (best_idx >= vtp_last_filled.back()) {
+          auto* vtp_array = visits_to_perform.back().get()->data();
+          std::fill(vtp_array + (vtp_last_filled.back() + 1),
+                    vtp_array + best_idx + 1, 0);
+        }
+        (*visits_to_perform.back())[best_idx] += new_visits;
+        cur_limit -= new_visits;
+
+        Node* child_node = best_edge.GetOrSpawnNode(node);
+
+        // Try to claim this child for expansion.
+        bool claimed = false;
+        if (child_node->TryStartScoreUpdate()) {
+          current_nstarted[best_idx]++;
+          new_visits -= 1;
+          claimed = true;
+        }
+        // Collision cancellation subtracts from the collision node too, so
+        // every non-claimed visit must be represented in the child VL count.
+        if (new_visits > 0) {
+          child_node->IncrementNInFlight(new_visits);
+          current_nstarted[best_idx] += new_visits;
+        }
+        current_score[best_idx] = current_pol[best_idx] * puct_mult /
+                                      (1 + current_nstarted[best_idx]) +
+                                  current_util[best_idx];
+
+        // If claimed and it's a new leaf or terminal, create a Visit entry.
+        if (claimed &&
+            (child_node->GetN() == 0 || child_node->IsTerminal())) {
+          (*visits_to_perform.back())[best_idx] -= 1;
+          auto ntp = NodeToProcess::Visit(
+              child_node,
+              static_cast<uint16_t>(current_path.size() + 1 + base_depth));
+          ntp.moves_to_node = moves_to_path;
+          ntp.moves_to_node.push_back(best_edge.GetMove());
+          receiver->push_back(std::move(ntp));
+        }
+
+        if (best_idx > vtp_last_filled.back() &&
+            (*visits_to_perform.back())[best_idx] > 0) {
+          vtp_last_filled.back() = best_idx;
+        }
+      }
+      is_root_node = false;
+      // Fall through to select the first child to recurse into.
     }
 
-    // Extend the node (generate legal moves, detect terminal).
-    ExtendNode(ntp);
+    // Find next child with visits_to_perform > 0 to recurse into.
+    int min_idx = current_path.back();
+    bool found_child = false;
+    if (vtp_last_filled.back() > min_idx) {
+      int idx = -1;
+      for (auto& child : node->Edges()) {
+        idx++;
+        if (idx > min_idx && (*visits_to_perform.back())[idx] > 0) {
+          if (moves_to_path.size() !=
+              current_path.size() + static_cast<size_t>(base_depth)) {
+            moves_to_path.push_back(child.GetMove());
+          } else {
+            moves_to_path.back() = child.GetMove();
+          }
+          current_path.back() = idx;
+          current_path.push_back(-1);
+          node = child.GetOrSpawnNode(node);
+          found_child = true;
+          break;
+        }
+        if (idx >= vtp_last_filled.back()) break;
+      }
+    }
+    if (!found_child) {
+      node = node->GetParent();
+      if (!moves_to_path.empty()) moves_to_path.pop_back();
+      current_path.pop_back();
+      vtp_buffer_.push_back(std::move(visits_to_perform.back()));
+      visits_to_perform.pop_back();
+      vtp_last_filled.pop_back();
+    }
+  }
+}
+
+// =====================================================================
+// ProcessPickedNodes — extend nodes + add to NN batch
+// =====================================================================
+
+void SearchWorker::ProcessPickedNodes() {
+  for (int i = 0; i < static_cast<int>(minibatch_.size()); i++) {
+    auto& ntp = minibatch_[i];
+    if (ntp.IsCollision()) continue;
+    if (!ntp.IsExtendable()) continue;
+
+    // Extend the node.
+    ExtendNode(ntp.node, ntp.depth, ntp.moves_to_node);
 
     if (!ntp.node->IsTerminal()) {
-      // Needs NN evaluation — add to computation batch.
+      // Add to NN batch.
+      ntp.nn_queried = true;
       ShogiBoard board = search_->root_board_;
       for (const auto& m : ntp.moves_to_node) {
         board.DoMove(m);
       }
       MoveList legal_moves = board.GenerateLegalMoves();
-
-      nn_batch_indices_.push_back(static_cast<int>(minibatch_.size()));
+      nn_batch_indices_.push_back(i);
       computation_->AddInput(board, legal_moves);
     }
-
-    minibatch_.push_back(std::move(ntp));
-    gathered++;
-  }
-}
-
-// =====================================================================
-// PickNodeToExtend — PUCT selection (from lc0)
-// =====================================================================
-
-SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
-  Node* node = search_->root_node_;
-  uint16_t depth = 0;
-  std::vector<Move> moves;
-  bool is_root = true;
-
-  // Lock tree for reading/writing.
-  std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
-
-  while (true) {
-    // If node has no visits (not yet evaluated), no children, or is terminal
-    // — we've reached a leaf. N==0 check prevents descending through nodes
-    // that have edges but no policy priors yet (queued for NN eval).
-    if (node->GetN() == 0 || !node->HasChildren() || node->IsTerminal()) {
-      // Try to claim this node for expansion.
-      if (node->TryStartScoreUpdate()) {
-        return NodeToProcess::Visit(node, depth, std::move(moves));
-      } else {
-        // Collision — another thread is expanding this node.
-        // Increment n_in_flight so CancelSharedCollisions can decrement it.
-        node->IncrementNInFlight(1);
-        return NodeToProcess::Collision(node, depth, 1);
-      }
-    }
-
-    // PUCT selection among children.
-    const float draw_score = search_->GetDrawScore(depth % 2 == 1);
-    const float cpuct = ComputeCpuct(config_, node->GetN(), is_root);
-    const float puct_mult =
-        cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
-
-    // Compute FPU.
-    float visited_pol = 0.0f;
-    for (auto* child : node->VisitedNodes()) {
-      visited_pol += node->GetEdgeToNode(child)->GetP();
-    }
-    const float fpu = GetFpu(config_, node, is_root, draw_score, visited_pol);
-
-    // Find best child by PUCT score.
-    float best_score = -1e10f;
-    Edge_Iterator<false> best_edge;
-
-    for (auto edge = node->Edges(); edge != edge.end(); ++edge) {
-      float q, u;
-      if (edge.HasNode() && edge.GetN() > 0) {
-        q = edge.GetQ(fpu, draw_score);
-        u = edge.GetP() * puct_mult / (1 + edge.GetNStarted());
-      } else {
-        q = fpu;
-        int n_started = edge.HasNode() ? edge.GetNStarted() : 0;
-        u = edge.GetP() * puct_mult / (1 + n_started);
-      }
-
-      float score = q + u;
-      if (score > best_score) {
-        best_score = score;
-        best_edge = edge;
-      }
-    }
-
-    if (!best_edge) {
-      // No valid edge found — shouldn't happen.
-      return NodeToProcess::Collision(node, depth, 1);
-    }
-
-    // Add virtual loss to this node for other threads.
-    node->IncrementNInFlight(1);
-
-    // Move to the selected child.
-    moves.push_back(best_edge.GetMove());
-    Node* child = best_edge.GetOrSpawnNode(node);
-    node = child;
-    depth++;
-    is_root = false;
   }
 }
 
@@ -405,50 +603,37 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
 // ExtendNode — terminal detection and edge creation (from lc0)
 // =====================================================================
 
-void SearchWorker::ExtendNode(NodeToProcess& ntp) {
-  Node* node = ntp.node;
-
-  // Reconstruct board position.
+void SearchWorker::ExtendNode(Node* node, int depth,
+                              const std::vector<Move>& moves) {
   ShogiBoard board = search_->root_board_;
-  for (const auto& m : ntp.moves_to_node) {
-    board.DoMove(m);
-  }
+  for (const auto& m : moves) board.DoMove(m);
 
   auto legal_moves = board.GenerateLegalMoves();
 
-  // No legal moves = checkmate (shogi has no stalemate).
   if (legal_moves.empty()) {
-    // Side to move is checkmated. From lc0 convention:
-    // WHITE_WON = the side that "just moved" wins = current side loses.
-    // So checkmate = side to move loses.
     node->MakeTerminal(GameResult::WHITE_WON);
     return;
   }
 
-  // Declare win (entering king).
   if (board.CanDeclareWin()) {
     node->MakeTerminal(GameResult::BLACK_WON);
     return;
   }
 
-  // Repetition check.
   if (node != search_->root_node_) {
     auto rep = board.CheckRepetition();
     if (rep == ShogiBoard::RepetitionResult::kDraw) {
       node->MakeTerminal(GameResult::DRAW);
       return;
     } else if (rep == ShogiBoard::RepetitionResult::kWin) {
-      // Current side wins (opponent made perpetual check).
       node->MakeTerminal(GameResult::BLACK_WON);
       return;
     } else if (rep == ShogiBoard::RepetitionResult::kLoss) {
-      // Current side loses (we made perpetual check).
       node->MakeTerminal(GameResult::WHITE_WON);
       return;
     }
   }
 
-  // Not terminal — create edges for legal moves.
   node->CreateEdges(legal_moves);
 }
 

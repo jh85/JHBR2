@@ -187,50 +187,55 @@ class SearchWorker {
   void FetchMinibatchResults();
   void DoBackupUpdate();
 
-  // PUCT selection — picks one leaf node to extend.
   struct NodeToProcess {
     Node* node;
     int multivisit = 1;
+    int maxvisit = 0;
     uint16_t depth = 0;
     bool is_collision = false;
     bool nn_queried = false;
 
-    // NN results.
     float eval_q = 0.0f;
     float eval_d = 0.0f;
     float eval_m = 0.0f;
 
-    // Moves from root to this node (for board reconstruction).
     std::vector<Move> moves_to_node;
 
-    static NodeToProcess Visit(Node* node, uint16_t depth,
-                                std::vector<Move> moves) {
+    bool IsExtendable() const { return !is_collision && !node->IsTerminal(); }
+    bool IsCollision() const { return is_collision; }
+
+    static NodeToProcess Visit(Node* node, uint16_t depth) {
       NodeToProcess ntp;
       ntp.node = node;
       ntp.depth = depth;
-      ntp.moves_to_node = std::move(moves);
+      ntp.multivisit = 1;
       return ntp;
     }
-    static NodeToProcess Collision(Node* node, uint16_t depth, int count) {
+    static NodeToProcess Collision(Node* node, uint16_t depth,
+                                   int count, int max_count = 0) {
       NodeToProcess ntp;
       ntp.node = node;
       ntp.depth = depth;
       ntp.multivisit = count;
+      ntp.maxvisit = max_count;
       ntp.is_collision = true;
       return ntp;
     }
   };
 
-  // Pick a leaf node to extend (PUCT selection + VL).
-  NodeToProcess PickNodeToExtend();
+  // lc0-style bulk visit distribution (one recursive tree walk).
+  void PickNodesToExtend(int collision_limit);
+  void PickNodesToExtendTask(Node* node, int base_depth, int collision_limit,
+                             const std::vector<Move>& moves_to_base,
+                             std::vector<NodeToProcess>* receiver);
+
+  // Process picked nodes: extend + add to NN batch.
+  void ProcessPickedNodes();
 
   // Extend a node: generate legal moves, detect terminals.
-  void ExtendNode(NodeToProcess& ntp);
+  void ExtendNode(Node* node, int depth, const std::vector<Move>& moves);
 
-  // Backup one node's result through the tree.
   void DoBackupUpdateSingleNode(const NodeToProcess& ntp);
-
-  // Bounds propagation for sticky endgames.
   bool MaybeSetBounds(Node* p, float m, int* n_to_fix,
                       float* v_delta, float* d_delta, float* m_delta) const;
 
@@ -238,9 +243,12 @@ class SearchWorker {
   const SearchConfig& config_;
   std::vector<NodeToProcess> minibatch_;
 
-  // Per-worker computation (created fresh each iteration).
+  // Workspace for bulk visit distribution (reused across iterations).
+  std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer_;
+  std::array<Node::Iterator, 256> cur_iters_;
+
   std::unique_ptr<Computation> computation_;
-  std::vector<int> nn_batch_indices_;  // Maps computation index to minibatch index
+  std::vector<int> nn_batch_indices_;
 };
 
 }  // namespace lc0_shogi

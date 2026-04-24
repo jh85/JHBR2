@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -92,7 +93,12 @@ class Node {
   uint32_t GetN() const { return n_; }
   uint32_t GetNInFlight() const { return n_in_flight_; }
   uint32_t GetChildrenVisits() const { return n_ > 0 ? n_ - 1 : 0; }
-  int GetNStarted() const { return n_ + n_in_flight_; }
+  int GetNStarted() const {
+    uint64_t started = static_cast<uint64_t>(n_) + n_in_flight_;
+    constexpr uint64_t kMaxSafeStarted =
+        static_cast<uint64_t>(std::numeric_limits<int>::max() / 4);
+    return static_cast<int>(std::min(started, kMaxSafeStarted));
+  }
   float GetQ(float draw_score) const { return wl_ + draw_score * d_; }
   float GetWL() const { return wl_; }
   float GetD() const { return d_; }
@@ -183,6 +189,8 @@ class Node {
   friend class VisitedNode_Iterator<true>;
   friend class VisitedNode_Iterator<false>;
 };
+
+static_assert(sizeof(Node) == 64, "Node layout must stay lc0-compatible");
 
 // =====================================================================
 // EdgeAndNode — convenience pair

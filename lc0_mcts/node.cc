@@ -100,6 +100,11 @@ Move Edge::GetMove(bool as_opponent) const {
 }
 
 void Edge::SetP(float p) {
+  if (!std::isfinite(p) || p <= 0.0f) {
+    p_ = 0;
+    return;
+  }
+  p = std::min(p, 1.0f);
   assert(0.0f <= p && p <= 1.0f);
   constexpr int32_t roundings = (1 << 11) - (3 << 28);
   int32_t tmp;
@@ -272,7 +277,11 @@ bool Node::TryStartScoreUpdate() {
   return true;
 }
 
-void Node::CancelScoreUpdate(int multivisit) { n_in_flight_ -= multivisit; }
+void Node::CancelScoreUpdate(int multivisit) {
+  assert(multivisit >= 0);
+  assert(n_in_flight_ >= static_cast<uint32_t>(multivisit));
+  n_in_flight_ -= multivisit;
+}
 
 void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
   wl_ += multivisit * (v - wl_) / (n_ + multivisit);
