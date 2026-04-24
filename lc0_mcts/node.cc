@@ -147,8 +147,13 @@ Node* Node::CreateSingleChildNode(Move move) {
 void Node::CreateEdges(const MoveList& moves) {
   assert(!edges_);
   assert(!child_);
-  edges_ = Edge::FromMovelist(moves);
-  num_edges_ = moves.size();
+  // Cap at 255 edges (uint8_t). Top policy moves cover >99.99% of probability.
+  // Shogi can have 500+ legal moves but PUCT never selects low-policy moves.
+  int n = std::min(static_cast<int>(moves.size()), 255);
+  MoveList capped;
+  for (int i = 0; i < n; i++) capped.push_back(moves[i]);
+  edges_ = Edge::FromMovelist(capped);
+  num_edges_ = static_cast<uint8_t>(n);
 }
 
 Node::ConstIterator Node::Edges() const {
