@@ -100,6 +100,7 @@ void USIEngine::CmdUsi() {
   Send("option name Threads type spin default 1 min 1 max 128");
   Send("option name MinibatchSize type spin default 32 min 1 max 256");
   Send("option name PerLeafGathering type check default true");
+  Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
 
@@ -146,6 +147,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     lc0_config_.minibatch_size = std::stoi(value);
   } else if (name_lower == "perleafgathering") {
     lc0_config_.per_leaf_gathering = (value == "true");
+  } else if (name_lower == "leafdfpnnodes") {
+    lc0_config_.leaf_dfpn_nodes = std::stoi(value);
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {

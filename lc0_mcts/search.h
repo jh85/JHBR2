@@ -89,6 +89,10 @@ struct SearchConfig {
 
   // Policy softmax temperature (1.0 = use NN output directly)
   float policy_softmax_temp = 1.0f;
+
+  // Leaf df-pn: inline mate detection at leaf nodes.
+  // Budget in nodes (0 = disabled). Typical: 10-100.
+  int leaf_dfpn_nodes = 0;
 };
 
 // =====================================================================

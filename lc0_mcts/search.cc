@@ -28,6 +28,7 @@
 #include <random>
 #include <sstream>
 
+#include "mate/dfpn.h"
 #include "shogi/encoder.h"
 
 namespace lc0_shogi {
@@ -408,6 +409,18 @@ void SearchWorker::ExtendNodeInPlace(NodeToProcess& ntp) {
       node->MakeTerminal(GameResult::WHITE_WON); return;
     }
   }
+
+  // Leaf df-pn: inline mate detection with tiny budget.
+  if (config_.leaf_dfpn_nodes > 0) {
+    jhbr2::MateDfpnSolver solver(config_.leaf_dfpn_nodes);
+    Move mate_move = solver.search(board, config_.leaf_dfpn_nodes);
+    if (!mate_move.is_null() && !jhbr2::MateDfpnSolver::IsNoMate(mate_move)) {
+      // Side to move can force mate → this position is winning.
+      node->MakeTerminal(GameResult::BLACK_WON);
+      return;
+    }
+  }
+
   node->CreateEdges(legal_moves);
 }
 
@@ -761,6 +774,16 @@ void SearchWorker::ExtendNode(Node* node, int depth,
       return;
     } else if (rep == ShogiBoard::RepetitionResult::kLoss) {
       node->MakeTerminal(GameResult::WHITE_WON);
+      return;
+    }
+  }
+
+  // Leaf df-pn: inline mate detection with tiny budget.
+  if (config_.leaf_dfpn_nodes > 0) {
+    jhbr2::MateDfpnSolver solver(config_.leaf_dfpn_nodes);
+    Move mate_move = solver.search(board, config_.leaf_dfpn_nodes);
+    if (!mate_move.is_null() && !jhbr2::MateDfpnSolver::IsNoMate(mate_move)) {
+      node->MakeTerminal(GameResult::BLACK_WON);
       return;
     }
   }
