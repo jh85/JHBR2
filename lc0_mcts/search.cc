@@ -275,16 +275,19 @@ void SearchWorker::ExecuteOneIteration() {
 
 void SearchWorker::GatherMinibatch() {
   int target = config_.minibatch_size;
-  int collisions_left = config_.max_collision_visits;
+  // Collision budget: stop early if tree can't provide enough leaves.
+  // Too many collisions = wasted CPU time + inflated n_in_flight.
+  int max_collisions = target * 2;
+  int collisions = 0;
   int gathered = 0;
 
-  while (gathered < target && collisions_left > 0) {
+  while (gathered < target && collisions < max_collisions) {
     if (search_->stop_.load(std::memory_order_acquire)) break;
 
     auto ntp = PickNodeToExtend();
 
     if (ntp.is_collision) {
-      collisions_left -= ntp.multivisit;
+      collisions += ntp.multivisit;
       minibatch_.push_back(std::move(ntp));
       continue;
     }
