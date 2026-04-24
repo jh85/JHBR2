@@ -103,7 +103,7 @@ class Node {
   bool IsTwoFoldTerminal() const { return terminal_type_ == Terminal::TwoFold; }
   typedef std::pair<GameResult, GameResult> Bounds;
   Bounds GetBounds() const { return {lower_bound_, upper_bound_}; }
-  uint8_t GetNumEdges() const { return num_edges_; }
+  uint16_t GetNumEdges() const { return num_edges_; }
 
   void CopyPolicy(int max_needed, float* output) const {
     if (!edges_) return;
@@ -170,7 +170,7 @@ class Node {
   uint32_t n_ = 0;
   uint32_t n_in_flight_ = 0;
   uint16_t index_;
-  uint8_t num_edges_ = 0;
+  uint16_t num_edges_ = 0;  // Shogi can have 500+ legal moves (chess only ~218)
   Terminal terminal_type_ : 2;
   GameResult lower_bound_ : 2;
   GameResult upper_bound_ : 2;

@@ -244,8 +244,8 @@ class SearchWorker {
   std::vector<NodeToProcess> minibatch_;
 
   // Workspace for bulk visit distribution (reused across iterations).
-  std::vector<std::unique_ptr<std::array<int, 256>>> vtp_buffer_;
-  std::array<Node::Iterator, 256> cur_iters_;
+  std::vector<std::unique_ptr<std::array<int, 640>>> vtp_buffer_;
+  std::array<Node::Iterator, 640> cur_iters_;
 
   std::unique_ptr<Computation> computation_;
   std::vector<int> nn_batch_indices_;

@@ -303,15 +303,15 @@ void SearchWorker::PickNodesToExtendTask(
     std::vector<NodeToProcess>* receiver) {
 
   // Workspace arrays (reused via vtp_buffer_).
-  std::vector<std::unique_ptr<std::array<int, 256>>> visits_to_perform;
+  std::vector<std::unique_ptr<std::array<int, 640>>> visits_to_perform;
   std::vector<int> vtp_last_filled;
   std::vector<int> current_path;
   std::vector<Move> moves_to_path = moves_to_base;
 
-  std::array<float, 256> current_pol;
-  std::array<float, 256> current_util;
-  std::array<float, 256> current_score;
-  std::array<int, 256> current_nstarted;
+  std::array<float, 640> current_pol;
+  std::array<float, 640> current_util;
+  std::array<float, 640> current_score;
+  std::array<int, 640> current_nstarted;
 
   Node::Iterator best_edge;
   Node::Iterator second_best_edge;
@@ -363,7 +363,7 @@ void SearchWorker::PickNodesToExtendTask(
         visits_to_perform.push_back(std::move(vtp_buffer_.back()));
         vtp_buffer_.pop_back();
       } else {
-        visits_to_perform.push_back(std::make_unique<std::array<int, 256>>());
+        visits_to_perform.push_back(std::make_unique<std::array<int, 640>>());
       }
       vtp_last_filled.push_back(-1);
 
