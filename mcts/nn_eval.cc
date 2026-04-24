@@ -86,26 +86,44 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
   opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
   // --- Try TensorRT first (best performance, dynamic batch) ---
+  // Create cache directory for TRT engine files.
+  std::system("mkdir -p trt_cache 2>/dev/null");
   if (use_gpu) {
     try {
       Ort::SessionOptions trt_opts;
       trt_opts.SetIntraOpNumThreads(1);
       trt_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
-      // TensorRT provider options via C API.
+      // TensorRT provider options via C API (lc0-style dynamic batch).
       OrtTensorRTProviderOptionsV2* trt_provider_opts = nullptr;
       Ort::GetApi().CreateTensorRTProviderOptions(&trt_provider_opts);
+
+      // Dynamic batch profiles: min=1, opt=32, max=128.
+      // ONNX Runtime builds a TensorRT engine with these optimization profiles,
+      // so any batch size 1-128 runs efficiently without padding.
+      std::string min_shapes = "input_planes:1x" + std::to_string(kShogiInputPlanes) + "x9x9";
+      std::string opt_shapes = "input_planes:32x" + std::to_string(kShogiInputPlanes) + "x9x9";
+      std::string max_shapes = "input_planes:128x" + std::to_string(kShogiInputPlanes) + "x9x9";
+
       std::vector<const char*> trt_keys = {
         "trt_max_workspace_size",
         "trt_fp16_enable",
         "trt_engine_cache_enable",
         "trt_engine_cache_path",
+        "trt_profile_min_shapes",
+        "trt_profile_opt_shapes",
+        "trt_profile_max_shapes",
+        "trt_builder_optimization_level",
       };
       std::vector<const char*> trt_values = {
-        "2147483648",   // 2GB workspace
-        "1",            // Enable FP16
-        "1",            // Cache the TRT engine
-        ".",            // Cache directory
+        "2147483648",           // 2GB workspace
+        "1",                    // Enable FP16
+        "1",                    // Cache the TRT engine
+        "./trt_cache",          // Cache directory
+        min_shapes.c_str(),     // Min batch = 1
+        opt_shapes.c_str(),     // Optimal batch = 32
+        max_shapes.c_str(),     // Max batch = 128
+        "3",                    // Builder optimization level (3 = good balance)
       };
       Ort::GetApi().UpdateTensorRTProviderOptions(
           trt_provider_opts, trt_keys.data(), trt_values.data(), trt_keys.size());
