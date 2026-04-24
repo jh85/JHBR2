@@ -152,6 +152,7 @@ class Search {
   // Threading.
   std::atomic<bool> stop_{false};
   mutable std::shared_mutex nodes_mutex_;
+  std::mutex nn_mutex_;  // Serializes NN evaluation (TensorRT is not thread-safe)
 
   // Stats (guarded by nodes_mutex_).
   EdgeAndNode current_best_edge_;

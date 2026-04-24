@@ -437,6 +437,8 @@ void SearchWorker::ExtendNode(NodeToProcess& ntp) {
 
 void SearchWorker::RunNNComputation() {
   if (nn_batch_.empty()) return;
+  // Serialize NN access — TensorRT execution context is not thread-safe.
+  std::lock_guard<std::mutex> lock(search_->nn_mutex_);
   nn_results_ = search_->evaluator_.EvaluateBatch(nn_batch_);
 }
 
