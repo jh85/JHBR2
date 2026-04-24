@@ -362,16 +362,20 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
     for (auto edge = node->Edges(); edge != edge.end(); ++edge) {
       float q = (edge.HasNode() && edge.GetN() > 0)
                     ? edge.GetQ(fpu, draw_score) : fpu;
+      if (!std::isfinite(q)) q = 0.0f;
       int n_started = (edge.HasNode()) ? edge.GetNStarted() : 0;
       float u = edge.GetP() * puct_mult / (1 + n_started);
       float score = q + u;
-      if (score > best_score) {
+      if (!std::isfinite(score)) score = fpu;
+      if (best_edge.edge() == nullptr || score > best_score) {
         best_score = score;
         best_edge = edge;
       }
     }
 
     if (!best_edge) {
+      // No edges at all — shouldn't happen for expanded nodes.
+      node->IncrementNInFlight(1);
       return NodeToProcess::Collision(node, depth, 1);
     }
 
