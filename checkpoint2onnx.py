@@ -34,12 +34,38 @@ def main():
             "mlh": {0: "batch"},
         }
 
+    export_kwargs = dict(
+        input_names=["input_planes"],
+        output_names=["policy","wdl","mlh"],
+        opset_version=18,
+    )
+    if dynamic:
+        export_kwargs["dynamic_axes"] = dynamic_axes
+        # Force legacy exporter (dynamo ignores dynamic_axes)
+        export_kwargs["dynamo"] = False
+
     torch.onnx.export(model, torch.randn(batch_size,48,9,9),
-                      onnx_name,
-                      input_names=["input_planes"],
-                      output_names=["policy","wdl","mlh"],
-                      dynamic_axes=dynamic_axes,
-                      opset_version=18)
-    print("done")
+                      onnx_name, **export_kwargs)
+
+    # Verify dynamic batch dim was set
+    if dynamic:
+        import onnx
+        m = onnx.load(onnx_name)
+        dim0 = m.graph.input[0].type.tensor_type.shape.dim[0]
+        if dim0.dim_param:
+            print(f"done (dynamic batch: {dim0.dim_param})")
+        else:
+            print(f"WARNING: batch dim is static ({dim0.dim_value}), not dynamic!")
+            print("Fixing manually...")
+            for inp in m.graph.input:
+                inp.type.tensor_type.shape.dim[0].dim_param = "batch"
+                inp.type.tensor_type.shape.dim[0].ClearField("dim_value")
+            for out in m.graph.output:
+                out.type.tensor_type.shape.dim[0].dim_param = "batch"
+                out.type.tensor_type.shape.dim[0].ClearField("dim_value")
+            onnx.save(m, onnx_name)
+            print("Fixed — batch dim is now dynamic")
+    else:
+        print("done")
 
 main()
