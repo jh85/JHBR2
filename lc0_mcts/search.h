@@ -83,6 +83,10 @@ struct SearchConfig {
   // Sticky endgames (propagate bounds from terminal children)
   bool sticky_endgames = true;
 
+  // Use per-leaf gathering instead of bulk distribution.
+  // Better NPS with static-batch TensorRT engines.
+  bool per_leaf_gathering = false;
+
   // Policy softmax temperature (1.0 = use NN output directly)
   float policy_softmax_temp = 1.0f;
 };
@@ -204,11 +208,13 @@ class SearchWorker {
     bool IsExtendable() const { return !is_collision && !node->IsTerminal(); }
     bool IsCollision() const { return is_collision; }
 
-    static NodeToProcess Visit(Node* node, uint16_t depth) {
+    static NodeToProcess Visit(Node* node, uint16_t depth,
+                                std::vector<Move> moves = {}) {
       NodeToProcess ntp;
       ntp.node = node;
       ntp.depth = depth;
       ntp.multivisit = 1;
+      ntp.moves_to_node = std::move(moves);
       return ntp;
     }
     static NodeToProcess Collision(Node* node, uint16_t depth,
@@ -223,16 +229,20 @@ class SearchWorker {
     }
   };
 
-  // lc0-style bulk visit distribution (one recursive tree walk).
+  // --- Gathering strategies ---
+
+  // Per-leaf: one PickNodeToExtend call per leaf (better for static-batch TRT).
+  void GatherMinibatchPerLeaf();
+  NodeToProcess PickNodeToExtend();
+  void ExtendNodeInPlace(NodeToProcess& ntp);
+
+  // Bulk: lc0-style one recursive tree walk (better for dynamic-batch).
+  void GatherMinibatchBulk();
   void PickNodesToExtend(int collision_limit);
   void PickNodesToExtendTask(Node* node, int base_depth, int collision_limit,
                              const std::vector<Move>& moves_to_base,
                              std::vector<NodeToProcess>* receiver);
-
-  // Process picked nodes: extend + add to NN batch.
   void ProcessPickedNodes();
-
-  // Extend a node: generate legal moves, detect terminals.
   void ExtendNode(Node* node, int depth, const std::vector<Move>& moves);
 
   void DoBackupUpdateSingleNode(const NodeToProcess& ntp);

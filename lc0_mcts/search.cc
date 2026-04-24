@@ -282,12 +282,143 @@ void SearchWorker::ExecuteOneIteration() {
 // =====================================================================
 
 void SearchWorker::GatherMinibatch() {
+  if (config_.per_leaf_gathering) {
+    GatherMinibatchPerLeaf();
+  } else {
+    GatherMinibatchBulk();
+  }
+}
+
+// =====================================================================
+// Per-leaf gathering — one PickNodeToExtend per leaf
+// Better NPS with static-batch TensorRT engines.
+// =====================================================================
+
+void SearchWorker::GatherMinibatchPerLeaf() {
+  int target = config_.minibatch_size;
+  int max_collisions = target * 2;
+  int collisions = 0;
+  int gathered = 0;
+
+  while (gathered < target && collisions < max_collisions) {
+    if (search_->stop_.load(std::memory_order_acquire)) break;
+
+    auto ntp = PickNodeToExtend();
+
+    if (ntp.is_collision) {
+      collisions += ntp.multivisit;
+      minibatch_.push_back(std::move(ntp));
+      continue;
+    }
+
+    ExtendNodeInPlace(ntp);
+
+    if (!ntp.node->IsTerminal()) {
+      ShogiBoard board = search_->root_board_;
+      for (const auto& m : ntp.moves_to_node) board.DoMove(m);
+      MoveList legal_moves = board.GenerateLegalMoves();
+      nn_batch_indices_.push_back(static_cast<int>(minibatch_.size()));
+      computation_->AddInput(board, legal_moves);
+    }
+
+    minibatch_.push_back(std::move(ntp));
+    gathered++;
+  }
+}
+
+SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
+  Node* node = search_->root_node_;
+  uint16_t depth = 0;
+  std::vector<Move> moves;
+  bool is_root = true;
+
+  std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
+
+  while (true) {
+    if (node->GetN() == 0 || !node->HasChildren() || node->IsTerminal()) {
+      if (node->TryStartScoreUpdate()) {
+        return NodeToProcess::Visit(node, depth, std::move(moves));
+      } else {
+        node->IncrementNInFlight(1);
+        return NodeToProcess::Collision(node, depth, 1);
+      }
+    }
+
+    const float draw_score = search_->GetDrawScore(depth % 2 == 1);
+    const float cpuct = ComputeCpuct(config_, node->GetN(), is_root);
+    const float puct_mult =
+        cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
+
+    float visited_pol = 0.0f;
+    for (auto* child : node->VisitedNodes()) {
+      visited_pol += node->GetEdgeToNode(child)->GetP();
+    }
+    const float fpu = GetFpu(config_, node, is_root, draw_score, visited_pol);
+
+    float best_score = -1e10f;
+    Edge_Iterator<false> best_edge;
+
+    for (auto edge = node->Edges(); edge != edge.end(); ++edge) {
+      float q = (edge.HasNode() && edge.GetN() > 0)
+                    ? edge.GetQ(fpu, draw_score) : fpu;
+      int n_started = (edge.HasNode()) ? edge.GetNStarted() : 0;
+      float u = edge.GetP() * puct_mult / (1 + n_started);
+      float score = q + u;
+      if (score > best_score) {
+        best_score = score;
+        best_edge = edge;
+      }
+    }
+
+    if (!best_edge) {
+      return NodeToProcess::Collision(node, depth, 1);
+    }
+
+    node->IncrementNInFlight(1);
+    moves.push_back(best_edge.GetMove());
+    Node* child = best_edge.GetOrSpawnNode(node);
+    node = child;
+    depth++;
+    is_root = false;
+  }
+}
+
+void SearchWorker::ExtendNodeInPlace(NodeToProcess& ntp) {
+  Node* node = ntp.node;
+  ShogiBoard board = search_->root_board_;
+  for (const auto& m : ntp.moves_to_node) board.DoMove(m);
+
+  auto legal_moves = board.GenerateLegalMoves();
+
+  if (legal_moves.empty()) {
+    node->MakeTerminal(GameResult::WHITE_WON);
+    return;
+  }
+  if (board.CanDeclareWin()) {
+    node->MakeTerminal(GameResult::BLACK_WON);
+    return;
+  }
+  if (node != search_->root_node_) {
+    auto rep = board.CheckRepetition();
+    if (rep == ShogiBoard::RepetitionResult::kDraw) {
+      node->MakeTerminal(GameResult::DRAW); return;
+    } else if (rep == ShogiBoard::RepetitionResult::kWin) {
+      node->MakeTerminal(GameResult::BLACK_WON); return;
+    } else if (rep == ShogiBoard::RepetitionResult::kLoss) {
+      node->MakeTerminal(GameResult::WHITE_WON); return;
+    }
+  }
+  node->CreateEdges(legal_moves);
+}
+
+// =====================================================================
+// Bulk gathering — lc0-style one recursive tree walk
+// Better for dynamic-batch backends.
+// =====================================================================
+
+void SearchWorker::GatherMinibatchBulk() {
   int collision_limit = config_.minibatch_size;
-
-  // Bulk pick: one recursive tree walk distributes all visits.
   PickNodesToExtend(collision_limit);
-
-  // Process picked nodes: extend and add to NN batch.
   ProcessPickedNodes();
 }
 
