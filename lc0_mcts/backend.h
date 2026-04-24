@@ -92,9 +92,7 @@ class Backend {
 inline void Computation::ComputeBlocking() {
   if (inputs_.empty()) return;
   std::lock_guard<std::mutex> lock(backend_->gpu_mutex_);
-  fprintf(stderr, "[DBG] EvaluateBatch size=%d\n", (int)inputs_.size());
   results_ = backend_->evaluator_.EvaluateBatch(inputs_);
-  fprintf(stderr, "[DBG] EvaluateBatch done, results=%d\n", (int)results_.size());
 }
 
 }  // namespace lc0_shogi
