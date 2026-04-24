@@ -368,27 +368,34 @@ class DirectionPolicyHead(nn.Module):
         board_logits = torch.matmul(Q, K.transpose(-2, -1)) * scale
         board_flat = board_logits.flatten(1)  # (B, 6561)
 
-        # Gather candidate logits for each policy slot: (B, 2187, MAX_SOURCES)
-        # gather_idx is (2187, 8) with indices into the 6561-dim board_flat.
-        # Advanced indexing: board_flat[:, idx] → (B, 2187, 8). No reshape needed.
-        gathered = board_flat[:, self.gather_idx]  # (B, 2187, 8)
+        # Gather candidate logits for each policy slot.
+        # gather_idx: (2187, 8), gather_mask: (2187, 8)
+        # For each of 8 source slots, index_select from board_flat → (B, 2187)
+        # Then take masked max over the 8 sources.
+        # This avoids fancy indexing that produces static Reshape/Expand in ONNX.
+        channels = []
+        for c in range(self.gather_idx.shape[1]):
+            idx_c = self.gather_idx[:, c]  # (2187,) — indices into 6561
+            selected = torch.index_select(board_flat, 1, idx_c)  # (B, 2187)
+            channels.append(selected)
+        gathered = torch.stack(channels, dim=2)  # (B, 2187, 8)
 
-        # Apply mask: set padding positions to -inf so they don't affect max
         mask = self.gather_mask.unsqueeze(0)  # (1, 2187, 8)
         gathered = gathered * mask + (1.0 - mask) * (-1e10)
 
-        # Take max over sources: (B, 2187)
-        board_policy = gathered.max(dim=2).values
+        board_policy = gathered.max(dim=2).values  # (B, 2187)
 
         # Drop logits: drop_queries @ K^T
-        dq = self.drop_queries.unsqueeze(0).expand(K.shape[0], -1, -1)
+        # No expand needed — matmul broadcasts (1,7,d) @ (B,d,81) → (B,7,81)
+        dq = self.drop_queries.unsqueeze(0)  # (1, 7, d)
         drop_logits = torch.matmul(dq, K.transpose(-2, -1)) * scale  # (B, 7, 81)
 
-        # Write drops into the policy (slots 1620-2186)
-        drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81
-        # Replace the drop portion of board_policy with drop logits
-        policy = board_policy.clone()
-        policy[:, drop_start:drop_start + NUM_DROP_TYPES * 81] = drop_logits.flatten(1)
+        # Build policy by concatenation instead of clone+slice assignment.
+        # board_policy[:, :drop_start] are board moves, rest replaced by drops.
+        drop_start = (NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS) * 81  # 1620
+        board_part = board_policy[:, :drop_start]  # (B, 1620)
+        drop_part = drop_logits.flatten(1)          # (B, 567)
+        policy = torch.cat([board_part, drop_part], dim=1)  # (B, 2187)
 
         return policy
 
