@@ -103,7 +103,7 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
       // so any batch size 1-128 runs efficiently without padding.
       std::string min_shapes = "input_planes:1x" + std::to_string(kShogiInputPlanes) + "x9x9";
       std::string opt_shapes = "input_planes:32x" + std::to_string(kShogiInputPlanes) + "x9x9";
-      std::string max_shapes = "input_planes:128x" + std::to_string(kShogiInputPlanes) + "x9x9";
+      std::string max_shapes = "input_planes:256x" + std::to_string(kShogiInputPlanes) + "x9x9";
 
       std::vector<const char*> trt_keys = {
         "trt_max_workspace_size",
