@@ -323,8 +323,10 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
   std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
 
   while (true) {
-    // If node is not expanded or is terminal, we've reached a leaf.
-    if (!node->HasChildren() || node->IsTerminal()) {
+    // If node has no visits (not yet evaluated), no children, or is terminal
+    // — we've reached a leaf. N==0 check prevents descending through nodes
+    // that have edges but no policy priors yet (queued for NN eval).
+    if (node->GetN() == 0 || !node->HasChildren() || node->IsTerminal()) {
       // Try to claim this node for expansion.
       if (node->TryStartScoreUpdate()) {
         return NodeToProcess::Visit(node, depth, std::move(moves));
