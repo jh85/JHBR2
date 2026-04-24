@@ -335,6 +335,8 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
         return NodeToProcess::Visit(node, depth, std::move(moves));
       } else {
         // Collision — another thread is expanding this node.
+        // Increment n_in_flight so CancelSharedCollisions can decrement it.
+        node->IncrementNInFlight(1);
         return NodeToProcess::Collision(node, depth, 1);
       }
     }
