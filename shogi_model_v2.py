@@ -357,7 +357,6 @@ class DirectionPolicyHead(nn.Module):
 
     def forward(self, x):
         """x: (B, 81, d_model) → (B, 2187) policy logits"""
-        B = x.shape[0]
         d = self.cfg.policy_d_model
 
         pe = self.act(self.embed(x))
@@ -371,9 +370,12 @@ class DirectionPolicyHead(nn.Module):
 
         # Gather candidate logits for each policy slot: (B, 2187, MAX_SOURCES)
         # gather_idx is (2187, 8), expand to (B, 2187, 8)
-        idx = self.gather_idx.unsqueeze(0).expand(B, -1, -1)  # (B, 2187, 8)
-        idx_flat = idx.reshape(B, -1)  # (B, 2187*8)
-        gathered = torch.gather(board_flat, 1, idx_flat).reshape(B, POLICY_SIZE, -1)  # (B, 2187, 8)
+        # Use expand + flatten instead of reshape(B, ...) for dynamic batch.
+        idx = self.gather_idx.unsqueeze(0).expand_as(
+            board_flat[:, :1].unsqueeze(2).expand(-1, POLICY_SIZE, self.gather_idx.shape[1])
+        )  # (B, 2187, 8)
+        idx_flat = idx.flatten(1)  # (B, 2187*8) — no explicit B dimension
+        gathered = torch.gather(board_flat, 1, idx_flat).unflatten(1, (POLICY_SIZE, -1))  # (B, 2187, 8)
 
         # Apply mask: set padding positions to -inf so they don't affect max
         mask = self.gather_mask.unsqueeze(0)  # (1, 2187, 8)
@@ -383,7 +385,7 @@ class DirectionPolicyHead(nn.Module):
         board_policy = gathered.max(dim=2).values
 
         # Drop logits: drop_queries @ K^T
-        dq = self.drop_queries.unsqueeze(0).expand(B, -1, -1)
+        dq = self.drop_queries.unsqueeze(0).expand(x.shape[0], -1, -1)
         drop_logits = torch.matmul(dq, K.transpose(-2, -1)) * scale  # (B, 7, 81)
 
         # Write drops into the policy (slots 1620-2186)
