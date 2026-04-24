@@ -108,6 +108,14 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
       return result;
     }
 
+    // Single legal move — no need to search.
+    if (legal_moves.size() == 1) {
+      SearchResult result;
+      result.best_move = legal_moves[0];
+      result.nodes = 0;
+      return result;
+    }
+
     // Evaluate root position.
     auto root_comp = backend_.CreateComputation();
     root_comp->AddInput(board, legal_moves);
