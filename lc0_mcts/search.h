@@ -31,13 +31,9 @@
 #include <thread>
 #include <vector>
 
+#include "lc0_mcts/backend.h"
 #include "lc0_mcts/node.h"
 #include "lc0_mcts/types.h"
-#ifdef USE_TENSORRT
-#include "mcts/nn_tensorrt.h"
-#else
-#include "mcts/nn_eval.h"
-#endif
 
 namespace lc0_shogi {
 
@@ -142,7 +138,7 @@ class Search {
   // Convert Q to centipawns.
   static int QToCentipawns(float q);
 
-  NNEvaluator& evaluator_;
+  Backend backend_;
   SearchConfig config_;
 
   // Tree.
@@ -152,7 +148,6 @@ class Search {
   // Threading.
   std::atomic<bool> stop_{false};
   mutable std::shared_mutex nodes_mutex_;
-  std::mutex nn_mutex_;  // Serializes NN evaluation (TensorRT is not thread-safe)
 
   // Stats (guarded by nodes_mutex_).
   EdgeAndNode current_best_edge_;
@@ -243,10 +238,9 @@ class SearchWorker {
   const SearchConfig& config_;
   std::vector<NodeToProcess> minibatch_;
 
-  // NN batch data.
-  std::vector<std::pair<ShogiBoard, MoveList>> nn_batch_;
-  std::vector<NNOutput> nn_results_;
-  std::vector<int> nn_batch_indices_;  // Maps nn_batch index to minibatch index
+  // Per-worker computation (created fresh each iteration).
+  std::unique_ptr<Computation> computation_;
+  std::vector<int> nn_batch_indices_;  // Maps computation index to minibatch index
 };
 
 }  // namespace lc0_shogi

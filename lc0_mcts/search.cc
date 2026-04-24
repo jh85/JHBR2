@@ -84,7 +84,7 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 // =====================================================================
 
 Search::Search(NNEvaluator& evaluator, const SearchConfig& config)
-    : evaluator_(evaluator), config_(config) {}
+    : backend_(evaluator), config_(config) {}
 
 Search::~Search() = default;
 
@@ -109,7 +109,14 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
     }
 
     // Evaluate root position.
-    NNOutput root_eval = evaluator_.Evaluate(board, legal_moves);
+    auto root_comp = backend_.CreateComputation();
+    root_comp->AddInput(board, legal_moves);
+    root_comp->ComputeBlocking();
+
+    NNOutput root_eval;
+    root_eval.value = root_comp->GetQ(0);
+    root_eval.draw = root_comp->GetD(0);
+    root_eval.policy = root_comp->GetPolicy(0);
 
     // Create edges with policy priors.
     root_node_->CreateEdges(legal_moves);
@@ -246,9 +253,8 @@ void SearchWorker::RunBlocking() {
 
 void SearchWorker::ExecuteOneIteration() {
   minibatch_.clear();
-  nn_batch_.clear();
-  nn_results_.clear();
   nn_batch_indices_.clear();
+  computation_ = search_->backend_.CreateComputation();
 
   // 1. Gather minibatch.
   GatherMinibatch();
@@ -287,7 +293,7 @@ void SearchWorker::GatherMinibatch() {
     ExtendNode(ntp);
 
     if (!ntp.node->IsTerminal()) {
-      // Needs NN evaluation — add to batch.
+      // Needs NN evaluation — add to computation batch.
       ShogiBoard board = search_->root_board_;
       for (const auto& m : ntp.moves_to_node) {
         board.DoMove(m);
@@ -295,7 +301,7 @@ void SearchWorker::GatherMinibatch() {
       MoveList legal_moves = board.GenerateLegalMoves();
 
       nn_batch_indices_.push_back(static_cast<int>(minibatch_.size()));
-      nn_batch_.emplace_back(std::move(board), std::move(legal_moves));
+      computation_->AddInput(board, legal_moves);
     }
 
     minibatch_.push_back(std::move(ntp));
@@ -436,10 +442,8 @@ void SearchWorker::ExtendNode(NodeToProcess& ntp) {
 // =====================================================================
 
 void SearchWorker::RunNNComputation() {
-  if (nn_batch_.empty()) return;
-  // Serialize NN access — TensorRT execution context is not thread-safe.
-  std::lock_guard<std::mutex> lock(search_->nn_mutex_);
-  nn_results_ = search_->evaluator_.EvaluateBatch(nn_batch_);
+  if (computation_->UsedBatchSize() == 0) return;
+  computation_->ComputeBlocking();  // Internally serialized via Backend mutex.
 }
 
 // =====================================================================
@@ -451,14 +455,13 @@ void SearchWorker::FetchMinibatchResults() {
   for (int b = 0; b < static_cast<int>(nn_batch_indices_.size()); b++) {
     int mb_idx = nn_batch_indices_[b];
     auto& ntp = minibatch_[mb_idx];
-    auto& result = nn_results_[b];
-    auto& legal_moves = nn_batch_[b].second;
+    const auto& policy = computation_->GetPolicy(b);
 
     // Set policy priors on edges.
     int p_idx = 0;
     for (auto& edge : ntp.node->Edges()) {
-      if (p_idx < static_cast<int>(result.policy.size())) {
-        edge.edge()->SetP(result.policy[p_idx]);
+      if (p_idx < static_cast<int>(policy.size())) {
+        edge.edge()->SetP(policy[p_idx]);
       }
       p_idx++;
     }
@@ -473,9 +476,9 @@ void SearchWorker::FetchMinibatchResults() {
 
     // Store eval for backup. Negate Q (NN returns from side-to-move perspective,
     // but backup expects from "just moved" perspective like lc0).
-    ntp.eval_q = -result.value;
-    ntp.eval_d = result.draw;
-    ntp.eval_m = 0.0f;
+    ntp.eval_q = -computation_->GetQ(b);
+    ntp.eval_d = computation_->GetD(b);
+    ntp.eval_m = computation_->GetM(b);
     ntp.nn_queried = true;
   }
 
