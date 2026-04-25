@@ -180,7 +180,7 @@ class Search {
 
 class SearchWorker {
  public:
-  SearchWorker(Search* search, const SearchConfig& config);
+  SearchWorker(Search* search, const SearchConfig& config, int worker_id = 0);
 
   // Main loop: execute iterations until search stops.
   void RunBlocking();
@@ -255,6 +255,7 @@ class SearchWorker {
 
   Search* const search_;
   const SearchConfig& config_;
+  int worker_id_;
   std::vector<NodeToProcess> minibatch_;
 
   // Workspace for bulk visit distribution (reused across iterations).

@@ -85,7 +85,7 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 // =====================================================================
 
 Search::Search(NNEvaluator& evaluator, const SearchConfig& config)
-    : backend_(evaluator), config_(config) {}
+    : backend_(evaluator, config.num_threads), config_(config) {}
 
 Search::~Search() = default;
 
@@ -117,10 +117,10 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
       return result;
     }
 
-    // Evaluate root position.
+    // Evaluate root position (direct call, before GPU thread starts).
     auto root_comp = backend_.CreateComputation();
     root_comp->AddInput(board, legal_moves);
-    root_comp->ComputeBlocking();
+    backend_.EvalDirect(root_comp.get());
 
     NNOutput root_eval;
     root_eval.value = root_comp->GetQ(0);
@@ -153,17 +153,21 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
   shared_collisions_.clear();
   current_best_edge_ = GetBestChildNoTemperature(root_node_);
 
+  // Start GPU thread for shared batching (multi-worker only).
+  backend_.StartGPUThread();
+
   // Launch worker threads.
   std::vector<std::thread> threads;
   for (int t = 0; t < config_.num_threads; t++) {
-    threads.emplace_back([this]() {
-      SearchWorker worker(this, config_);
+    threads.emplace_back([this, t]() {
+      SearchWorker worker(this, config_, t);
       worker.RunBlocking();
     });
   }
 
-  // Wait for all threads.
+  // Wait for all workers, then stop GPU thread.
   for (auto& t : threads) t.join();
+  backend_.StopGPUThread();
 
   // Collect result.
   auto t1 = std::chrono::steady_clock::now();
@@ -251,8 +255,9 @@ int Search::QToCentipawns(float q) {
 // SearchWorker
 // =====================================================================
 
-SearchWorker::SearchWorker(Search* search, const SearchConfig& config)
-    : search_(search), config_(config) {}
+SearchWorker::SearchWorker(Search* search, const SearchConfig& config,
+                           int worker_id)
+    : search_(search), config_(config), worker_id_(worker_id) {}
 
 void SearchWorker::RunBlocking() {
   do {
@@ -263,7 +268,7 @@ void SearchWorker::RunBlocking() {
 void SearchWorker::ExecuteOneIteration() {
   minibatch_.clear();
   nn_batch_indices_.clear();
-  computation_ = search_->backend_.CreateComputation();
+  computation_ = search_->backend_.CreateComputation(worker_id_);
 
   // 1. Gather minibatch.
   GatherMinibatch();
