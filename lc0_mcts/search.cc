@@ -84,14 +84,9 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 // Search
 // =====================================================================
 
-Search::Search(NNEvaluator& evaluator, const SearchConfig& config,
-               NNEvaluator* evaluator2)
+Search::Search(std::vector<NNEvaluator*> evaluators, const SearchConfig& config)
     : config_(config) {
-  if (evaluator2) {
-    backend_ = std::make_unique<Backend>(evaluator, *evaluator2, config.num_threads);
-  } else {
-    backend_ = std::make_unique<Backend>(evaluator, config.num_threads);
-  }
+  backend_ = std::make_unique<Backend>(std::move(evaluators), config.num_threads);
 }
 
 Search::~Search() = default;

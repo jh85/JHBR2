@@ -52,8 +52,7 @@ class USIEngine {
 
   // --- Members ---
   lczero::ShogiBoard board_;
-  std::unique_ptr<NNEvaluator> evaluator_;
-  std::unique_ptr<NNEvaluator> evaluator2_;  // Second GPU
+  std::vector<std::unique_ptr<NNEvaluator>> evaluators_;
   std::unique_ptr<lc0_shogi::Search> lc0_search_;
   lc0_shogi::SearchConfig lc0_config_;
   int game_ply_ = 0;

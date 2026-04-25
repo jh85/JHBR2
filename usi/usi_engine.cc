@@ -109,16 +109,13 @@ void USIEngine::CmdUsi() {
 }
 
 void USIEngine::CmdIsReady() {
-  if (!evaluator_) {
-    Log("Loading model: " + onnx_path_);
-
+  if (evaluators_.empty()) {
     ShogiEncoderTables::Init();
 
-    evaluator_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, 0);
-
-    if (num_gpus_ >= 2) {
-      Log("Loading model on GPU 1...");
-      evaluator2_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, 1);
+    for (int g = 0; g < num_gpus_; g++) {
+      Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
+      evaluators_.push_back(
+          std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g));
     }
 
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
@@ -207,7 +204,7 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
 }
 
 void USIEngine::CmdGo(const std::vector<std::string>& parts) {
-  if (!evaluator_) {
+  if (evaluators_.empty()) {
     Send("bestmove resign");
     return;
   }
@@ -303,8 +300,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   });
 
   // --- Run lc0-style MCTS ---
-  lc0_search_ = std::make_unique<lc0_shogi::Search>(
-      *evaluator_, lc0_config_, evaluator2_.get());
+  std::vector<jhbr2::NNEvaluator*> eval_ptrs;
+  for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
+  lc0_search_ = std::make_unique<lc0_shogi::Search>(eval_ptrs, lc0_config_);
   auto result = lc0_search_->Run(board_, game_ply_);
 
   // --- Stop df-pn and wait ---

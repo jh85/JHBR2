@@ -120,8 +120,7 @@ struct SearchResult {
 
 class Search {
  public:
-  Search(NNEvaluator& evaluator, const SearchConfig& config,
-         NNEvaluator* evaluator2 = nullptr);
+  Search(std::vector<NNEvaluator*> evaluators, const SearchConfig& config);
   ~Search();
 
   // Run search from position. game_ply is for temperature scheduling.

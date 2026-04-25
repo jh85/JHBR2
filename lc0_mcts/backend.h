@@ -78,22 +78,9 @@ class Computation {
 
 class Backend {
  public:
-  // Single GPU constructor.
-  Backend(NNEvaluator& evaluator, int num_workers = 1)
-      : evaluator_(evaluator), evaluator2_(nullptr), num_gpus_(1),
-        num_workers_(num_workers) {
-    if (num_workers_ > 1) {
-      // Shared mode: allocate per-worker result storage and CVs.
-      worker_results_.resize(num_workers_);
-      worker_ready_.resize(num_workers_, false);
-      worker_cvs_ = std::make_unique<std::condition_variable[]>(num_workers_);
-    }
-  }
-
-  // Dual GPU constructor.
-  Backend(NNEvaluator& evaluator, NNEvaluator& evaluator2, int num_workers = 1)
-      : evaluator_(evaluator), evaluator2_(&evaluator2), num_gpus_(2),
-        num_workers_(num_workers) {
+  // N-GPU constructor. Pass pointers to all evaluators (one per GPU).
+  Backend(std::vector<NNEvaluator*> evaluators, int num_workers = 1)
+      : evaluators_(std::move(evaluators)), num_workers_(num_workers) {
     if (num_workers_ > 1) {
       worker_results_.resize(num_workers_);
       worker_ready_.resize(num_workers_, false);
@@ -132,7 +119,7 @@ class Backend {
   // Direct GPU eval (bypasses shared queue). Used for root eval.
   void EvalDirect(Computation* comp) {
     std::lock_guard<std::mutex> lock(gpu_mutex_);
-    comp->results_ = evaluator_.EvaluateBatch(comp->inputs_);
+    comp->results_ = evaluators_[0]->EvaluateBatch(comp->inputs_);
   }
 
  private:
@@ -203,30 +190,37 @@ class Backend {
         }
       }
 
-      // GPU evaluation — split across GPUs if available.
+      // GPU evaluation — split across N GPUs.
       std::vector<NNOutput> all_results;
-      if (num_gpus_ == 1 || !evaluator2_) {
-        all_results = evaluator_.EvaluateBatch(combined);
+      int num_gpus = static_cast<int>(evaluators_.size());
+      int total = static_cast<int>(combined.size());
+
+      if (num_gpus <= 1) {
+        all_results = evaluators_[0]->EvaluateBatch(combined);
       } else {
-        // Split batch across two GPUs.
-        int half = static_cast<int>(combined.size()) / 2;
-        std::vector<std::pair<ShogiBoard, MoveList>> batch1(
-            combined.begin(), combined.begin() + half);
-        std::vector<std::pair<ShogiBoard, MoveList>> batch2(
-            combined.begin() + half, combined.end());
+        // Split batch evenly across GPUs.
+        int per_gpu = (total + num_gpus - 1) / num_gpus;
+        std::vector<std::vector<NNOutput>> gpu_results(num_gpus);
+        std::vector<std::thread> gpu_threads;
 
-        // Launch both GPU evals concurrently.
-        std::vector<NNOutput> results2;
-        std::thread gpu2_thread([&]() {
-          results2 = evaluator2_->EvaluateBatch(batch2);
-        });
-        auto results1 = evaluator_.EvaluateBatch(batch1);
-        gpu2_thread.join();
+        for (int g = 0; g < num_gpus; g++) {
+          int start = g * per_gpu;
+          int end = std::min(start + per_gpu, total);
+          if (start >= total) break;
+          gpu_threads.emplace_back([&, g, start, end]() {
+            std::vector<std::pair<ShogiBoard, MoveList>> sub(
+                combined.begin() + start, combined.begin() + end);
+            gpu_results[g] = evaluators_[g]->EvaluateBatch(sub);
+          });
+        }
+        for (auto& t : gpu_threads) t.join();
 
-        all_results = std::move(results1);
-        all_results.insert(all_results.end(),
-                           std::make_move_iterator(results2.begin()),
-                           std::make_move_iterator(results2.end()));
+        // Concatenate results in order.
+        for (int g = 0; g < num_gpus; g++) {
+          all_results.insert(all_results.end(),
+                             std::make_move_iterator(gpu_results[g].begin()),
+                             std::make_move_iterator(gpu_results[g].end()));
+        }
       }
 
       // Distribute results back to workers.
@@ -255,9 +249,7 @@ class Backend {
     return n;
   }
 
-  NNEvaluator& evaluator_;
-  NNEvaluator* evaluator2_;  // Second GPU (nullptr = single GPU)
-  int num_gpus_;
+  std::vector<NNEvaluator*> evaluators_;  // One per GPU
   int num_workers_;
 
   // Solo mode.
