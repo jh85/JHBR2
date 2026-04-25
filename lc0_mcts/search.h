@@ -150,7 +150,7 @@ class Search {
   // Convert Q to centipawns.
   static int QToCentipawns(float q);
 
-  Backend backend_;
+  std::unique_ptr<Backend> backend_;
   SearchConfig config_;
 
   // Tree.

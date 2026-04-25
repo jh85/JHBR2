@@ -86,9 +86,13 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 
 Search::Search(NNEvaluator& evaluator, const SearchConfig& config,
                NNEvaluator* evaluator2)
-    : backend_(evaluator2 ? Backend(evaluator, *evaluator2, config.num_threads)
-                          : Backend(evaluator, config.num_threads)),
-      config_(config) {}
+    : config_(config) {
+  if (evaluator2) {
+    backend_ = std::make_unique<Backend>(evaluator, *evaluator2, config.num_threads);
+  } else {
+    backend_ = std::make_unique<Backend>(evaluator, config.num_threads);
+  }
+}
 
 Search::~Search() = default;
 
@@ -121,9 +125,9 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
     }
 
     // Evaluate root position (direct call, before GPU thread starts).
-    auto root_comp = backend_.CreateComputation();
+    auto root_comp = backend_->CreateComputation();
     root_comp->AddInput(board, legal_moves);
-    backend_.EvalDirect(root_comp.get());
+    backend_->EvalDirect(root_comp.get());
 
     NNOutput root_eval;
     root_eval.value = root_comp->GetQ(0);
@@ -157,7 +161,7 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
   current_best_edge_ = GetBestChildNoTemperature(root_node_);
 
   // Start GPU thread for shared batching (multi-worker only).
-  backend_.StartGPUThread();
+  backend_->StartGPUThread();
 
   // Launch worker threads.
   std::vector<std::thread> threads;
@@ -170,7 +174,7 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
 
   // Wait for all workers, then stop GPU thread.
   for (auto& t : threads) t.join();
-  backend_.StopGPUThread();
+  backend_->StopGPUThread();
 
   // Collect result.
   auto t1 = std::chrono::steady_clock::now();
@@ -271,7 +275,7 @@ void SearchWorker::RunBlocking() {
 void SearchWorker::ExecuteOneIteration() {
   minibatch_.clear();
   nn_batch_indices_.clear();
-  computation_ = search_->backend_.CreateComputation(worker_id_);
+  computation_ = search_->backend_->CreateComputation(worker_id_);
 
   // 1. Gather minibatch.
   GatherMinibatch();
