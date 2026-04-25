@@ -107,6 +107,8 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
       std::string max_shapes = "input_planes:512x" + std::to_string(kShogiInputPlanes) + "x9x9";
 
       std::string device_id_str = std::to_string(device_id);
+      std::string cache_path = "./trt_cache/gpu" + device_id_str;
+      std::system(("mkdir -p " + cache_path + " 2>/dev/null").c_str());
       std::vector<const char*> trt_keys = {
         "device_id",
         "trt_max_workspace_size",
@@ -123,7 +125,7 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
         "2147483648",           // 2GB workspace
         "1",                    // Enable FP16
         "1",                    // Cache the TRT engine
-        "./trt_cache",          // Cache directory
+        cache_path.c_str(),     // Per-GPU cache directory
         min_shapes.c_str(),     // Min batch = 1
         opt_shapes.c_str(),     // Optimal batch = 32
         max_shapes.c_str(),     // Max batch = 512
