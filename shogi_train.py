@@ -432,10 +432,15 @@ def train(args):
         model = torch.nn.DataParallel(model)
 
     # --- Dataset ---
-    use_sharded = os.path.exists(f"{args.data}_000.npz")
-    use_text = not use_sharded and os.path.exists(args.data)
+    use_psv = args.psv_dir is not None
+    use_sharded = not use_psv and os.path.exists(f"{args.data}_000.npz")
+    use_text = not use_psv and not use_sharded and os.path.exists(args.data)
 
-    if use_sharded:
+    if use_psv:
+        from psv_dataset import PSVShardedDataset
+        print(f"Using PSV dataset from {args.psv_dir}")
+        sharded_dataset = PSVShardedDataset(args.psv_dir)
+    elif use_sharded:
         print("Using pre-computed binary dataset (fast, memory-efficient)")
         sharded_dataset = ShardedDataset(args.data)
     elif use_text:
@@ -457,7 +462,7 @@ def train(args):
         n_batches = 0
         t0 = time.time()
 
-        if use_sharded:
+        if use_psv or use_sharded:
             # Iterate through shards in random order
             shard_order = sharded_dataset.shard_order(shuffle=True)
             for shard_id in shard_order:
@@ -654,5 +659,7 @@ if __name__ == "__main__":
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
+    parser.add_argument("--psv-dir", default=None,
+                        help="PSV data directory (YaneuraOu format, .bin files)")
     args = parser.parse_args()
     train(args)
