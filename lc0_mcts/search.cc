@@ -333,7 +333,7 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
   std::vector<Move> moves;
   bool is_root = true;
 
-  std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
+  std::shared_lock<std::shared_mutex> lock(search_->nodes_mutex_);
 
   while (true) {
     if (node->GetN() == 0 || !node->HasChildren() || node->IsTerminal()) {
@@ -440,7 +440,10 @@ void SearchWorker::GatherMinibatchBulk() {
 }
 
 void SearchWorker::PickNodesToExtend(int collision_limit) {
-  std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
+  // Shared lock: multiple threads can gather simultaneously.
+  // Node creation (GetOrSpawnNode) is safe via linked-list insertion.
+  // VL (n_in_flight) prevents threads from selecting the same leaf.
+  std::shared_lock<std::shared_mutex> lock(search_->nodes_mutex_);
   std::vector<Move> empty;
   PickNodesToExtendTask(search_->root_node_, 0, collision_limit,
                         empty, &minibatch_);
