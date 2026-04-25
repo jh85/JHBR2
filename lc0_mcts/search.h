@@ -93,6 +93,9 @@ struct SearchConfig {
   // Leaf df-pn: inline mate detection at leaf nodes.
   // Budget in nodes (0 = disabled). Typical: 10-100.
   int leaf_dfpn_nodes = 0;
+
+  // Multi-GPU: number of GPUs (1 or 2).
+  int num_gpus = 1;
 };
 
 // =====================================================================
@@ -117,7 +120,8 @@ struct SearchResult {
 
 class Search {
  public:
-  Search(NNEvaluator& evaluator, const SearchConfig& config);
+  Search(NNEvaluator& evaluator, const SearchConfig& config,
+         NNEvaluator* evaluator2 = nullptr);
   ~Search();
 
   // Run search from position. game_ply is for temperature scheduling.

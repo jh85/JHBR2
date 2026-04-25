@@ -78,10 +78,23 @@ class Computation {
 
 class Backend {
  public:
+  // Single GPU constructor.
   Backend(NNEvaluator& evaluator, int num_workers = 1)
-      : evaluator_(evaluator), num_workers_(num_workers) {
+      : evaluator_(evaluator), evaluator2_(nullptr), num_gpus_(1),
+        num_workers_(num_workers) {
     if (num_workers_ > 1) {
       // Shared mode: allocate per-worker result storage and CVs.
+      worker_results_.resize(num_workers_);
+      worker_ready_.resize(num_workers_, false);
+      worker_cvs_ = std::make_unique<std::condition_variable[]>(num_workers_);
+    }
+  }
+
+  // Dual GPU constructor.
+  Backend(NNEvaluator& evaluator, NNEvaluator& evaluator2, int num_workers = 1)
+      : evaluator_(evaluator), evaluator2_(&evaluator2), num_gpus_(2),
+        num_workers_(num_workers) {
+    if (num_workers_ > 1) {
       worker_results_.resize(num_workers_);
       worker_ready_.resize(num_workers_, false);
       worker_cvs_ = std::make_unique<std::condition_variable[]>(num_workers_);
@@ -190,8 +203,31 @@ class Backend {
         }
       }
 
-      // ONE GPU call for all workers' leaves.
-      auto all_results = evaluator_.EvaluateBatch(combined);
+      // GPU evaluation — split across GPUs if available.
+      std::vector<NNOutput> all_results;
+      if (num_gpus_ == 1 || !evaluator2_) {
+        all_results = evaluator_.EvaluateBatch(combined);
+      } else {
+        // Split batch across two GPUs.
+        int half = static_cast<int>(combined.size()) / 2;
+        std::vector<std::pair<ShogiBoard, MoveList>> batch1(
+            combined.begin(), combined.begin() + half);
+        std::vector<std::pair<ShogiBoard, MoveList>> batch2(
+            combined.begin() + half, combined.end());
+
+        // Launch both GPU evals concurrently.
+        std::vector<NNOutput> results2;
+        std::thread gpu2_thread([&]() {
+          results2 = evaluator2_->EvaluateBatch(batch2);
+        });
+        auto results1 = evaluator_.EvaluateBatch(batch1);
+        gpu2_thread.join();
+
+        all_results = std::move(results1);
+        all_results.insert(all_results.end(),
+                           std::make_move_iterator(results2.begin()),
+                           std::make_move_iterator(results2.end()));
+      }
 
       // Distribute results back to workers.
       std::vector<int> worker_count(num_workers_, 0);
@@ -220,6 +256,8 @@ class Backend {
   }
 
   NNEvaluator& evaluator_;
+  NNEvaluator* evaluator2_;  // Second GPU (nullptr = single GPU)
+  int num_gpus_;
   int num_workers_;
 
   // Solo mode.

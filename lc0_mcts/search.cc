@@ -84,8 +84,11 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 // Search
 // =====================================================================
 
-Search::Search(NNEvaluator& evaluator, const SearchConfig& config)
-    : backend_(evaluator, config.num_threads), config_(config) {}
+Search::Search(NNEvaluator& evaluator, const SearchConfig& config,
+               NNEvaluator* evaluator2)
+    : backend_(evaluator2 ? Backend(evaluator, *evaluator2, config.num_threads)
+                          : Backend(evaluator, config.num_threads)),
+      config_(config) {}
 
 Search::~Search() = default;
 

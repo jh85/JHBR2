@@ -44,7 +44,8 @@ struct NNOutput {
 
 class NNEvaluator {
  public:
-  explicit NNEvaluator(const std::string& engine_path, bool use_gpu = true);
+  explicit NNEvaluator(const std::string& engine_path, bool use_gpu = true,
+                       int device_id = 0);
   ~NNEvaluator();
 
   NNOutput Evaluate(const ShogiBoard& board, const MoveList& legal_moves);

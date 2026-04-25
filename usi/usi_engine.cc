@@ -101,6 +101,7 @@ void USIEngine::CmdUsi() {
   Send("option name MinibatchSize type spin default 32 min 1 max 256");
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
+  Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
 
@@ -113,9 +114,15 @@ void USIEngine::CmdIsReady() {
 
     ShogiEncoderTables::Init();
 
-    evaluator_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_);
+    evaluator_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, 0);
 
-    Log("Model loaded, max_nodes=" + std::to_string(max_nodes_));
+    if (num_gpus_ >= 2) {
+      Log("Loading model on GPU 1...");
+      evaluator2_ = std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, 1);
+    }
+
+    Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
+        ", max_nodes=" + std::to_string(max_nodes_));
   }
   Send("readyok");
 }
@@ -149,6 +156,9 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     lc0_config_.per_leaf_gathering = (value == "true");
   } else if (name_lower == "leafdfpnnodes") {
     lc0_config_.leaf_dfpn_nodes = std::stoi(value);
+  } else if (name_lower == "numgpus") {
+    num_gpus_ = std::stoi(value);
+    lc0_config_.num_gpus = num_gpus_;
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
@@ -293,7 +303,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   });
 
   // --- Run lc0-style MCTS ---
-  lc0_search_ = std::make_unique<lc0_shogi::Search>(*evaluator_, lc0_config_);
+  lc0_search_ = std::make_unique<lc0_shogi::Search>(
+      *evaluator_, lc0_config_, evaluator2_.get());
   auto result = lc0_search_->Run(board_, game_ply_);
 
   // --- Stop df-pn and wait ---

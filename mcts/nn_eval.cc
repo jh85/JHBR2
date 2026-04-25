@@ -76,7 +76,8 @@ struct NNEvaluator::Impl {
   bool use_tensorrt = false;
 };
 
-NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
+NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
+                         int device_id)
     : impl_(std::make_unique<Impl>()) {
 
   ShogiEncoderTables::Init();
@@ -105,7 +106,9 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
       std::string opt_shapes = "input_planes:32x" + std::to_string(kShogiInputPlanes) + "x9x9";
       std::string max_shapes = "input_planes:512x" + std::to_string(kShogiInputPlanes) + "x9x9";
 
+      std::string device_id_str = std::to_string(device_id);
       std::vector<const char*> trt_keys = {
+        "device_id",
         "trt_max_workspace_size",
         "trt_fp16_enable",
         "trt_engine_cache_enable",
@@ -116,14 +119,15 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
         "trt_builder_optimization_level",
       };
       std::vector<const char*> trt_values = {
+        device_id_str.c_str(),  // GPU device ID
         "2147483648",           // 2GB workspace
         "1",                    // Enable FP16
         "1",                    // Cache the TRT engine
         "./trt_cache",          // Cache directory
         min_shapes.c_str(),     // Min batch = 1
         opt_shapes.c_str(),     // Optimal batch = 32
-        max_shapes.c_str(),     // Max batch = 128
-        "3",                    // Builder optimization level (3 = good balance)
+        max_shapes.c_str(),     // Max batch = 512
+        "3",                    // Builder optimization level
       };
       Ort::GetApi().UpdateTensorRTProviderOptions(
           trt_provider_opts, trt_keys.data(), trt_values.data(), trt_keys.size());
@@ -133,6 +137,10 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu)
       // Also add CUDA as fallback for ops TensorRT doesn't support.
       OrtCUDAProviderOptionsV2* cuda_opts = nullptr;
       Ort::GetApi().CreateCUDAProviderOptions(&cuda_opts);
+      std::vector<const char*> cuda_keys = {"device_id"};
+      std::vector<const char*> cuda_vals = {device_id_str.c_str()};
+      Ort::GetApi().UpdateCUDAProviderOptions(cuda_opts, cuda_keys.data(),
+                                              cuda_vals.data(), 1);
       trt_opts.AppendExecutionProvider_CUDA_V2(*cuda_opts);
       Ort::GetApi().ReleaseCUDAProviderOptions(cuda_opts);
 

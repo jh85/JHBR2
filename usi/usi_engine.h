@@ -53,6 +53,7 @@ class USIEngine {
   // --- Members ---
   lczero::ShogiBoard board_;
   std::unique_ptr<NNEvaluator> evaluator_;
+  std::unique_ptr<NNEvaluator> evaluator2_;  // Second GPU
   std::unique_ptr<lc0_shogi::Search> lc0_search_;
   lc0_shogi::SearchConfig lc0_config_;
   int game_ply_ = 0;
@@ -60,6 +61,7 @@ class USIEngine {
   // Options
   std::string onnx_path_ = "shogi_bt4.onnx";
   int max_nodes_ = 800;
+  int num_gpus_ = 1;
   float noise_epsilon_ = 0.0f;
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;

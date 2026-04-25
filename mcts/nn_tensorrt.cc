@@ -114,9 +114,11 @@ struct NNEvaluator::Impl {
   }
 };
 
-NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/)
+NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
+                         int device_id)
     : impl_(std::make_unique<Impl>()) {
 
+  CUDA_CHECK(cudaSetDevice(device_id));
   ShogiEncoderTables::Init();
 
   // Load serialized engine from file.

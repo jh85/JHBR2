@@ -46,7 +46,8 @@ class NNEvaluator {
  public:
   // Load model from ONNX file.
   // use_gpu: try CUDA provider first, fall back to CPU.
-  explicit NNEvaluator(const std::string& onnx_path, bool use_gpu = true);
+  explicit NNEvaluator(const std::string& onnx_path, bool use_gpu = true,
+                       int device_id = 0);
   ~NNEvaluator();
 
   // Evaluate a single position.
