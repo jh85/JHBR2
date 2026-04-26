@@ -377,7 +377,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
   if (pv_str.empty()) pv_str = result.best_move.ToString();
 
-  Send("info depth 1 score cp " + std::to_string(result.score_cp) +
+  int pv_depth = static_cast<int>(result.pv.size());
+  Send("info depth " + std::to_string(std::max(pv_depth, 1)) +
+       " score cp " + std::to_string(result.score_cp) +
        " nodes " + std::to_string(result.nodes) +
        " time " + std::to_string(static_cast<int>(result.time_sec * 1000)) +
        " nps " + std::to_string(static_cast<int>(result.nps)) +
