@@ -104,7 +104,7 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
       // so any batch size 1-128 runs efficiently without padding.
       std::string min_shapes = "input_planes:1x" + std::to_string(kShogiInputPlanes) + "x9x9";
       std::string opt_shapes = "input_planes:32x" + std::to_string(kShogiInputPlanes) + "x9x9";
-      std::string max_shapes = "input_planes:512x" + std::to_string(kShogiInputPlanes) + "x9x9";
+      std::string max_shapes = "input_planes:1024x" + std::to_string(kShogiInputPlanes) + "x9x9";
 
       std::string device_id_str = std::to_string(device_id);
       std::string cache_path = "./trt_cache/gpu" + device_id_str;
