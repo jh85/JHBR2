@@ -381,7 +381,7 @@ class DirectionPolicyHead(nn.Module):
         gathered = torch.stack(channels, dim=2)  # (B, 2187, 8)
 
         mask = self.gather_mask.unsqueeze(0)  # (1, 2187, 8)
-        gathered = gathered * mask + (1.0 - mask) * (-1e10)
+        gathered = gathered * mask + (1.0 - mask) * (-1e4)
 
         board_policy = gathered.max(dim=2).values  # (B, 2187)
 
