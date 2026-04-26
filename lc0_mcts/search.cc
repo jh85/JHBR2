@@ -182,19 +182,13 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
   result.nodes = total_playouts_;
   result.time_sec = elapsed;
   result.nps = elapsed > 0.001f ? total_playouts_ / elapsed : 0.0f;
-  // Convert root Q to sente's perspective (shogi GUI standard).
-  // Root Q is from "just moved" (opponent) perspective.
-  // -root_Q = side-to-move perspective.
+  // Score from side-to-move's perspective (USI standard, same as dlshogi).
+  // Root Q is from "just moved" (opponent) perspective. Negate for side-to-move.
+  // GUIs handle flipping for sente-perspective display.
   float stm_q = -root_node_->GetWL();
-
-  // If sente is to move, stm_q is already from sente's perspective.
-  // If gote is to move, negate to get sente's perspective.
-  bool sente_to_move = (root_board_.side_to_move() == lczero::BLACK);
-  float sente_q = sente_to_move ? stm_q : -stm_q;
-
-  result.root_q = sente_q;
+  result.root_q = stm_q;
   result.root_d = root_node_->GetD();
-  result.score_cp = QToCentipawns(sente_q);
+  result.score_cp = QToCentipawns(stm_q);
   result.pv = GetPV(root_node_);
 
   return result;
@@ -223,9 +217,7 @@ bool Search::IsSearchActive() const {
       si.nodes = total_playouts_;
       si.time_ms = static_cast<int>(elapsed * 1000);
       si.nps = elapsed > 0.001f ? static_cast<int>(total_playouts_ / elapsed) : 0;
-      float stm_q2 = -root_node_->GetWL();
-      bool sente2 = (root_board_.side_to_move() == lczero::BLACK);
-      si.score_cp = QToCentipawns(sente2 ? stm_q2 : -stm_q2);
+      si.score_cp = QToCentipawns(-root_node_->GetWL());
       si.pv = GetPV(root_node_);
       si.depth = static_cast<int>(si.pv.size());
       config_.info_callback(si);
