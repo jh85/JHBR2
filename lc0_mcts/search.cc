@@ -265,9 +265,18 @@ std::vector<Move> Search::GetPV(Node* root) const {
 }
 
 int Search::QToCentipawns(float q) {
-  if (q >= 1.0f) return 10000;
-  if (q <= -1.0f) return -10000;
-  return static_cast<int>(290.680623072 * std::tan(1.5620688421 * q));
+  // Convert Q (W-L, range -1..+1) to centipawns using dlshogi's formula:
+  //   win_rate = (q + 1) / 2
+  //   cp = -log(1/win_rate - 1) × eval_coef
+  // eval_coef = 285 (dlshogi default, matches shogi GUI expectations)
+  constexpr float kEvalCoef = 285.0f;
+
+  // Convert Q to win rate
+  float win_rate = (q + 1.0f) / 2.0f;
+  win_rate = std::clamp(win_rate, 0.0001f, 0.9999f);
+
+  int cp = static_cast<int>(-std::log(1.0f / win_rate - 1.0f) * kEvalCoef);
+  return std::clamp(cp, -29900, 29900);
 }
 
 // =====================================================================
