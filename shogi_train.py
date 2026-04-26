@@ -201,30 +201,12 @@ class ShardedDataset(Dataset):
     """
 
     def __init__(self, prefix):
-        # Discover shards without loading them.
-        # Supports both 3-digit (prefix_000.npz) and 6-digit (prefix_000000.npz) naming.
-        self.shard_paths = []
+        # Discover shards by globbing (handles gaps from failed workers).
+        import glob
+        self.shard_paths = sorted(glob.glob(f"{prefix}_*.npz"))
 
-        # Try 6-digit first (from precompute_psv.py)
-        idx = 0
-        while True:
-            path = f"{prefix}_{idx:06d}.npz"
-            if not os.path.exists(path):
-                break
-            self.shard_paths.append(path)
-            idx += 1
-
-        # Fall back to 3-digit (legacy format)
-        if idx == 0:
-            while True:
-                path = f"{prefix}_{idx:03d}.npz"
-                if not os.path.exists(path):
-                    break
-                self.shard_paths.append(path)
-                idx += 1
-
-        if idx == 0:
-            raise FileNotFoundError(f"No shard files found: {prefix}_000.npz or {prefix}_000000.npz")
+        if not self.shard_paths:
+            raise FileNotFoundError(f"No shard files found: {prefix}_*.npz")
 
         self.num_shards = idx
         self.planes = None
