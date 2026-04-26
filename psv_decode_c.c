@@ -171,15 +171,17 @@ static int decode_move_to_policy(uint16_t move_raw, int turn) {
 
     int to_sq = move_raw & 0x7F;
     int from_raw = (move_raw >> 7) & 0x7F;
-    int promote = (move_raw >> 14) & 1;
+    int is_drop = (move_raw >> 14) & 1;   // bit 14 = MOVE_DROP
+    int promote = (move_raw >> 15) & 1;   // bit 15 = MOVE_PROMOTE
 
     if (to_sq >= 81) return -1;
 
     int flip = (turn == COLOR_WHITE);
 
-    if (from_raw >= MOVE_DROP_FLAG) {
-        // Drop move
-        int piece_type = from_raw - MOVE_DROP_FLAG;
+    if (is_drop) {
+        // Drop move: from_raw encodes piece type directly
+        // In YaneuraOu: from = SQ_NB + piece_type (but with drop flag, from is just piece)
+        int piece_type = from_raw;
         if (piece_type < 1 || piece_type > 7) return -1;
         int pt = piece_type - 1; // 0-6
         int to = to_sq;
