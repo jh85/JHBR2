@@ -31,6 +31,8 @@
 #include <thread>
 #include <vector>
 
+// Forward declaration — SearchInfo defined inside namespace below.
+
 #include "lc0_mcts/backend.h"
 #include "lc0_mcts/node.h"
 #include "lc0_mcts/types.h"
@@ -39,6 +41,17 @@ namespace lc0_shogi {
 
 using jhbr2::NNEvaluator;
 using jhbr2::NNOutput;
+
+// Callback for periodic search info output (USI "info" lines).
+struct SearchInfo {
+  int depth = 0;
+  int score_cp = 0;
+  int nodes = 0;
+  int nps = 0;
+  int time_ms = 0;
+  std::vector<Move> pv;
+};
+using InfoCallback = std::function<void(const SearchInfo&)>;
 
 // =====================================================================
 // Search parameters — simple struct, no OptionsDict
@@ -96,6 +109,10 @@ struct SearchConfig {
 
   // Multi-GPU: number of GPUs (1 or 2).
   int num_gpus = 1;
+
+  // Info callback: called periodically during search for GUI output.
+  InfoCallback info_callback = nullptr;
+  float info_interval = 1.0f;  // seconds between info outputs
 };
 
 // =====================================================================
@@ -171,6 +188,7 @@ class Search {
 
   // Timing.
   std::chrono::steady_clock::time_point start_time_;
+  mutable std::chrono::steady_clock::time_point last_info_time_;
 
   // Board at root (for move generation during ExtendNode).
   ShogiBoard root_board_;

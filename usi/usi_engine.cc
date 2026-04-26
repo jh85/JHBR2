@@ -300,6 +300,21 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   });
 
   // --- Run lc0-style MCTS ---
+  // Set info callback for periodic GUI output during search.
+  lc0_config_.info_callback = [this](const lc0_shogi::SearchInfo& info) {
+    std::string pv_str;
+    for (const auto& m : info.pv) {
+      if (!pv_str.empty()) pv_str += " ";
+      pv_str += m.ToString();
+    }
+    Send("info depth " + std::to_string(info.depth) +
+         " score cp " + std::to_string(info.score_cp) +
+         " nodes " + std::to_string(info.nodes) +
+         " nps " + std::to_string(info.nps) +
+         " time " + std::to_string(info.time_ms) +
+         (pv_str.empty() ? "" : " pv " + pv_str));
+  };
+
   std::vector<jhbr2::NNEvaluator*> eval_ptrs;
   for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
   lc0_search_ = std::make_unique<lc0_shogi::Search>(eval_ptrs, lc0_config_);

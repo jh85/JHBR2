@@ -94,6 +94,7 @@ Search::~Search() = default;
 SearchResult Search::Run(ShogiBoard board, int game_ply) {
   stop_.store(false, std::memory_order_release);
   start_time_ = std::chrono::steady_clock::now();
+  last_info_time_ = start_time_;
 
   root_board_ = board;
   root_is_black_to_move_ = (board.side_to_move() == lczero::WHITE);
@@ -197,10 +198,26 @@ bool Search::IsSearchActive() const {
     if (total_playouts_ >= config_.max_nodes) return false;
   }
 
-  if (config_.max_time > 0.0f) {
-    float elapsed = std::chrono::duration<float>(
-        std::chrono::steady_clock::now() - start_time_).count();
-    if (elapsed >= config_.max_time) return false;
+  auto now = std::chrono::steady_clock::now();
+  float elapsed = std::chrono::duration<float>(now - start_time_).count();
+
+  if (config_.max_time > 0.0f && elapsed >= config_.max_time) return false;
+
+  // Periodic info output for GUI.
+  if (config_.info_callback) {
+    float since_last = std::chrono::duration<float>(now - last_info_time_).count();
+    if (since_last >= config_.info_interval) {
+      last_info_time_ = now;
+      std::shared_lock<std::shared_mutex> lock(nodes_mutex_);
+      SearchInfo si;
+      si.nodes = total_playouts_;
+      si.time_ms = static_cast<int>(elapsed * 1000);
+      si.nps = elapsed > 0.001f ? static_cast<int>(total_playouts_ / elapsed) : 0;
+      si.score_cp = QToCentipawns(root_node_->GetWL());
+      si.pv = GetPV(root_node_);
+      si.depth = static_cast<int>(si.pv.size());
+      config_.info_callback(si);
+    }
   }
 
   return true;
