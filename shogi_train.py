@@ -468,7 +468,7 @@ def train(args):
             for shard_id in shard_order:
                 sharded_dataset.load_shard(shard_id)
                 loader = DataLoader(sharded_dataset, batch_size=args.batch,
-                                    shuffle=True, num_workers=4,
+                                    shuffle=True, num_workers=args.workers,
                                     pin_memory=True, drop_last=True)
 
                 for planes, policy_target, wdl_target in loader:
@@ -661,5 +661,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
     parser.add_argument("--psv-dir", default=None,
                         help="PSV data directory (YaneuraOu format, .bin files)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="DataLoader workers (increase for PSV: 32-64)")
     args = parser.parse_args()
     train(args)
