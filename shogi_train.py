@@ -208,7 +208,7 @@ class ShardedDataset(Dataset):
         if not self.shard_paths:
             raise FileNotFoundError(f"No shard files found: {prefix}_*.npz")
 
-        self.num_shards = idx
+        self.num_shards = len(self.shard_paths)
         self.planes = None
         self.policy = None
         self.wdl = None
