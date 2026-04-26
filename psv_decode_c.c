@@ -318,15 +318,43 @@ int decode_psv_record(
         planes[(offset + plane_idx) * 81 + sq_r * 9 + sq_f] = 1.0f;
     }
 
-    // 5. Hand pieces
+    // 5. Hand pieces (different Huffman: code>>1, bits-1)
     int hand_counts[2][7]; // [color][P,L,N,S,B,R,G]
     memset(hand_counts, 0, sizeof(hand_counts));
 
     while (bs.cursor < 256) {
-        int piece = decode_piece(&bs);
+        // Decode hand piece using shifted Huffman codes
+        int code = 0, bits = 0;
+        int piece = NO_PIECE;
+        while (bits < 6 && bs.cursor < 256) {
+            code |= read_one_bit(&bs) << bits;
+            bits++;
+            for (int i = 1; i < HUFFMAN_TABLE_SIZE; i++) { // skip NO_PIECE
+                if ((huffman_table[i].code >> 1) == code &&
+                    (huffman_table[i].bits - 1) == bits) {
+                    piece = huffman_table[i].piece;
+                    goto hand_found;
+                }
+            }
+        }
+        break; // No match found — end of hand data
+    hand_found:
         if (piece == NO_PIECE) break;
         if (bs.cursor >= 256) break;
+
+        // Read promote flag (not for GOLD)
+        int promoted = 0;
+        if (piece != GOLD) {
+            promoted = read_one_bit(&bs);
+        }
+
+        // Read color
+        if (bs.cursor >= 256) break;
         int color = read_one_bit(&bs);
+
+        // Promoted pieces from hand = piecebox (skip)
+        if (promoted) continue;
+
         if (piece >= 1 && piece <= 7) {
             hand_counts[color][piece - 1]++;
         }
