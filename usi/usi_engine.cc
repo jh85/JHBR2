@@ -98,7 +98,7 @@ void USIEngine::CmdUsi() {
   Send("option name NoiseEpsilon type string default 0.0");
   Send("option name UseGPU type check default true");
   Send("option name Threads type spin default 1 min 1 max 128");
-  Send("option name MinibatchSize type spin default 32 min 1 max 256");
+  Send("option name MinibatchSize type spin default 32 min 1 max 4096");
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
