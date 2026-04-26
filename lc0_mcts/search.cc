@@ -182,9 +182,10 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
   result.nodes = total_playouts_;
   result.time_sec = elapsed;
   result.nps = elapsed > 0.001f ? total_playouts_ / elapsed : 0.0f;
-  result.root_q = root_node_->GetWL();
+  // Root Q is from "just moved" (opponent) perspective. Negate for side-to-move.
+  result.root_q = -root_node_->GetWL();
   result.root_d = root_node_->GetD();
-  result.score_cp = QToCentipawns(root_node_->GetWL());
+  result.score_cp = QToCentipawns(-root_node_->GetWL());
   result.pv = GetPV(root_node_);
 
   return result;
@@ -213,7 +214,7 @@ bool Search::IsSearchActive() const {
       si.nodes = total_playouts_;
       si.time_ms = static_cast<int>(elapsed * 1000);
       si.nps = elapsed > 0.001f ? static_cast<int>(total_playouts_ / elapsed) : 0;
-      si.score_cp = QToCentipawns(root_node_->GetWL());
+      si.score_cp = QToCentipawns(-root_node_->GetWL());
       si.pv = GetPV(root_node_);
       si.depth = static_cast<int>(si.pv.size());
       config_.info_callback(si);
