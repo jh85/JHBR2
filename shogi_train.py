@@ -427,7 +427,8 @@ def train(args):
 
     # --- Dataset ---
     use_psv = args.psv_dir is not None
-    use_sharded = not use_psv and os.path.exists(f"{args.data}_000.npz")
+    import glob
+    use_sharded = not use_psv and len(glob.glob(f"{args.data}_*.npz")) > 0
     use_text = not use_psv and not use_sharded and os.path.exists(args.data)
 
     if use_psv:
