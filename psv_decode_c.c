@@ -180,28 +180,32 @@ static int decode_move_to_policy(uint16_t move_raw, int turn) {
 
     if (is_drop) {
         // Drop move: from_raw encodes piece type directly
-        // In YaneuraOu: from = SQ_NB + piece_type (but with drop flag, from is just piece)
         int piece_type = from_raw;
         if (piece_type < 1 || piece_type > 7) return -1;
         int pt = piece_type - 1; // 0-6
-        int to = to_sq;
+        // Convert YaneuraOu square to Python convention (flip file)
+        int ya_f = to_sq / 9, ya_r = to_sq % 9;
+        int py_f = 8 - ya_f, py_r = ya_r;
         if (flip) {
-            int to_f = to / 9, to_r = to % 9;
-            to = (8 - to_f) * 9 + (8 - to_r);
+            py_f = 8 - py_f;
+            py_r = 8 - py_r;
         }
+        int to = py_f * 9 + py_r;
         int direction = NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS + pt; // 20-26
         return direction * 81 + to;
     } else {
-        // Board move
+        // Board move — convert YaneuraOu squares to Python convention
         if (from_raw >= 81) return -1;
-        int from = from_raw;
-        int to = to_sq;
+        int from_ya_f = from_raw / 9, from_ya_r = from_raw % 9;
+        int to_ya_f = to_sq / 9, to_ya_r = to_sq % 9;
+        int from_py_f = 8 - from_ya_f, from_py_r = from_ya_r;
+        int to_py_f = 8 - to_ya_f, to_py_r = to_ya_r;
         if (flip) {
-            int ff = from / 9, fr = from % 9;
-            from = (8 - ff) * 9 + (8 - fr);
-            int tf = to / 9, tr = to % 9;
-            to = (8 - tf) * 9 + (8 - tr);
+            from_py_f = 8 - from_py_f; from_py_r = 8 - from_py_r;
+            to_py_f = 8 - to_py_f; to_py_r = 8 - to_py_r;
         }
+        int from = from_py_f * 9 + from_py_r;
+        int to = to_py_f * 9 + to_py_r;
         int dir = g_direction_table[from * 81 + to];
         if (dir < 0) return -1;
         if (promote) dir += NUM_DIRECTIONS; // 0-9 → 10-19
@@ -302,8 +306,13 @@ int decode_psv_record(
         int plane_idx = piece_to_plane[piece_type];
         if (plane_idx < 0) continue;
 
-        int file = sq / 9;
-        int rank = sq % 9;
+        // YaneuraOu: file 0 = USI file 1 (rightmost).
+        // Python sfen_to_planes: file 0 = USI file 9 (leftmost).
+        // Convert: py_file = 8 - yaneuraou_file
+        int ya_file = sq / 9;
+        int ya_rank = sq % 9;
+        int file = 8 - ya_file;  // flip to match Python convention
+        int rank = ya_rank;
 
         int is_ours, sq_f, sq_r;
         if (flip) {
