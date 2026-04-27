@@ -328,17 +328,26 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   int remaining_ms = hard_deadline_ms - (int)total_elapsed_ms;
   int wait_ms = std::min(dfpn_min_wait_ms, std::max(remaining_ms - 500, 0));
 
-  if (!dfpn_done && wait_ms > 0) {
+  // Wait for df-pn with hard deadline — never exceed MaxMoveTime.
+  root_dfpn.stop();
+  {
     auto wait_start = std::chrono::steady_clock::now();
+    int max_wait_ms = std::max(hard_deadline_ms - (int)std::chrono::duration_cast<
+        std::chrono::milliseconds>(wait_start - move_start_time).count(), 100);
     while (!dfpn_done) {
       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - wait_start).count();
-      if (elapsed_ms >= wait_ms) break;
+      if (elapsed_ms >= max_wait_ms) {
+        // df-pn still running past deadline — detach and abandon.
+        // The thread will eventually stop when stop() takes effect.
+        dfpn_thread.detach();
+        dfpn_done = true;  // Pretend it's done — don't use its result.
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    root_dfpn.stop();
+    if (dfpn_thread.joinable()) dfpn_thread.join();
   }
-  dfpn_thread.join();
 
   // --- Choose result ---
   bool use_mate = dfpn_done &&
