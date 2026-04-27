@@ -471,8 +471,21 @@ void SearchWorker::ExtendNodeInPlace(NodeToProcess& ntp) {
 // =====================================================================
 
 void SearchWorker::GatherMinibatchBulk() {
-  int collision_limit = config_.minibatch_size;
-  PickNodesToExtend(collision_limit);
+  // Adaptive minibatch: start small, grow as tree deepens.
+  // Early search: small MB → focus on top policy moves.
+  // Late search: large MB → deep tree has many frontier nodes.
+  int mb = config_.minibatch_size;
+  if (mb > 128) {
+    float elapsed = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - search_->start_time_).count();
+    // Start at 128, double every second, cap at configured MB.
+    int adaptive = 128;
+    int seconds = static_cast<int>(elapsed);
+    for (int i = 0; i < seconds && adaptive < mb; i++)
+      adaptive *= 2;
+    mb = std::min(adaptive, mb);
+  }
+  PickNodesToExtend(mb);
   ProcessPickedNodes();
 }
 
