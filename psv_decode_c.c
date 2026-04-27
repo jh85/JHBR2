@@ -115,44 +115,56 @@ static int g_direction_inited = 0;
 // 8: Knight-Left (file+1, rank-2)
 // 9: Knight-Right (file-1, rank-2)
 
+// Direction vectors matching Python's DIRECTION_VECTORS exactly:
+// 0: UP(0,-1), 1: UP_LEFT(-1,-1), 2: UP_RIGHT(1,-1), 3: LEFT(-1,0),
+// 4: RIGHT(1,0), 5: DOWN(0,1), 6: DOWN_LEFT(-1,1), 7: DOWN_RIGHT(1,1),
+// 8: KNIGHT_LEFT(-1,-2), 9: KNIGHT_RIGHT(1,-2)
+static const int dir_vf[] = { 0, -1,  1, -1, 1, 0, -1, 1, -1,  1};
+static const int dir_vr[] = {-1, -1, -1,  0, 0, 1,  1, 1, -2, -2};
+static const int dir_sliding[] = {1, 1, 1, 1, 1, 1, 1, 1, 0, 0}; // 0-7 sliding, 8-9 step
+
 static void init_direction_table(void) {
     if (g_direction_inited) return;
-
     memset(g_direction_table, -1, sizeof(g_direction_table));
 
     for (int from_sq = 0; from_sq < 81; from_sq++) {
-        int from_f = from_sq / 9;
-        int from_r = from_sq % 9;
-
+        int from_f = from_sq / 9, from_r = from_sq % 9;
         for (int to_sq = 0; to_sq < 81; to_sq++) {
-            int to_f = to_sq / 9;
-            int to_r = to_sq % 9;
-
-            int df = to_f - from_f;
-            int dr = to_r - from_r;
-
+            int to_f = to_sq / 9, to_r = to_sq % 9;
+            int df = to_f - from_f, dr = to_r - from_r;
             if (df == 0 && dr == 0) continue;
 
-            int dir = -1;
-
-            // Knight moves
-            if (df == 1 && dr == -2) { dir = 8; }
-            else if (df == -1 && dr == -2) { dir = 9; }
-            // Straight and diagonal
-            else if (df == 0 && dr < 0) { // Up
-                // Check all squares between are empty (sliding)
-                dir = 0;
+            for (int d = 0; d < 10; d++) {
+                int vf = dir_vf[d], vr = dir_vr[d];
+                if (dir_sliding[d]) {
+                    // Sliding: (df, dr) must be a positive multiple of (vf, vr)
+                    if (vf == 0 && vr == 0) continue;
+                    if (vf == 0) {
+                        if (df == 0 && dr != 0 && ((dr > 0) == (vr > 0)) && (dr % vr == 0)) {
+                            g_direction_table[from_sq * 81 + to_sq] = d;
+                            break;
+                        }
+                    } else if (vr == 0) {
+                        if (dr == 0 && df != 0 && ((df > 0) == (vf > 0)) && (df % vf == 0)) {
+                            g_direction_table[from_sq * 81 + to_sq] = d;
+                            break;
+                        }
+                    } else {
+                        // Diagonal: df/vf == dr/vr, both positive multiples
+                        if (df != 0 && dr != 0 && (df % vf == 0) && (dr % vr == 0) &&
+                            (df / vf) == (dr / vr) && (df / vf) > 0) {
+                            g_direction_table[from_sq * 81 + to_sq] = d;
+                            break;
+                        }
+                    }
+                } else {
+                    // Step (knight): exact match
+                    if (df == vf && dr == vr) {
+                        g_direction_table[from_sq * 81 + to_sq] = d;
+                        break;
+                    }
+                }
             }
-            else if (df == 0 && dr > 0) { dir = 1; } // Down
-            else if (df > 0 && dr == 0) { dir = 2; } // Left
-            else if (df < 0 && dr == 0) { dir = 3; } // Right
-            else if (df > 0 && dr < 0 && df == -dr) { dir = 4; } // Up-Left
-            else if (df < 0 && dr < 0 && df == dr) { dir = 5; } // Up-Right
-            else if (df > 0 && dr > 0 && df == dr) { dir = 6; } // Down-Left
-            else if (df < 0 && dr > 0 && -df == dr) { dir = 7; } // Down-Right
-
-            if (dir >= 0)
-                g_direction_table[from_sq * 81 + to_sq] = dir;
         }
     }
     g_direction_inited = 1;
@@ -183,29 +195,26 @@ static int decode_move_to_policy(uint16_t move_raw, int turn) {
         int piece_type = from_raw;
         if (piece_type < 1 || piece_type > 7) return -1;
         int pt = piece_type - 1; // 0-6
-        // Convert YaneuraOu square to Python convention (flip file)
-        int ya_f = to_sq / 9, ya_r = to_sq % 9;
-        int py_f = 8 - ya_f, py_r = ya_r;
+        // Use YaneuraOu convention for policy (matches make_direction_policy_index)
+        int to_f = to_sq / 9, to_r = to_sq % 9;
         if (flip) {
-            py_f = 8 - py_f;
-            py_r = 8 - py_r;
+            to_f = 8 - to_f;
+            to_r = 8 - to_r;
         }
-        int to = py_f * 9 + py_r;
+        int to = to_f * 9 + to_r;
         int direction = NUM_DIRECTIONS + NUM_PROMO_DIRECTIONS + pt; // 20-26
         return direction * 81 + to;
     } else {
-        // Board move — convert YaneuraOu squares to Python convention
+        // Board move — use YaneuraOu convention (matches make_direction_policy_index)
         if (from_raw >= 81) return -1;
-        int from_ya_f = from_raw / 9, from_ya_r = from_raw % 9;
-        int to_ya_f = to_sq / 9, to_ya_r = to_sq % 9;
-        int from_py_f = 8 - from_ya_f, from_py_r = from_ya_r;
-        int to_py_f = 8 - to_ya_f, to_py_r = to_ya_r;
+        int from_f = from_raw / 9, from_r = from_raw % 9;
+        int to_f = to_sq / 9, to_r = to_sq % 9;
         if (flip) {
-            from_py_f = 8 - from_py_f; from_py_r = 8 - from_py_r;
-            to_py_f = 8 - to_py_f; to_py_r = 8 - to_py_r;
+            from_f = 8 - from_f; from_r = 8 - from_r;
+            to_f = 8 - to_f; to_r = 8 - to_r;
         }
-        int from = from_py_f * 9 + from_py_r;
-        int to = to_py_f * 9 + to_py_r;
+        int from = from_f * 9 + from_r;
+        int to = to_f * 9 + to_r;
         int dir = g_direction_table[from * 81 + to];
         if (dir < 0) return -1;
         if (promote) dir += NUM_DIRECTIONS; // 0-9 → 10-19
