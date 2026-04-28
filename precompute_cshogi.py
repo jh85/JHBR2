@@ -52,7 +52,7 @@ def decode_one_record(board, sfen_data, move_raw, score, game_result,
         return None
 
     if is_hcpe:
-        move_usi = cshogi.move16_to_usi(move_raw)
+        move_usi = cshogi.move_to_usi(move_raw)
     else:
         move_usi = cshogi.move_to_usi(move_raw)
 
