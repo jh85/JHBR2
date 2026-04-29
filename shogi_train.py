@@ -414,8 +414,20 @@ def train(args):
     remaining_epochs = args.epochs - start_epoch
     if remaining_epochs <= 0:
         remaining_epochs = args.epochs  # safety fallback
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    # Cosine annealing with optional linear warmup.
+    warmup_steps = args.warmup_steps
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=remaining_epochs, last_epoch=-1)
+
+    if warmup_steps > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[warmup_steps])
+        print(f"LR warmup: {warmup_steps} steps, then cosine annealing")
+    else:
+        scheduler = cosine_scheduler
 
     # Mixed precision training (FP16 forward, FP32 gradients).
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
@@ -490,6 +502,10 @@ def train(args):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
+
+                    # Step LR scheduler per batch during warmup
+                    if warmup_steps > 0 and n_batches < warmup_steps:
+                        scheduler.step()
 
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
@@ -654,6 +670,8 @@ if __name__ == "__main__":
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
+    parser.add_argument("--warmup-steps", type=int, default=0,
+                        help="LR warmup steps (0=disabled, 1000=recommended for large models)")
     parser.add_argument("--psv-dir", default=None,
                         help="PSV data directory (YaneuraOu format, .bin files)")
     parser.add_argument("--workers", type=int, default=4,
