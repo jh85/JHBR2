@@ -499,7 +499,7 @@ def train(args):
                     optimizer.zero_grad()
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
 
@@ -546,7 +546,7 @@ def train(args):
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
 
@@ -670,6 +670,8 @@ if __name__ == "__main__":
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
+    parser.add_argument("--grad-clip", type=float, default=1.0,
+                        help="Gradient norm clip (1.0=default, 10.0 for from-scratch large models)")
     parser.add_argument("--warmup-steps", type=int, default=0,
                         help="LR warmup steps (0=disabled, 1000=recommended for large models)")
     parser.add_argument("--psv-dir", default=None,
