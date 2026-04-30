@@ -105,6 +105,7 @@ void USIEngine::CmdUsi() {
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name BookFile type string default ");
+  Send("option name BookOnTheFly type check default false");
 
   Send("usiok");
 }
@@ -124,8 +125,12 @@ void USIEngine::CmdIsReady() {
 
     // Load opening book if specified.
     if (!book_path_.empty()) {
-      int book_count = book_.Load(book_path_);
-      Log("Book loaded: " + std::to_string(book_count) + " positions from " + book_path_);
+      int book_count = book_.Load(book_path_, book_on_the_fly_);
+      if (book_on_the_fly_) {
+        Log("Book on-the-fly: " + book_path_);
+      } else {
+        Log("Book loaded: " + std::to_string(book_count) + " positions from " + book_path_);
+      }
     }
   }
   Send("readyok");
@@ -169,6 +174,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     max_move_time_ms_ = std::stoi(value);
   } else if (name_lower == "bookfile") {
     book_path_ = value;
+  } else if (name_lower == "bookonthefly") {
+    book_on_the_fly_ = (value == "true");
   }
 
   Log("Set " + name + " = " + value);
@@ -271,7 +278,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   // Probe opening book.
-  if (book_.size() > 0) {
+  if (book_.is_loaded()) {
     auto* entry = book_.Probe(board_.ToSfen());
     if (entry) {
       Log("Book hit: " + entry->move_usi + " (eval=" +

@@ -7,20 +7,20 @@
     ...
 
   First move per position is the best (sorted by eval descending).
-  Lookup by SFEN string (exact match).
+  Lookup by SFEN string (exact match, ply number ignored).
+
+  Two modes:
+    - Full load: entire book loaded into memory (fast probe, slow startup)
+    - On-the-fly: binary search on sorted file (zero startup, zero memory)
 */
 
 #pragma once
 
+#include <fstream>
 #include <string>
 #include <unordered_map>
-#include <vector>
-
-#include "shogi/types.h"
 
 namespace lc0_shogi {
-
-using lczero::Move;
 
 struct BookEntry {
   std::string move_usi;    // best move USI string
@@ -31,20 +31,32 @@ struct BookEntry {
 
 class OpeningBook {
  public:
-  // Load book from file. Returns number of positions loaded.
-  int Load(const std::string& path);
+  ~OpeningBook();
+
+  // Load book from file.
+  // on_the_fly=false: loads entire file into memory, returns position count.
+  // on_the_fly=true: opens file for binary search, returns 0 (no preload).
+  int Load(const std::string& path, bool on_the_fly = false);
 
   // Probe: lookup position by SFEN. Returns nullptr if not found.
-  const BookEntry* Probe(const std::string& sfen) const;
+  const BookEntry* Probe(const std::string& sfen);
 
-  int size() const { return static_cast<int>(entries_.size()); }
+  bool is_loaded() const { return !entries_.empty() || on_the_fly_; }
 
  private:
-  // Key: SFEN without move number (e.g., "lnsgkgsnl/... b -")
-  // Strips the trailing ply number for matching.
   static std::string NormalizeSfen(const std::string& sfen);
 
+  // On-the-fly binary search helpers
+  std::string NextSfen(int64_t seek_from, int64_t& last_pos);
+  const BookEntry* ProbeOnTheFly(const std::string& sfen);
+
   std::unordered_map<std::string, BookEntry> entries_;
+
+  // On-the-fly state
+  bool on_the_fly_ = false;
+  std::fstream fs_;
+  int64_t file_size_ = 0;
+  BookEntry otf_result_;  // reusable buffer for on-the-fly results
 };
 
 }  // namespace lc0_shogi
