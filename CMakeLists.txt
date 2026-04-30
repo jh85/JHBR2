@@ -72,6 +72,7 @@ option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
 set(LC0_MCTS_SRCS
   lc0_mcts/node.cc
   lc0_mcts/search.cc
+  lc0_mcts/book.cc
 )
 
 if(USE_TENSORRT)

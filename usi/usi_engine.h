@@ -18,6 +18,7 @@
 #else
 #include "mcts/nn_eval.h"
 #endif
+#include "lc0_mcts/book.h"
 #include "lc0_mcts/search.h"
 #include "shogi/board.h"
 
@@ -65,6 +66,8 @@ class USIEngine {
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;
   int max_move_time_ms_ = 0;
+  std::string book_path_;
+  lc0_shogi::OpeningBook book_;
 };
 
 }  // namespace jhbr2

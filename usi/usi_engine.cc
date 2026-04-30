@@ -104,6 +104,7 @@ void USIEngine::CmdUsi() {
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
+  Send("option name BookFile type string default ");
 
   Send("usiok");
 }
@@ -120,6 +121,12 @@ void USIEngine::CmdIsReady() {
 
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
         ", max_nodes=" + std::to_string(max_nodes_));
+
+    // Load opening book if specified.
+    if (!book_path_.empty()) {
+      int book_count = book_.Load(book_path_);
+      Log("Book loaded: " + std::to_string(book_count) + " positions from " + book_path_);
+    }
   }
   Send("readyok");
 }
@@ -160,6 +167,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
     max_move_time_ms_ = std::stoi(value);
+  } else if (name_lower == "bookfile") {
+    book_path_ = value;
   }
 
   Log("Set " + name + " = " + value);
@@ -259,6 +268,22 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   if (board_.CanDeclareWin()) {
     Send("bestmove win");
     return;
+  }
+
+  // Probe opening book.
+  if (book_.size() > 0) {
+    auto* entry = book_.Probe(board_.ToSfen());
+    if (entry) {
+      Log("Book hit: " + entry->move_usi + " (eval=" +
+          std::to_string(entry->eval) + ", depth=" +
+          std::to_string(entry->depth) + ")");
+      std::string response = "bestmove " + entry->move_usi;
+      if (entry->ponder_usi != "none" && !entry->ponder_usi.empty()) {
+        response += " ponder " + entry->ponder_usi;
+      }
+      Send(response);
+      return;
+    }
   }
 
   // Configure lc0 MCTS search.
