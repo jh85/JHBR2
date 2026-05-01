@@ -66,6 +66,7 @@ class USIEngine {
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;
   int max_move_time_ms_ = 0;
+  int max_move_time_1m_ms_ = 0;
   std::string book_path_;
   bool book_on_the_fly_ = false;
   lc0_shogi::OpeningBook book_;

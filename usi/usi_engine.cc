@@ -104,6 +104,7 @@ void USIEngine::CmdUsi() {
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
+  Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
   Send("option name BookFile type string default ");
   Send("option name BookOnTheFly type check default false");
 
@@ -172,6 +173,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
     max_move_time_ms_ = std::stoi(value);
+  } else if (name_lower == "maxmovetime1m") {
+    max_move_time_1m_ms_ = std::stoi(value);
   } else if (name_lower == "bookfile") {
     book_path_ = value;
   } else if (name_lower == "bookonthefly") {
@@ -266,9 +269,15 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     max_time = std::max(max_time, 0.1f);
   }
 
-  if (max_move_time_ms_ > 0) {
-    float cap = std::max(max_move_time_ms_ / 1000.0f - 0.5f, 0.5f);
-    if (max_time <= 0.0f || cap < max_time) max_time = cap;
+  {
+    int my_time = (board_.side_to_move() == BLACK) ? btime : wtime;
+    int cap_ms = max_move_time_ms_;
+    if (max_move_time_1m_ms_ > 0 && my_time > 0 && my_time < 60000)
+      cap_ms = max_move_time_1m_ms_;
+    if (cap_ms > 0) {
+      float cap = std::max(cap_ms / 1000.0f - 0.5f, 0.5f);
+      if (max_time <= 0.0f || cap < max_time) max_time = cap;
+    }
   }
 
   // Check entering-king declaration.
