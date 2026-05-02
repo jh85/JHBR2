@@ -330,14 +330,19 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       ? max_move_time_ms_
       : static_cast<int>(max_time * 1000) + 2000;
 
-  MateDfpnSolver root_dfpn(root_dfpn_nodes);
-  std::atomic<bool> dfpn_done{false};
-  Move dfpn_mate_move;
-  ShogiBoard dfpn_board = board_;
+  // Use shared_ptr so detached thread doesn't access destroyed locals.
+  struct DfpnState {
+    MateDfpnSolver solver;
+    std::atomic<bool> done{false};
+    Move mate_move;
+    ShogiBoard board;
+    DfpnState(size_t nodes, const ShogiBoard& b) : solver(nodes), board(b) {}
+  };
+  auto dfpn = std::make_shared<DfpnState>(root_dfpn_nodes, board_);
 
-  auto dfpn_thread = std::thread([&]() {
-    dfpn_mate_move = root_dfpn.search(dfpn_board, root_dfpn_nodes);
-    dfpn_done = true;
+  auto dfpn_thread = std::thread([dfpn, root_dfpn_nodes]() {
+    dfpn->mate_move = dfpn->solver.search(dfpn->board, root_dfpn_nodes);
+    dfpn->done = true;
   });
 
   // --- Run lc0-style MCTS ---
@@ -362,27 +367,21 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   auto result = lc0_search_->Run(board_, game_ply_);
 
   // --- Stop df-pn and wait ---
-  root_dfpn.stop();
-
-  auto total_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - move_start_time).count();
-  int remaining_ms = hard_deadline_ms - (int)total_elapsed_ms;
-  int wait_ms = std::min(dfpn_min_wait_ms, std::max(remaining_ms - 500, 0));
+  dfpn->solver.stop();
 
   // Wait for df-pn with hard deadline — never exceed MaxMoveTime.
-  root_dfpn.stop();
   {
     auto wait_start = std::chrono::steady_clock::now();
     int max_wait_ms = std::max(hard_deadline_ms - (int)std::chrono::duration_cast<
         std::chrono::milliseconds>(wait_start - move_start_time).count(), 100);
-    while (!dfpn_done) {
+    while (!dfpn->done) {
       auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
           std::chrono::steady_clock::now() - wait_start).count();
       if (elapsed_ms >= max_wait_ms) {
         // df-pn still running past deadline — detach and abandon.
-        // The thread will eventually stop when stop() takes effect.
+        // shared_ptr keeps DfpnState alive until the thread finishes.
         dfpn_thread.detach();
-        dfpn_done = true;  // Pretend it's done — don't use its result.
+        dfpn->done = true;  // Pretend it's done — don't use its result.
         break;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -391,26 +390,26 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   // --- Choose result ---
-  bool use_mate = dfpn_done &&
-                  !dfpn_mate_move.is_null() &&
-                  !MateDfpnSolver::IsNoMate(dfpn_mate_move);
+  bool use_mate = dfpn->done &&
+                  !dfpn->mate_move.is_null() &&
+                  !MateDfpnSolver::IsNoMate(dfpn->mate_move);
 
   if (use_mate) {
-    auto pv = root_dfpn.get_pv();
+    auto pv = dfpn->solver.get_pv();
     std::string pv_str;
     for (const auto& m : pv) {
       if (!pv_str.empty()) pv_str += " ";
       pv_str += m.ToString();
     }
-    if (pv_str.empty()) pv_str = dfpn_mate_move.ToString();
+    if (pv_str.empty()) pv_str = dfpn->mate_move.ToString();
 
     int mate_ply = (int)pv.size();
     Log("Root df-pn found mate in " + std::to_string(mate_ply) + " ply");
 
     Send("info depth 1 score mate " + std::to_string((mate_ply + 1) / 2) +
-         " nodes " + std::to_string(root_dfpn.get_nodes_searched()) +
+         " nodes " + std::to_string(dfpn->solver.get_nodes_searched()) +
          " pv " + pv_str);
-    Send("bestmove " + dfpn_mate_move.ToString());
+    Send("bestmove " + dfpn->mate_move.ToString());
     return;
   }
 

@@ -17,6 +17,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <iostream>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -203,14 +204,23 @@ class Backend {
         std::vector<std::vector<NNOutput>> gpu_results(num_gpus);
         std::vector<std::thread> gpu_threads;
 
+        std::atomic<bool> gpu_error{false};
         for (int g = 0; g < num_gpus; g++) {
           int start = g * per_gpu;
           int end = std::min(start + per_gpu, total);
           if (start >= total) break;
           gpu_threads.emplace_back([&, g, start, end]() {
-            std::vector<std::pair<ShogiBoard, MoveList>> sub(
-                combined.begin() + start, combined.begin() + end);
-            gpu_results[g] = evaluators_[g]->EvaluateBatch(sub);
+            try {
+              std::vector<std::pair<ShogiBoard, MoveList>> sub(
+                  combined.begin() + start, combined.begin() + end);
+              gpu_results[g] = evaluators_[g]->EvaluateBatch(sub);
+            } catch (const std::exception& e) {
+              std::cerr << "GPU " << g << " error: " << e.what() << std::endl;
+              gpu_error.store(true);
+            } catch (...) {
+              std::cerr << "GPU " << g << " unknown error" << std::endl;
+              gpu_error.store(true);
+            }
           });
         }
         for (auto& t : gpu_threads) t.join();
