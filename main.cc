@@ -13,7 +13,24 @@
 #include "shogi/bitboard.h"
 #include "shogi/encoder.h"
 
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <execinfo.h>
+
+static void crash_handler(int sig) {
+  fprintf(stderr, "\n=== JHBR2 CRASH: signal %d ===\n", sig);
+  void* frames[32];
+  int n = backtrace(frames, 32);
+  backtrace_symbols_fd(frames, n, 2);  // write to stderr
+  fflush(stderr);
+  _exit(1);
+}
+
 int main(int /*argc*/, char* /*argv*/[]) {
+  signal(SIGSEGV, crash_handler);
+  signal(SIGABRT, crash_handler);
+  signal(SIGFPE, crash_handler);
   // Initialize static tables.
   lczero::ShogiTables::Init();
   lczero::ShogiEncoderTables::Init();
