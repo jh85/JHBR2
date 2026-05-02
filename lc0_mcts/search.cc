@@ -894,25 +894,34 @@ void SearchWorker::FetchMinibatchResults() {
 void SearchWorker::DoBackupUpdate() {
   std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
 
+  // First pass: record collisions into shared_collisions_.
+  // We must cancel them BEFORE the backup loop, because
+  // DoBackupUpdateSingleNode may call MakeSolid() which moves
+  // child nodes to a new array and GCs the old ones — invalidating
+  // any collision pointers that refer to those children.
   bool work_done = false;
   for (const auto& ntp : minibatch_) {
-    DoBackupUpdateSingleNode(ntp);
-    if (!ntp.is_collision) work_done = true;
+    if (ntp.is_collision) {
+      search_->shared_collisions_.emplace_back(ntp.node, ntp.multivisit);
+    } else {
+      work_done = true;
+    }
   }
+  search_->CancelSharedCollisions();
+
   if (!work_done) return;
 
-  search_->CancelSharedCollisions();
+  // Second pass: backup non-collision nodes.
+  for (const auto& ntp : minibatch_) {
+    if (!ntp.is_collision) {
+      DoBackupUpdateSingleNode(ntp);
+    }
+  }
   search_->total_batches_++;
 }
 
 void SearchWorker::DoBackupUpdateSingleNode(const NodeToProcess& ntp) {
   Node* node = ntp.node;
-
-  if (ntp.is_collision) {
-    // Collisions are handled via shared_collisions.
-    search_->shared_collisions_.emplace_back(node, ntp.multivisit);
-    return;
-  }
 
   auto update_parent_bounds =
       config_.sticky_endgames && node->IsTerminal() && !node->GetN();
