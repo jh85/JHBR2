@@ -953,13 +953,10 @@ void SearchWorker::DoBackupUpdateSingleNode(const NodeToProcess& ntp) {
       n->AdjustForTerminal(v_delta, d_delta, m_delta, n_to_fix);
     }
 
-    // Solidify if enough visits.
-    if (n->GetN() >= solid_threshold) {
-      if (n->MakeSolid() && n == search_->root_node_) {
-        search_->current_best_edge_ =
-            search_->GetBestChildNoTemperature(search_->root_node_);
-      }
-    }
+    // MakeSolid disabled: it moves child nodes to a new array and GCs
+    // the old ones, which invalidates pointers held by other workers
+    // during their lock-free gather phase → SIGSEGV.
+    // TODO: re-enable with proper pointer invalidation handling.
 
     if (!p) break;
 
