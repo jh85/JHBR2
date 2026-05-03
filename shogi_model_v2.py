@@ -35,6 +35,16 @@ from dataclasses import dataclass, field
 
 # Direction vectors (df, dr) for BLACK's perspective.
 # Piece moves FROM (to_f - df*dist, to_r - dr*dist) TO (to_f, to_r).
+# NOTE on direction labels: vertical (UP/DOWN) is source-perspective, but
+# horizontal (LEFT/RIGHT) is destination-perspective — i.e. "UP_LEFT" means
+# the piece moves upward and arrives at the destination from its left side.
+# This is because we compute df = to_f - from_f and our file index increases
+# toward physical-left (file 1 is rightmost, file 9 is leftmost from sente's
+# view), so df < 0 (labelled LEFT here) is actually a physical rightward move.
+# dlshogi inverts dir_x and uses pure source-perspective labels, so its LEFT
+# is our RIGHT (and ditto for the diagonals and knight moves).
+# Do NOT try to load dlshogi policy weights directly — 8 of 27 channels are
+# mirrored, plus drops are reordered (we put Gold last; dlshogi puts it at 24).
 DIRECTION_VECTORS = [
     (0, -1),   # 0: UP
     (-1, -1),  # 1: UP_LEFT
