@@ -106,41 +106,45 @@ def process_pack_file(args):
     written = 0
     errors = 0
     games = 0
+    skipped_games = 0
 
     board = cshogi.Board()
 
-    try:
-        while not decoder.eof():
-            # Game start: get initial SFEN, set up board
+    while not decoder.eof():
+        # PHASE 1: read one game from the decoder. Decoder failures here
+        # are unrecoverable (we don't know where the next game starts) so
+        # we stop processing this file. Per-game encoding failures are
+        # handled separately in PHASE 2.
+        try:
             sfen = decoder.get_sfen()
-            board.set_sfen(sfen)
-
-            # Phase 1: read all (move, eval) until the game-result marker
             game_kif = []
             game_result_abs = 0
             while True:
                 move = decoder.read_uint16()
-                # End-of-game marker: from/to squares are equal
                 sq1 = move & 0x7f
                 sq2 = (move >> 7) & 0x7f
                 if sq1 == sq2:
-                    game_result_abs = sq1   # 0=draw, 1=BLACK win, 2=WHITE win
-                    decoder.read_uint8()    # status / reason byte
+                    game_result_abs = sq1
+                    decoder.read_uint8()
                     break
                 eval16 = decoder.read_int16()
                 game_kif.append((move, eval16))
+        except Exception as e:
+            print(f"  {pack_path}: decoder broke at game {games}: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr)
+            break
 
-            games += 1
-            n_moves = len(game_kif)
-            if n_moves == 0:
-                continue
+        games += 1
+        n_moves = len(game_kif)
+        if n_moves == 0:
+            continue
 
-            # Phase 2: replay the game, emit one record per move
+        # PHASE 2: encode the game. The decoder is at a game boundary, so
+        # if encoding this specific game fails we can skip it and continue.
+        try:
+            board.set_sfen(sfen)
             for i, (move, eval16) in enumerate(game_kif):
                 remaining_plies = n_moves - i - 1
-                # Clip large values: a draw-shuffle of 300 plies isn't
-                # informative; capping at e.g. 200 lets MLH focus on
-                # near-end positions where the signal matters.
                 mlh_target = min(remaining_plies, mlh_clip)
 
                 rec = encode_one_position(board, move, eval16,
@@ -154,23 +158,23 @@ def process_pack_file(args):
                     wdl_buf.append(wdl)
                     mlh_buf.append(mlh_target)
 
-                # Advance the board (use the original raw move from pack)
                 try:
                     board.push_move16(move)
                 except Exception:
                     errors += 1
                     break
 
-                # Flush full shards
                 if len(planes_buf) >= shard_size:
                     flush_shard(shard_id, output_dir, planes_buf,
                                 policy_buf, wdl_buf, mlh_buf)
                     written += len(planes_buf)
                     planes_buf, policy_buf, wdl_buf, mlh_buf = [], [], [], []
                     shard_id += 1
-
-    except Exception as e:
-        print(f"  {pack_path}: stopped at game {games}: {e}", file=sys.stderr)
+        except Exception as e:
+            skipped_games += 1
+            if skipped_games <= 10:
+                print(f"  {pack_path}: skipped game {games}: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
 
     # Flush any partial final shard
     if planes_buf:
@@ -179,7 +183,7 @@ def process_pack_file(args):
         written += len(planes_buf)
         shard_id += 1
 
-    return pack_path, games, written, errors, shard_id
+    return pack_path, games, written, errors, shard_id, skipped_games
 
 
 def main():
@@ -216,21 +220,24 @@ def main():
                       args.shard_size, args.eval_coef, args.mlh_clip))
 
     t0 = time.time()
-    total_games = total_written = total_errors = 0
+    total_games = total_written = total_errors = total_skipped = 0
     with Pool(args.workers) as pool:
-        for pack_path, games, written, errors, _ in pool.imap_unordered(
+        for pack_path, games, written, errors, _, skipped in pool.imap_unordered(
                 process_pack_file, tasks):
             total_games += games
             total_written += written
             total_errors += errors
+            total_skipped += skipped
             elapsed = time.time() - t0
             print(f"  done {os.path.basename(pack_path)}: "
-                  f"{games:,} games, {written:,} positions "
+                  f"{games:,} games ({skipped} skipped), {written:,} positions "
                   f"(errors={errors}, total {total_written:,} "
                   f"in {elapsed:.0f}s, {total_written/max(elapsed,1):.0f}/s)")
 
-    print(f"\nFinished: {total_games:,} games, {total_written:,} positions, "
-          f"{total_errors} errors")
+    print(f"\nFinished: {total_games:,} games, "
+          f"{total_skipped} skipped, "
+          f"{total_written:,} positions, "
+          f"{total_errors} per-position errors")
     print(f"Output: {args.output_dir}")
 
 
