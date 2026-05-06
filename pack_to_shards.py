@@ -12,8 +12,9 @@ Each shard is a .npz with arrays:
     planes  (N, 48, 9, 9)  float16
     policy  (N,)           int32   in [0, 2187), or -1 if move missing
     wdl     (N, 3)         float16 (W, D, L) from side-to-move's perspective
-    mlh     (N,)           int16   remaining plies from this position to
-                                   game end (clamped to [0, 200])
+    mlh     (N,)           int16   raw remaining plies from this position to
+                                   game end (no clipping — apply at training
+                                   time so the threshold is tunable)
 
 Usage:
     python pack_to_shards.py \
@@ -21,8 +22,7 @@ Usage:
         --output-dir /workspace/pack_precomputed/ \
         --shard-size 500000 \
         --workers 16 \
-        --eval-coef 600.0 \
-        --mlh-clip 200
+        --eval-coef 600.0
 """
 
 import argparse
@@ -94,7 +94,7 @@ def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
 
 def process_pack_file(args):
     """Process a single .pack file → one or more shards."""
-    pack_path, shard_id_base, output_dir, shard_size, eval_coef, mlh_clip = args
+    pack_path, shard_id_base, output_dir, shard_size, eval_coef = args
 
     with open(pack_path, "rb") as f:
         data = bytearray(f.read())
@@ -145,7 +145,11 @@ def process_pack_file(args):
             board.set_sfen(sfen)
             for i, (move, eval16) in enumerate(game_kif):
                 remaining_plies = n_moves - i - 1
-                mlh_target = min(remaining_plies, mlh_clip)
+                # Store the raw value; clipping is applied at training time
+                # in shogi_train.py so the clip threshold can be tuned
+                # without regenerating shards. int16 holds values to 32767
+                # which is far beyond any plausible Shogi game length.
+                mlh_target = remaining_plies
 
                 rec = encode_one_position(board, move, eval16,
                                           game_result_abs, eval_coef)
@@ -193,8 +197,6 @@ def main():
     p.add_argument("--shard-size", type=int, default=500_000)
     p.add_argument("--workers", type=int, default=16)
     p.add_argument("--eval-coef", type=float, default=600.0)
-    p.add_argument("--mlh-clip", type=int, default=200,
-                   help="Clamp remaining_plies to this value for MLH target")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -217,7 +219,7 @@ def main():
     for idx, path in enumerate(pack_files):
         shard_id_base = idx * PER_FILE_SHARD_BUDGET
         tasks.append((path, shard_id_base, args.output_dir,
-                      args.shard_size, args.eval_coef, args.mlh_clip))
+                      args.shard_size, args.eval_coef))
 
     t0 = time.time()
     total_games = total_written = total_errors = total_skipped = 0
