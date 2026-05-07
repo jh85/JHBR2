@@ -29,6 +29,7 @@
 #include <sstream>
 
 #include "mate/dfpn.h"
+#include "mate/shallow_mate.h"
 #include "shogi/encoder.h"
 
 namespace lc0_shogi {
@@ -451,15 +452,11 @@ void SearchWorker::ExtendNodeInPlace(NodeToProcess& ntp) {
     }
   }
 
-  // Leaf df-pn: inline mate detection with tiny budget.
-  if (config_.leaf_dfpn_nodes > 0) {
-    jhbr2::MateDfpnSolver solver(config_.leaf_dfpn_nodes);
-    Move mate_move = solver.search(board, config_.leaf_dfpn_nodes);
-    if (!mate_move.is_null() && !jhbr2::MateDfpnSolver::IsNoMate(mate_move)) {
-      // Side to move can force mate → this position is winning.
-      node->MakeTerminal(GameResult::BLACK_WON);
-      return;
-    }
+  // Leaf mate detection: dispatch on leaf_mate_mode.
+  if (CheckLeafMate(board)) {
+    // Side to move can force mate → this position is winning.
+    node->MakeTerminal(GameResult::BLACK_WON);
+    return;
   }
 
   node->CreateEdges(legal_moves);
@@ -818,17 +815,38 @@ void SearchWorker::ExtendNode(Node* node, int depth,
     }
   }
 
-  // Leaf df-pn: inline mate detection with tiny budget.
-  if (config_.leaf_dfpn_nodes > 0) {
-    jhbr2::MateDfpnSolver solver(config_.leaf_dfpn_nodes);
-    Move mate_move = solver.search(board, config_.leaf_dfpn_nodes);
-    if (!mate_move.is_null() && !jhbr2::MateDfpnSolver::IsNoMate(mate_move)) {
-      node->MakeTerminal(GameResult::BLACK_WON);
-      return;
-    }
+  // Leaf mate detection: dispatch on leaf_mate_mode.
+  if (CheckLeafMate(board)) {
+    node->MakeTerminal(GameResult::BLACK_WON);
+    return;
   }
 
   node->CreateEdges(legal_moves);
+}
+
+// Dispatch helper for leaf mate detection. Returns true if the side
+// to move at `board` has a forced mate within the configured limits.
+// Mode is selected via config_.leaf_mate_mode:
+//   kOff     → always returns false
+//   kDfpn    → df-pn search up to config_.leaf_dfpn_nodes nodes
+//   kShallow → shallow check-only AND/OR search up to
+//              config_.leaf_mate_depth plies
+bool SearchWorker::CheckLeafMate(ShogiBoard& board) {
+  switch (config_.leaf_mate_mode) {
+    case SearchConfig::LeafMateMode::kOff:
+      return false;
+    case SearchConfig::LeafMateMode::kDfpn: {
+      if (config_.leaf_dfpn_nodes <= 0) return false;
+      jhbr2::MateDfpnSolver solver(config_.leaf_dfpn_nodes);
+      Move mate_move = solver.search(board, config_.leaf_dfpn_nodes);
+      return !mate_move.is_null() &&
+             !jhbr2::MateDfpnSolver::IsNoMate(mate_move);
+    }
+    case SearchConfig::LeafMateMode::kShallow:
+      return jhbr2::shallow_mate::HasMateWithin(board,
+                                                 config_.leaf_mate_depth);
+  }
+  return false;
 }
 
 // =====================================================================

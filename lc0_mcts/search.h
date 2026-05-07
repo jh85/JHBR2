@@ -103,9 +103,23 @@ struct SearchConfig {
   // Policy softmax temperature (1.0 = use NN output directly)
   float policy_softmax_temp = 1.0f;
 
-  // Leaf df-pn: inline mate detection at leaf nodes.
-  // Budget in nodes (0 = disabled). Typical: 10-100.
+  // Leaf mate detection mode at leaf nodes.
+  enum class LeafMateMode {
+    kOff,      // No leaf mate check.
+    kDfpn,     // df-pn with `leaf_dfpn_nodes` budget (legacy default).
+    kShallow,  // Shallow check-only AND/OR search at `leaf_mate_depth`
+               // plies. Faster on non-mate positions, better mate
+               // coverage at low budgets. See mate/shallow_mate.h.
+  };
+  LeafMateMode leaf_mate_mode = LeafMateMode::kDfpn;
+
+  // df-pn budget when leaf_mate_mode == kDfpn.
+  // Typical: 10-100. (Was the only knob before kShallow existed.)
   int leaf_dfpn_nodes = 0;
+
+  // Search depth (plies) when leaf_mate_mode == kShallow.
+  // Must be odd; supported values: 1, 3, 5, 7.
+  int leaf_mate_depth = 5;
 
   // Multi-GPU: number of GPUs (1 or 2).
   int num_gpus = 1;
@@ -269,6 +283,11 @@ class SearchWorker {
                              std::vector<NodeToProcess>* receiver);
   void ProcessPickedNodes();
   void ExtendNode(Node* node, int depth, const std::vector<Move>& moves);
+
+  // Leaf mate-detection dispatch. Returns true if side-to-move at
+  // `board` has a forced mate within the configured limits (mode +
+  // depth/budget). See SearchConfig::leaf_mate_mode.
+  bool CheckLeafMate(lczero::ShogiBoard& board);
 
   void DoBackupUpdateSingleNode(const NodeToProcess& ntp);
   bool MaybeSetBounds(Node* p, float m, int* n_to_fix,

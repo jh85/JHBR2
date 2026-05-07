@@ -101,6 +101,8 @@ void USIEngine::CmdUsi() {
   Send("option name MinibatchSize type spin default 32 min 1 max 4096");
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
+  Send("option name LeafMateMode type combo default dfpn var off var dfpn var shallow");
+  Send("option name LeafMateDepth type spin default 5 min 1 max 7");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
@@ -166,6 +168,20 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     lc0_config_.per_leaf_gathering = (value == "true");
   } else if (name_lower == "leafdfpnnodes") {
     lc0_config_.leaf_dfpn_nodes = std::stoi(value);
+  } else if (name_lower == "leafmatemode") {
+    using Mode = lc0_shogi::SearchConfig::LeafMateMode;
+    std::string v = value;
+    for (auto& c : v) c = std::tolower(c);
+    if (v == "off") lc0_config_.leaf_mate_mode = Mode::kOff;
+    else if (v == "shallow") lc0_config_.leaf_mate_mode = Mode::kShallow;
+    else lc0_config_.leaf_mate_mode = Mode::kDfpn;  // default fallback
+  } else if (name_lower == "leafmatedepth") {
+    int d = std::stoi(value);
+    // Clamp to supported odd values: 1, 3, 5, 7.
+    if (d < 1) d = 1;
+    if (d > 7) d = 7;
+    if (d % 2 == 0) d -= 1;          // round even down to odd
+    lc0_config_.leaf_mate_depth = d;
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
     lc0_config_.num_gpus = num_gpus_;
