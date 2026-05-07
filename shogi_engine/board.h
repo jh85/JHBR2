@@ -125,15 +125,19 @@ class ShogiBoard {
   MoveList GenerateLegalMoves();
 
   // Generate the subset of legal moves that give check to the
-  // opponent. Equivalent to:
-  //     filter(GenerateLegalMoves(), MoveGivesCheck)
-  // but ~10-50× faster because we use bitboard ops instead of
-  // a do-undo per move.
+  // opponent. Equivalent to filter(GenerateLegalMoves, MoveGivesCheck).
   //
-  // Used by mate/shallow_mate.h to make the per-leaf 5-ply check
-  // viable in MCTS hot path. See docs/port_5ply_mate_check_plan.md
-  // (Phase 6).
+  // Two implementations:
+  //   - GenerateCheckingMovesViaFilter: simple oracle (slow).
+  //     Used as a property-test reference.
+  //   - GenerateCheckingMoves: production version. Uses precomputed
+  //     CheckBB tables (Phase 7a) to identify candidate pieces and
+  //     skip moves of pieces that cannot possibly give check.
+  //
+  // Used by mate/shallow_mate.h. See docs/port_5ply_mate_check_plan.md
+  // (Phase 6) and docs/port_yaneuraou_check_generator_plan.md (Phase 7).
   MoveList GenerateCheckingMoves();
+  MoveList GenerateCheckingMovesViaFilter();  // oracle; slower but obviously correct
 
   // Is the given move legal in the current position?
   bool IsLegal(Move m, const Bitboard& pinned);

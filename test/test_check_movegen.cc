@@ -50,34 +50,37 @@ std::set<std::string> ToStringSet(const MoveList& moves) {
     return out;
 }
 
-// Property: GenerateCheckingMoves(b) == filter(GenerateLegalMoves, MoveGivesCheck)
+// Property: BOTH GenerateCheckingMoves AND GenerateCheckingMovesViaFilter
+// must equal filter(GenerateLegalMoves, MoveGivesCheck).
 // Returns true on success.
 bool CheckPropertyOnSfen(const std::string& sfen,
                         const std::string& label) {
-    ShogiBoard b;
-    if (!b.SetFromSfen(sfen)) {
+    ShogiBoard b1, b2, b3;
+    if (!b1.SetFromSfen(sfen) || !b2.SetFromSfen(sfen) || !b3.SetFromSfen(sfen)) {
         std::printf("  FAIL  setup [%s]: SetFromSfen failed for %s\n",
                     label.c_str(), sfen.c_str());
         return false;
     }
-    auto specialized = b.GenerateCheckingMoves();
-    ShogiBoard b2;
-    b2.SetFromSfen(sfen);
-    auto legal = b2.GenerateLegalMoves();
+    auto fast    = b1.GenerateCheckingMoves();
+    auto via_filter = b2.GenerateCheckingMovesViaFilter();
+    auto legal   = b3.GenerateLegalMoves();
     MoveList oracle;
     for (size_t i = 0; i < legal.size(); ++i) {
-        if (MoveGivesCheck(b2, legal[i])) oracle.push_back(legal[i]);
+        if (MoveGivesCheck(b3, legal[i])) oracle.push_back(legal[i]);
     }
-    auto s_set = ToStringSet(specialized);
-    auto o_set = ToStringSet(oracle);
-    if (s_set == o_set) return true;
+    auto fast_set    = ToStringSet(fast);
+    auto filter_set  = ToStringSet(via_filter);
+    auto oracle_set  = ToStringSet(oracle);
 
-    // Mismatch: print details for debugging.
+    if (fast_set == oracle_set && filter_set == oracle_set) return true;
+
     std::printf("  FAIL  [%s] mismatch on %s\n", label.c_str(), sfen.c_str());
-    std::printf("        specialized (%zu): ", s_set.size());
-    for (const auto& s : s_set) std::printf("%s ", s.c_str());
-    std::printf("\n        oracle      (%zu): ", o_set.size());
-    for (const auto& s : o_set) std::printf("%s ", s.c_str());
+    std::printf("        fast        (%zu): ", fast_set.size());
+    for (const auto& s : fast_set)   std::printf("%s ", s.c_str());
+    std::printf("\n        via_filter  (%zu): ", filter_set.size());
+    for (const auto& s : filter_set) std::printf("%s ", s.c_str());
+    std::printf("\n        oracle      (%zu): ", oracle_set.size());
+    for (const auto& s : oracle_set) std::printf("%s ", s.c_str());
     std::printf("\n");
     return false;
 }
@@ -169,19 +172,21 @@ int main() {
             for (int ply = 0; ply < max_plies; ++ply) {
                 ++total;
                 std::string sfen = b.ToSfen();
-                ShogiBoard tmp;
-                tmp.SetFromSfen(sfen);
-                auto specialized = tmp.GenerateCheckingMoves();
-                ShogiBoard tmp2;
-                tmp2.SetFromSfen(sfen);
-                auto legal = tmp2.GenerateLegalMoves();
+                ShogiBoard t1, t2, t3;
+                t1.SetFromSfen(sfen);
+                t2.SetFromSfen(sfen);
+                t3.SetFromSfen(sfen);
+                auto fast    = t1.GenerateCheckingMoves();
+                auto via_filter = t2.GenerateCheckingMovesViaFilter();
+                auto legal   = t3.GenerateLegalMoves();
                 MoveList oracle;
                 for (size_t i = 0; i < legal.size(); ++i) {
-                    if (MoveGivesCheck(tmp2, legal[i])) oracle.push_back(legal[i]);
+                    if (MoveGivesCheck(t3, legal[i])) oracle.push_back(legal[i]);
                 }
-                auto s_set = ToStringSet(specialized);
-                auto o_set = ToStringSet(oracle);
-                if (s_set == o_set) {
+                auto fs = ToStringSet(fast);
+                auto vf = ToStringSet(via_filter);
+                auto os = ToStringSet(oracle);
+                if (fs == os && vf == os) {
                     ++ok;
                 } else {
                     if (failed.size() < 5) failed.push_back(sfen);

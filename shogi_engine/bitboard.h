@@ -383,6 +383,31 @@ extern Bitboard DragonStepBB[kSquareNB];
 // LanceMaskBB[sq][WHITE] = squares on same file with rank > sq's rank.
 extern Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
 
+// =====================================================================
+// CHECK TABLES — used by GenerateCheckingMovesFast (Phase 7).
+//
+// CheckBB[ksq][c] = bitboard of squares S such that a piece of color c
+// at S would attack ksq. With empty-occupancy assumption for sliders.
+//
+// Used to quickly identify which of our pieces could potentially give
+// check, without enumerating all moves. dlshogi/YaneuraOu equivalents:
+//   PawnCheckBB    ↔ pawnCheckTable
+//   KnightCheckBB  ↔ knightCheckTable
+//   SilverCheckBB  ↔ silverCheckTable
+//   GoldCheckBB    ↔ goldCheckTable
+//   LanceCheckBB   ↔ lanceCheckTable
+//   BishopCheckBB  ↔ bishopCheckTable (color-symmetric)
+//   HorseCheckBB   ↔ horseCheckTable  (color-symmetric)
+// (No table for rook/dragon: any rook/dragon could potentially check.)
+//
+extern Bitboard PawnCheckBB  [kSquareNB][COLOR_NB];
+extern Bitboard KnightCheckBB[kSquareNB][COLOR_NB];
+extern Bitboard SilverCheckBB[kSquareNB][COLOR_NB];
+extern Bitboard GoldCheckBB  [kSquareNB][COLOR_NB];
+extern Bitboard LanceCheckBB [kSquareNB][COLOR_NB];
+extern Bitboard BishopCheckBB[kSquareNB];
+extern Bitboard HorseCheckBB [kSquareNB];
+
 // BetweenBB[sq1][sq2]: squares strictly between sq1 and sq2 on the same
 // rank, file, or diagonal. Empty if not aligned.
 extern Bitboard BetweenBB[kSquareNB][kSquareNB];

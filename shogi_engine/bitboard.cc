@@ -24,6 +24,14 @@ Bitboard KingEffectBB[kSquareNB];
 Bitboard HorseStepBB[kSquareNB];
 Bitboard DragonStepBB[kSquareNB];
 Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
+Bitboard PawnCheckBB[kSquareNB][COLOR_NB];
+Bitboard KnightCheckBB[kSquareNB][COLOR_NB];
+Bitboard SilverCheckBB[kSquareNB][COLOR_NB];
+Bitboard GoldCheckBB[kSquareNB][COLOR_NB];
+Bitboard LanceCheckBB[kSquareNB][COLOR_NB];
+Bitboard BishopCheckBB[kSquareNB];
+Bitboard HorseCheckBB[kSquareNB];
+
 Bitboard BetweenBB[kSquareNB][kSquareNB];
 Bitboard LineBB[kSquareNB][kSquareNB];
 Bitboard QugiyRookMask[kSquareNB][2];
@@ -155,6 +163,71 @@ static void InitBetweenAndLine() {
   }
 }
 
+// Build "check tables": squares S from which a piece of (pt, c) would
+// attack a king at sq with empty occupancy. Used by Phase 7 fast check
+// generator. Must be called AFTER InitStepAttacks() and InitQugiyMasks()
+// so that the underlying Effect/Slider tables are populated.
+static void InitCheckTables() {
+  for (int ksq_idx = 0; ksq_idx < kSquareNB; ++ksq_idx) {
+    Square ksq = Square::FromIdx(ksq_idx);
+
+    PawnCheckBB[ksq_idx][BLACK]   = Bitboard::Zero();
+    PawnCheckBB[ksq_idx][WHITE]   = Bitboard::Zero();
+    KnightCheckBB[ksq_idx][BLACK] = Bitboard::Zero();
+    KnightCheckBB[ksq_idx][WHITE] = Bitboard::Zero();
+    SilverCheckBB[ksq_idx][BLACK] = Bitboard::Zero();
+    SilverCheckBB[ksq_idx][WHITE] = Bitboard::Zero();
+    GoldCheckBB[ksq_idx][BLACK]   = Bitboard::Zero();
+    GoldCheckBB[ksq_idx][WHITE]   = Bitboard::Zero();
+    LanceCheckBB[ksq_idx][BLACK]  = Bitboard::Zero();
+    LanceCheckBB[ksq_idx][WHITE]  = Bitboard::Zero();
+    BishopCheckBB[ksq_idx]        = Bitboard::Zero();
+    HorseCheckBB[ksq_idx]         = Bitboard::Zero();
+
+    for (int s_idx = 0; s_idx < kSquareNB; ++s_idx) {
+      Square s = Square::FromIdx(s_idx);
+
+      // Step pieces: invert the Effect table.
+      // PawnEffectBB[s][c].Test(ksq) ⇔ pawn(c) at s attacks ksq.
+      if (PawnEffectBB[s_idx][BLACK].Test(ksq))
+        PawnCheckBB[ksq_idx][BLACK].Set(s);
+      if (PawnEffectBB[s_idx][WHITE].Test(ksq))
+        PawnCheckBB[ksq_idx][WHITE].Set(s);
+
+      if (KnightEffectBB[s_idx][BLACK].Test(ksq))
+        KnightCheckBB[ksq_idx][BLACK].Set(s);
+      if (KnightEffectBB[s_idx][WHITE].Test(ksq))
+        KnightCheckBB[ksq_idx][WHITE].Set(s);
+
+      if (SilverEffectBB[s_idx][BLACK].Test(ksq))
+        SilverCheckBB[ksq_idx][BLACK].Set(s);
+      if (SilverEffectBB[s_idx][WHITE].Test(ksq))
+        SilverCheckBB[ksq_idx][WHITE].Set(s);
+
+      if (GoldEffectBB[s_idx][BLACK].Test(ksq))
+        GoldCheckBB[ksq_idx][BLACK].Set(s);
+      if (GoldEffectBB[s_idx][WHITE].Test(ksq))
+        GoldCheckBB[ksq_idx][WHITE].Set(s);
+
+      // Lance: c-color lance from s with empty occ reaches ksq?
+      if (LanceEffect(BLACK, s, Bitboard::Zero()).Test(ksq))
+        LanceCheckBB[ksq_idx][BLACK].Set(s);
+      if (LanceEffect(WHITE, s, Bitboard::Zero()).Test(ksq))
+        LanceCheckBB[ksq_idx][WHITE].Set(s);
+
+      // Bishop: symmetric — bishop from s with empty occ reaches ksq?
+      if (BishopEffect(s, Bitboard::Zero()).Test(ksq))
+        BishopCheckBB[ksq_idx].Set(s);
+    }
+
+    // Horse = bishop pattern + 4-cardinal step.
+    // Horse at s attacks ksq via cardinal step iff s is orthogonally
+    // adjacent to ksq, i.e., s ∈ HorseStepBB[ksq] (HorseStepBB is
+    // symmetric for 1-step orthogonal).
+    HorseCheckBB[ksq_idx] = BishopCheckBB[ksq_idx] | HorseStepBB[ksq_idx];
+  }
+}
+
 static void InitQugiyMasks() {
   for (int f = 0; f < 9; ++f) {
     for (int r = 0; r < 9; ++r) {
@@ -253,6 +326,9 @@ void Init() {
 
   // Qugiy sliding attack masks.
   InitQugiyMasks();
+
+  // Check tables (must be after step + slider tables are ready).
+  InitCheckTables();
 }
 
 }  // namespace ShogiTables
