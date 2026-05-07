@@ -163,7 +163,7 @@ target_link_libraries(test_mate PRIVATE mate_solver shogi_core)
 
 # ---- Test: shallow mate (Phase 0+) ----
 add_executable(test_shallow_mate test/test_shallow_mate.cc)
-target_link_libraries(test_shallow_mate PRIVATE shogi_core)
+target_link_libraries(test_shallow_mate PRIVATE mate_solver shogi_core)
 
 # ---- Bench: shallow mate vs df-pn ----
 add_executable(bench_shallow_mate test/bench_shallow_mate.cc)

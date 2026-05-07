@@ -13,6 +13,7 @@
 #include "shogi/bitboard.h"
 #include "shogi/board.h"
 #include "shogi/types.h"
+#include "mate/dfpn.h"
 #include "mate/shallow_mate.h"
 
 using lczero::ShogiBoard;
@@ -443,6 +444,205 @@ int main() {
     verify_corpus("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate3.sfen", 3, 200);
     verify_corpus("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate5.sfen", 5, 200);
     verify_corpus("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate7.sfen", 7, 100);
+
+    // -------------------------------------------------------------
+    // Phase 3: edge-case fixtures
+    // -------------------------------------------------------------
+
+    std::printf("\n=== Phase 3: Edge cases ===\n\n");
+
+    // Edge 1: Uchifuzume (打ち歩詰め). A pawn drop that would mate is
+    // illegal in Shogi. Set up a position where the only mating move
+    // is P*5b — which is uchifuzume — and verify HasMateWithin(b, 1)
+    // returns false (GenerateLegalMoves should not include the
+    // illegal pawn drop).
+    //
+    // Position:
+    //   White K on 5a, white pawns blocking all king escape squares
+    //   on rank a (4a, 6a) and rank b (4b, 6b). Black pawn in hand.
+    //   Black bishop on 8e supports 5b along the diagonal (so king
+    //   couldn't capture the dropped pawn).
+    //
+    //   No other black piece has a checking move into this trapped
+    //   king area.
+    //
+    //   If pawn drops were legal, P*5b would be mate. Since uchifuzume
+    //   makes it illegal, the engine should not list P*5b in legal
+    //   moves and HasMateWithin(b, 1) should return false.
+    //
+    // SFEN: 3pkp3/3p1p3/9/9/1B7/9/9/9/4K4 b P 1
+    {
+        ShogiBoard b;
+        bool ok = b.SetFromSfen("3pkp3/3p1p3/9/9/1B7/9/9/9/4K4 b P 1");
+        if (!ok) {
+            check("Uchifuzume setup", false, "SetFromSfen failed");
+        } else {
+            // First confirm that the engine correctly omits P*5b from
+            // legal moves (otherwise our test premise is wrong — would
+            // be an engine bug, not a shallow_mate bug).
+            auto moves = b.GenerateLegalMoves();
+            bool has_p5b = false;
+            for (size_t i = 0; i < moves.size(); ++i) {
+                if (moves[i].ToString() == "P*5b") { has_p5b = true; break; }
+            }
+            check("Uchifuzume: P*5b NOT in legal moves",
+                  !has_p5b,
+                  "engine listed P*5b as legal");
+
+            // Shallow mate-in-1 must NOT find mate (no other move mates
+            // here either).
+            check("Uchifuzume: HasMateWithin(b, 1) is false",
+                  !HasMateWithin(b, 1));
+            check("Uchifuzume: HasMateWithin(b, 3) is false",
+                  !HasMateWithin(b, 3));
+        }
+    }
+
+    // Edge 2: Promotion-conditional check.
+    //
+    // A silver moving to 5b checks a king on 4c (silver attacks the
+    // back-diagonal). Promoting to gold at 5b does NOT check (gold
+    // doesn't attack back-diagonals). So 5c5b and 5c5b+ behave
+    // differently for MoveGivesCheck.
+    //
+    // SFEN: 9/9/4Sk3/9/9/9/9/9/4K4 b - 1
+    //   (rank c reads file9..file1: 4 empty, S at file 5, k at file 4,
+    //    3 empty)
+    {
+        ShogiBoard b;
+        bool ok = b.SetFromSfen("9/9/4Sk3/9/9/9/9/9/4K4 b - 1");
+        if (!ok) {
+            check("Promotion-conditional setup", false, "SetFromSfen failed");
+        } else {
+            auto moves = b.GenerateLegalMoves();
+            Move m_no_promo, m_promo;
+            for (size_t i = 0; i < moves.size(); ++i) {
+                std::string s = moves[i].ToString();
+                if (s == "5c5b")  m_no_promo = moves[i];
+                if (s == "5c5b+") m_promo = moves[i];
+            }
+            check("Prom-cond: 5c5b is in legal moves",
+                  !m_no_promo.is_null());
+            check("Prom-cond: 5c5b+ is in legal moves",
+                  !m_promo.is_null());
+            if (!m_no_promo.is_null()) {
+                check("Prom-cond: 5c5b (silver) gives check",
+                      MoveGivesCheck(b, m_no_promo));
+            }
+            if (!m_promo.is_null()) {
+                check("Prom-cond: 5c5b+ (gold) does NOT give check",
+                      !MoveGivesCheck(b, m_promo));
+            }
+        }
+    }
+
+    // Edge 3: In-check at root.
+    //
+    // Side to move is in check — must respond with an evasion. The
+    // mate search should still terminate and behave correctly. This
+    // hits the INCHECK template parameter path (handled identically
+    // to non-INCHECK in our impl, but we want to verify nothing
+    // misbehaves).
+    //
+    // Position: black king at 5i, white rook at 5e, black has nothing
+    // else. Black is in check, has only king-evasion moves.
+    {
+        ShogiBoard b;
+        bool ok = b.SetFromSfen("4k4/9/9/9/4r4/9/9/9/4K4 b - 1");
+        if (!ok) {
+            check("In-check root setup", false, "SetFromSfen failed");
+        } else {
+            check("In-check root: side to move is in check", b.InCheck());
+            // No mate possible from this position — black just escapes
+            // with a king move. HasMateWithin should return false, not
+            // crash or hang.
+            check("In-check root: HasMateWithin(b, 1) terminates and returns false",
+                  !HasMateWithin(b, 1));
+            check("In-check root: HasMateWithin(b, 3) terminates and returns false",
+                  !HasMateWithin(b, 3));
+            check("In-check root: HasMateWithin(b, 5) terminates and returns false",
+                  !HasMateWithin(b, 5));
+        }
+    }
+
+    // Edge 4: Drop check by rook.
+    //
+    // Black has rook in hand, white king at 5a is hemmed in such that
+    // R*5b is mate-in-1 (rook on 5b checks along file, king has no
+    // legal escape and rook is supported).
+    //
+    // Reuse a position that puts the king in a smother:
+    //   white K at 5a, white silver at 4a, white silver at 6a (block
+    //   sideways), white pawn at 4b (block escape), white pawn at 6b
+    //   (block escape).
+    //   Black supports 5b via bishop at 9f (9-5=4, f-b=4 ✓).
+    //   Black has rook in hand → R*5b mate.
+    //
+    // SFEN: 3sks3/3p1p3/9/9/9/B8/9/9/4K4 b R 1
+    //   (similar structure to G*5b smother, but white silvers replace
+    //    pawns on rank a so that king can't capture silver from 4a or
+    //    6a; bishop at 9f supports 5b; black rook in hand)
+    //
+    // Wait — silvers attack diagonally, including 5b from 4a or 6a.
+    // That means a rook drop at 5b would be captured by silver. Use
+    // pawns instead (which only attack forward).
+    //
+    // SFEN: 3pkp3/3p1p3/9/9/9/B8/9/9/4K4 b R 1
+    {
+        ShogiBoard b;
+        bool ok = b.SetFromSfen("3pkp3/3p1p3/9/9/9/B8/9/9/4K4 b R 1");
+        if (!ok) {
+            check("Rook-drop-mate setup", false, "SetFromSfen failed");
+        } else {
+            check("Rook drop: HasMateWithin(b, 1) true (R*5b mate)",
+                  HasMateWithin(b, 1));
+            check("Rook drop: HasMateWithin(b, 3) true",
+                  HasMateWithin(b, 3));
+            check("Rook drop: HasMateWithin(b, 5) true",
+                  HasMateWithin(b, 5));
+        }
+    }
+
+    // Edge 5: Cross-validate against df-pn at high budget on a small
+    // sample. For a corpus position where df-pn (high budget) finds
+    // mate, our shallow check at the same depth should also find it
+    // (>=99% agreement allowed for edge cases).
+    //
+    // For each puzzle in mate3.sfen sample, run BOTH:
+    //   - HasMateWithin(b, 3) — shallow
+    //   - df-pn with 10,000 nodes — high-confidence reference
+    // and assert they agree on the verdict.
+    {
+        std::ifstream f("/home/ei/Downloads/JHBR2/mate3_5_7_9_11/mate3.sfen");
+        if (!f) {
+            std::printf("  SKIP  Cross-check (corpus not found)\n");
+        } else {
+            int n_total = 0, n_agree = 0;
+            std::string line;
+            while (std::getline(f, line) && n_total < 100) {
+                if (line.empty()) continue;
+                ShogiBoard b;
+                if (!b.SetFromSfen(line)) continue;
+                ++n_total;
+                bool shallow_says = HasMateWithin(b, 3);
+                ShogiBoard b2;
+                b2.SetFromSfen(line);
+                jhbr2::MateDfpnSolver solver(10000);
+                Move r = solver.search(b2, 10000);
+                bool dfpn_says = !r.is_null() &&
+                                 !jhbr2::MateDfpnSolver::IsNoMate(r);
+                if (shallow_says == dfpn_says) ++n_agree;
+            }
+            std::string label =
+                "Cross-check (n=" + std::to_string(n_total) + "): "
+                "shallow agrees with df-pn n=10000";
+            // Allow 1% disagreement for corner cases (uchifuzume edge
+            // cases at the depth boundary, etc.)
+            check(label,
+                  n_agree >= n_total * 99 / 100,
+                  std::to_string(n_agree) + "/" + std::to_string(n_total));
+        }
+    }
 
     std::printf("\n=== Summary: %d passed, %d failed ===\n", passed, failed);
     return failed == 0 ? 0 : 1;
