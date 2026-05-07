@@ -32,6 +32,15 @@ Bitboard LanceCheckBB[kSquareNB][COLOR_NB];
 Bitboard BishopCheckBB[kSquareNB];
 Bitboard HorseCheckBB[kSquareNB];
 
+// Move-check tables (Phase 7d, promotion-aware).
+Bitboard PawnMoveCheckBB  [kSquareNB][COLOR_NB];
+Bitboard KnightMoveCheckBB[kSquareNB][COLOR_NB];
+Bitboard SilverMoveCheckBB[kSquareNB][COLOR_NB];
+Bitboard LanceMoveCheckBB [kSquareNB][COLOR_NB];
+Bitboard BishopMoveCheckBB[kSquareNB][COLOR_NB];
+Bitboard GoldMoveCheckBB  [kSquareNB][COLOR_NB];
+Bitboard HorseMoveCheckBB [kSquareNB];
+
 Bitboard BetweenBB[kSquareNB][kSquareNB];
 Bitboard LineBB[kSquareNB][kSquareNB];
 Bitboard QugiyRookMask[kSquareNB][2];
@@ -163,11 +172,14 @@ static void InitBetweenAndLine() {
   }
 }
 
-// Build "check tables": squares S from which a piece of (pt, c) would
-// attack a king at sq with empty occupancy. Used by Phase 7 fast check
-// generator. Must be called AFTER InitStepAttacks() and InitQugiyMasks()
-// so that the underlying Effect/Slider tables are populated.
-static void InitCheckTables() {
+// Build "direct attack" check tables: squares S from which a piece of
+// (pt, c) attacks ksq directly (with empty occupancy for sliders).
+//
+// Used for DROP classification: when dropping piece pt at dst, check
+// if dst is in CheckBB[ksq][c] — if so, the drop attacks ksq.
+//
+// Must be called AFTER InitStepAttacks() and InitQugiyMasks().
+static void InitDirectAttackTables() {
   for (int ksq_idx = 0; ksq_idx < kSquareNB; ++ksq_idx) {
     Square ksq = Square::FromIdx(ksq_idx);
 
@@ -186,45 +198,208 @@ static void InitCheckTables() {
 
     for (int s_idx = 0; s_idx < kSquareNB; ++s_idx) {
       Square s = Square::FromIdx(s_idx);
-
-      // Step pieces: invert the Effect table.
-      // PawnEffectBB[s][c].Test(ksq) ⇔ pawn(c) at s attacks ksq.
-      if (PawnEffectBB[s_idx][BLACK].Test(ksq))
-        PawnCheckBB[ksq_idx][BLACK].Set(s);
-      if (PawnEffectBB[s_idx][WHITE].Test(ksq))
-        PawnCheckBB[ksq_idx][WHITE].Set(s);
-
-      if (KnightEffectBB[s_idx][BLACK].Test(ksq))
-        KnightCheckBB[ksq_idx][BLACK].Set(s);
-      if (KnightEffectBB[s_idx][WHITE].Test(ksq))
-        KnightCheckBB[ksq_idx][WHITE].Set(s);
-
-      if (SilverEffectBB[s_idx][BLACK].Test(ksq))
-        SilverCheckBB[ksq_idx][BLACK].Set(s);
-      if (SilverEffectBB[s_idx][WHITE].Test(ksq))
-        SilverCheckBB[ksq_idx][WHITE].Set(s);
-
-      if (GoldEffectBB[s_idx][BLACK].Test(ksq))
-        GoldCheckBB[ksq_idx][BLACK].Set(s);
-      if (GoldEffectBB[s_idx][WHITE].Test(ksq))
-        GoldCheckBB[ksq_idx][WHITE].Set(s);
-
-      // Lance: c-color lance from s with empty occ reaches ksq?
+      if (PawnEffectBB[s_idx][BLACK].Test(ksq))   PawnCheckBB[ksq_idx][BLACK].Set(s);
+      if (PawnEffectBB[s_idx][WHITE].Test(ksq))   PawnCheckBB[ksq_idx][WHITE].Set(s);
+      if (KnightEffectBB[s_idx][BLACK].Test(ksq)) KnightCheckBB[ksq_idx][BLACK].Set(s);
+      if (KnightEffectBB[s_idx][WHITE].Test(ksq)) KnightCheckBB[ksq_idx][WHITE].Set(s);
+      if (SilverEffectBB[s_idx][BLACK].Test(ksq)) SilverCheckBB[ksq_idx][BLACK].Set(s);
+      if (SilverEffectBB[s_idx][WHITE].Test(ksq)) SilverCheckBB[ksq_idx][WHITE].Set(s);
+      if (GoldEffectBB[s_idx][BLACK].Test(ksq))   GoldCheckBB[ksq_idx][BLACK].Set(s);
+      if (GoldEffectBB[s_idx][WHITE].Test(ksq))   GoldCheckBB[ksq_idx][WHITE].Set(s);
       if (LanceEffect(BLACK, s, Bitboard::Zero()).Test(ksq))
         LanceCheckBB[ksq_idx][BLACK].Set(s);
       if (LanceEffect(WHITE, s, Bitboard::Zero()).Test(ksq))
         LanceCheckBB[ksq_idx][WHITE].Set(s);
-
-      // Bishop: symmetric — bishop from s with empty occ reaches ksq?
       if (BishopEffect(s, Bitboard::Zero()).Test(ksq))
         BishopCheckBB[ksq_idx].Set(s);
     }
-
-    // Horse = bishop pattern + 4-cardinal step.
-    // Horse at s attacks ksq via cardinal step iff s is orthogonally
-    // adjacent to ksq, i.e., s ∈ HorseStepBB[ksq] (HorseStepBB is
-    // symmetric for 1-step orthogonal).
     HorseCheckBB[ksq_idx] = BishopCheckBB[ksq_idx] | HorseStepBB[ksq_idx];
+  }
+}
+
+// Build promotion-aware "move-check" tables (Phase 7d).
+//
+// MoveCheckBB[ksq][c] = squares S such that a c-color piece of the
+// given type at S has at least one MOVE that gives check to ksq,
+// INCLUDING promotion variants. Used for the BOARD-MOVE candidate
+// filter in GenerateCheckingMoves.
+//
+// Algorithm mirrors YaneuraOu/cppshogi/init.cpp:initCheckTable.
+//
+// Must be called AFTER InitDirectAttackTables (uses Effect/Slider tables).
+static void InitMoveCheckTables() {
+  for (int ksq_idx = 0; ksq_idx < kSquareNB; ++ksq_idx) {
+    Square ksq = Square::FromIdx(ksq_idx);
+    Bitboard ksq_bit = Bitboard::FromSquare(ksq);
+
+    for (int c_int = 0; c_int < COLOR_NB; ++c_int) {
+      Color c   = Color(c_int);
+      Color opp = ~c;
+      // Promotion zone for c: ranks 0-2 for BLACK, 6-8 for WHITE.
+      Bitboard promo_zone = PromotionZoneBB[c];
+      // "Rank 4" from c's perspective: the rank just outside promo
+      // zone (rank 3 for BLACK, rank 5 for WHITE).
+      Bitboard rank4 = (c == BLACK) ? RankBB[3] : RankBB[5];
+
+      // -------- Gold (no promotion — single part) --------
+      // Used for gold + all promoted-stepper variants (they all move
+      // like gold).
+      {
+        Bitboard tbl = Bitboard::Zero();
+        Bitboard candidates = GoldEffectBB[ksq_idx][opp];
+        while (candidates.Any()) {
+          Square checkSq = candidates.Pop();
+          tbl |= GoldEffectBB[checkSq.as_idx()][opp];
+        }
+        tbl = tbl & ~ksq_bit & ~GoldEffectBB[ksq_idx][opp];
+        GoldMoveCheckBB[ksq_idx][c_int] = tbl;
+      }
+
+      // -------- Silver (Parts 1+2+3) --------
+      {
+        Bitboard tbl = Bitboard::Zero();
+
+        // Part 1: silver moves (no promotion) to a square attacking ksq.
+        {
+          Bitboard candidates = SilverEffectBB[ksq_idx][opp];
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= SilverEffectBB[checkSq.as_idx()][opp];
+          }
+        }
+        // Part 2: silver IN promo zone moves and promotes to gold-attack-ksq.
+        {
+          Bitboard candidates = GoldEffectBB[ksq_idx][opp];
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= (SilverEffectBB[checkSq.as_idx()][opp] & promo_zone);
+          }
+        }
+        // Part 3: silver at rank 4 enters promo zone with promotion → gold attacks ksq.
+        {
+          Bitboard candidates = GoldEffectBB[ksq_idx][opp] & promo_zone;
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= (SilverEffectBB[checkSq.as_idx()][opp] & rank4);
+          }
+        }
+        tbl = tbl & ~ksq_bit & ~SilverEffectBB[ksq_idx][opp];
+        SilverMoveCheckBB[ksq_idx][c_int] = tbl;
+      }
+
+      // -------- Knight --------
+      {
+        Bitboard tbl = Bitboard::Zero();
+        // Part 1: knight moves (no promotion) to a square attacking ksq.
+        {
+          Bitboard candidates = KnightEffectBB[ksq_idx][opp];
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= KnightEffectBB[checkSq.as_idx()][opp];
+          }
+        }
+        // Part 2: knight moves into promo zone and promotes to gold.
+        // YaneuraOu only has one part: gold-attack-ksq squares INSIDE
+        // promo zone, with knight's "from" squares.
+        {
+          Bitboard candidates = GoldEffectBB[ksq_idx][opp] & promo_zone;
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= KnightEffectBB[checkSq.as_idx()][opp];
+          }
+        }
+        // No "subtract attacks" for knight (rare currently-checking case).
+        KnightMoveCheckBB[ksq_idx][c_int] = tbl;
+      }
+
+      // -------- Lance --------
+      {
+        // Start with the file ray (the natural lance reach to ksq).
+        Bitboard tbl = LanceEffect(opp, ksq, Bitboard::Zero());
+        // Add: squares from which lance moves to ksq's gold-attack-zone
+        // INSIDE promo zone (lance promotes to gold there).
+        Bitboard candidates = GoldEffectBB[ksq_idx][opp] & promo_zone;
+        while (candidates.Any()) {
+          Square checkSq = candidates.Pop();
+          tbl |= LanceEffect(opp, checkSq, Bitboard::Zero());
+        }
+        // Subtract: ksq itself and pawn-attack-ksq squares (already-checking).
+        tbl = tbl & ~ksq_bit & ~PawnEffectBB[ksq_idx][opp];
+        LanceMoveCheckBB[ksq_idx][c_int] = tbl;
+      }
+
+      // -------- Pawn --------
+      {
+        Bitboard tbl = Bitboard::Zero();
+        // Part 1: pawn moves to a square attacking ksq (non-promoting).
+        {
+          Bitboard candidates = PawnEffectBB[ksq_idx][opp];
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= PawnEffectBB[checkSq.as_idx()][opp];
+          }
+        }
+        // Part 2: pawn moves to a square inside promo zone where (as
+        // gold) it attacks ksq.
+        {
+          Bitboard candidates = GoldEffectBB[ksq_idx][opp] & promo_zone;
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= PawnEffectBB[checkSq.as_idx()][opp];
+          }
+        }
+        tbl = tbl & ~ksq_bit;
+        PawnMoveCheckBB[ksq_idx][c_int] = tbl;
+      }
+
+      // -------- Bishop --------
+      {
+        Bitboard tbl = Bitboard::Zero();
+        // Part 1: bishop moves to a square attacking ksq (non-promoting).
+        {
+          Bitboard candidates = BishopEffect(ksq, Bitboard::Zero());
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= BishopEffect(checkSq, Bitboard::Zero());
+          }
+        }
+        // Part 2: bishop promotes (target in promo zone) — promoted
+        // bishop = horse, which adds king-step around it. So checkSq
+        // is around ksq IN promo zone, and our bishop reaches it.
+        {
+          Bitboard candidates = KingEffectBB[ksq_idx] & promo_zone;
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= BishopEffect(checkSq, Bitboard::Zero());
+          }
+        }
+        // Part 3: bishop in promo zone moves (and promotes — horse
+        // step). Our bishop is in promo zone, target is around ksq.
+        {
+          Bitboard candidates = KingEffectBB[ksq_idx];
+          while (candidates.Any()) {
+            Square checkSq = candidates.Pop();
+            tbl |= BishopEffect(checkSq, Bitboard::Zero()) & promo_zone;
+          }
+        }
+        tbl = tbl & ~ksq_bit;
+        BishopMoveCheckBB[ksq_idx][c_int] = tbl;
+      }
+
+      // -------- Horse (color-symmetric, no promotion) --------
+      // Compute once per ksq (when c_int == 0) since it's symmetric.
+      if (c_int == 0) {
+        Bitboard tbl = Bitboard::Zero();
+        // Horse attack pattern = bishop diagonals + 4-cardinal step.
+        Bitboard candidates = BishopEffect(ksq, Bitboard::Zero()) | HorseStepBB[ksq_idx];
+        while (candidates.Any()) {
+          Square checkSq = candidates.Pop();
+          tbl |= BishopEffect(checkSq, Bitboard::Zero()) | HorseStepBB[checkSq.as_idx()];
+        }
+        tbl = tbl & ~ksq_bit;
+        HorseMoveCheckBB[ksq_idx] = tbl;
+      }
+    }
   }
 }
 
@@ -327,8 +502,11 @@ void Init() {
   // Qugiy sliding attack masks.
   InitQugiyMasks();
 
-  // Check tables (must be after step + slider tables are ready).
-  InitCheckTables();
+  // Direct-attack check tables (used for drop classification).
+  InitDirectAttackTables();
+
+  // Promotion-aware move-check tables (used for board-move filtering).
+  InitMoveCheckTables();
 }
 
 }  // namespace ShogiTables

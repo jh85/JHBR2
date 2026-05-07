@@ -400,13 +400,40 @@ extern Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
 //   HorseCheckBB   ↔ horseCheckTable  (color-symmetric)
 // (No table for rook/dragon: any rook/dragon could potentially check.)
 //
+// Direct-attack tables: PieceCheckBB[ksq][c] = squares from which a
+// c-color piece of the given type DIRECTLY attacks ksq (no movement
+// or promotion involved). Used for DROP classification only — drops
+// can't promote, so we only need direct-attack semantics.
 extern Bitboard PawnCheckBB  [kSquareNB][COLOR_NB];
 extern Bitboard KnightCheckBB[kSquareNB][COLOR_NB];
 extern Bitboard SilverCheckBB[kSquareNB][COLOR_NB];
 extern Bitboard GoldCheckBB  [kSquareNB][COLOR_NB];
 extern Bitboard LanceCheckBB [kSquareNB][COLOR_NB];
-extern Bitboard BishopCheckBB[kSquareNB];
-extern Bitboard HorseCheckBB [kSquareNB];
+extern Bitboard BishopCheckBB[kSquareNB];   // color-symmetric for direct attack
+extern Bitboard HorseCheckBB [kSquareNB];   // color-symmetric
+
+// Move-check tables: PieceMoveCheckBB[ksq][c] = squares S such that a
+// c-color piece of the given type at S has at least one MOVE giving
+// check to ksq, INCLUDING promotion variants.
+//
+// Used as a candidate filter for board-move classification: a piece
+// at S can possibly give check iff S ∈ MoveCheckBB[ksq][c]. (Drops
+// don't use these — they use the direct-attack tables above.)
+//
+// Mirrors YaneuraOu's checkTable construction (init.cpp:initCheckTable).
+// Only piece types that can promote get a MoveCheckBB; non-promoting
+// types (gold, king) reuse their direct-attack table.
+extern Bitboard PawnMoveCheckBB  [kSquareNB][COLOR_NB];
+extern Bitboard KnightMoveCheckBB[kSquareNB][COLOR_NB];
+extern Bitboard SilverMoveCheckBB[kSquareNB][COLOR_NB];
+extern Bitboard LanceMoveCheckBB [kSquareNB][COLOR_NB];
+extern Bitboard BishopMoveCheckBB[kSquareNB][COLOR_NB];   // per-color due to promo zone asymmetry
+// Non-promoting types still need MoveCheckBB ("squares from which the
+// piece could move-and-attack ksq") even though they don't have
+// promotion variants — because a gold/horse at src isn't currently
+// attacking ksq (illegal), but could move to a checking square.
+extern Bitboard GoldMoveCheckBB  [kSquareNB][COLOR_NB];
+extern Bitboard HorseMoveCheckBB [kSquareNB];   // color-symmetric
 
 // BetweenBB[sq1][sq2]: squares strictly between sq1 and sq2 on the same
 // rank, file, or diagonal. Empty if not aligned.

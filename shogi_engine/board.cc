@@ -613,6 +613,24 @@ MoveList ShogiBoard::GenerateCheckingMoves() {
   // Pieces that, if moved, may discover check.
   Bitboard our_blockers = ComputeBlockersForKing(them) & pieces(us);
 
+  // Direct-check candidates: pieces whose source square is in the
+  // promotion-aware MoveCheckBB. A piece NOT in this set can't possibly
+  // give direct check via any move (incl. promotion). Rooks/dragons
+  // are universal candidates (no zone constraint).
+  Bitboard direct_candidates =
+      (pieces(us, kPawn)   & ShogiTables::PawnMoveCheckBB[ksq_idx][us])   |
+      (pieces(us, kLance)  & ShogiTables::LanceMoveCheckBB[ksq_idx][us])  |
+      (pieces(us, kKnight) & ShogiTables::KnightMoveCheckBB[ksq_idx][us]) |
+      (pieces(us, kSilver) & ShogiTables::SilverMoveCheckBB[ksq_idx][us]) |
+      ((pieces(us, kGold)     | pieces(us, kProPawn) |
+        pieces(us, kProLance) | pieces(us, kProKnight) |
+        pieces(us, kProSilver)) & ShogiTables::GoldMoveCheckBB[ksq_idx][us]) |
+      (pieces(us, kBishop) & ShogiTables::BishopMoveCheckBB[ksq_idx][us]) |
+      (pieces(us, kHorse)  & ShogiTables::HorseMoveCheckBB[ksq_idx])      |
+       pieces(us, kRook) | pieces(us, kDragon);
+
+  Bitboard candidate_pieces = direct_candidates | our_blockers;
+
   MoveList legal = GenerateLegalMoves();
   MoveList result;
   result.reserve(legal.size());
@@ -667,15 +685,10 @@ MoveList ShogiBoard::GenerateCheckingMoves() {
         }
       }
     } else {
-      // Board move: classify the move's check-giving status.
-      //
-      // We can't pre-filter by source square using CheckBB because of
-      // promotion-induced check: a silver at 5d isn't in
-      // SilverCheckBB[5b], but the move 5d5c+ (promote silver→gold)
-      // at 5c could attack 5b. So we have to check each move's
-      // post-move attack pattern. Future optimization (Phase 7d):
-      // build promotion-aware candidate tables.
+      // Board move: filter by candidate set (promotion-aware MoveCheckBB).
       Square src = m.from();
+      if (!candidate_pieces.Test(src)) continue;
+
       Square dst = m.to();
       PieceType pt = piece_on(src).GetType();
       if (m.is_promotion()) pt = pt.Promote();
