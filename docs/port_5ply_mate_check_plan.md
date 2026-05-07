@@ -208,6 +208,157 @@ The port is "done" when all of these are true:
 | 3. Testing | 1.0 day |
 | 4. Real-play validation | 0.5 day |
 | 5. Rollout | 0.5 day |
+| 6. (Optional follow-up) `GenerateCheckingMoves` | 3–5 days |
+
+---
+
+## Phase 6 (optional follow-up): specialized `GenerateCheckingMoves`
+
+This phase is **only triggered if Phase 4 performance measurement
+shows that move generation is still the bottleneck**. Phases 0–5
+ship a working, fast 5-ply check using a filter (`GenerateLegalMoves()`
++ filter-by-`MoveGivesCheck`). That filter approach is ~50–200× faster
+than df-pn — the big win — but it's still ~100–300× slower than
+dlshogi's specialized check generator.
+
+### Trade-off captured at the time of writing this plan
+
+| Approach | Per-OR-node cost | 5-ply cost | vs df-pn |
+|---|---|---|---|
+| Filter (Phase 1 default) | ~5–15 μs | ~25–150 μs | 50–200× faster |
+| Specialized generator | ~500 ns – 2 μs | ~5–10 μs | another 100–300× faster |
+
+So Phase 6 is the optimization that closes the remaining gap with
+dlshogi. **Decision rule: only do Phase 6 if NPS in tactical positions
+is still below ~3000/sec after Phase 5.**
+
+### Why this is a separate phase, not part of Phase 1
+
+- Modifies `ShogiBoard` (the fundamental building block). Higher risk
+  than the rest of the port, which only adds new files.
+- Bundling it with Phase 1 makes debugging harder: if a strength
+  regression shows up, you'd need to disambiguate between bug-in-mate-
+  templates vs bug-in-new-move-generator.
+- Phase 4 perf measurement may show the filter is fast enough in
+  practice, in which case Phase 6 is unnecessary.
+
+### Safety principle: "additive only"
+
+Add `GenerateCheckingMoves()` as a **new method on `ShogiBoard`**.
+Never modify `GenerateLegalMoves()` or any existing method. Every
+existing call site is untouched, so the worst-case bug is contained
+to the new mate check itself.
+
+```cpp
+class ShogiBoard {
+public:
+  MoveList GenerateLegalMoves();      // unchanged
+  MoveList GenerateCheckingMoves();   // NEW — only used by mate check
+  // ...
+};
+```
+
+### Implementation sketch
+
+For each position, generate moves that produce check via:
+
+1. **Direct checks** — moves to a square that attacks the enemy king:
+   - Compute `direct_check_squares` per piece type using existing
+     attack-pattern helpers (`pawn_attacks_from`, `bishop_attacks`, ...)
+   - For each of our pieces of type T, intersect its legal-move
+     destinations with `direct_check_squares[T]`
+
+2. **Discovered checks** — moves of pieces that block sliding attacks
+   on the enemy king:
+   - `our_blockers = ComputeBlockersForKing(opponent_color) & our_pieces`
+   - Any move of a blocker (to a square not on the king-line) is a
+     discovered check
+
+3. **Drops** — drops that attack the enemy king:
+   - For each piece type in hand, drops on `direct_check_squares[T]`
+   - Filter out illegal drops (uchifuzume, two-pawn rule, etc. — reuse
+     existing drop legality logic)
+
+4. **Promotion**: each generated move that's eligible for promotion
+   needs to consider both promote and no-promote variants. The check
+   status may differ between them (e.g., promoting silver → gold
+   changes attack pattern → may or may not still be check).
+
+Reuse existing primitives:
+
+| Primitive | Used for |
+|---|---|
+| `AttackersTo(sq, occ)` | Sanity-checking after computing direct checks |
+| `ComputeBlockersForKing(c)` | Discovered checks |
+| `IsLegal(m, pinned)` | Filter pinned-piece illegal moves |
+| `ComputeGameResult` | Already handles uchifuzume — verify drop generation respects it |
+
+### Testing strategy (the key safety net)
+
+The filter approach IS the oracle. It's guaranteed correct (just
+slow). So the property test is exact equivalence:
+
+```cpp
+// Property: for every position, the two methods produce equal sets.
+void test_GenerateCheckingMoves_matches_oracle(const ShogiBoard& b) {
+    auto specialized = b.GenerateCheckingMoves();
+    auto oracle = filter(b.GenerateLegalMoves(),
+                         [&](Move m){ return MoveGivesCheck(b, m); });
+    ASSERT_EQ(set_of(specialized), set_of(oracle))
+        << "Mismatch at position: " << b.sfen();
+}
+```
+
+#### Test corpus tiers (run all of them):
+
+1. **Hand-curated mate-in-N positions** (~100 positions): correctness
+   on cases known to involve discovered checks, double checks,
+   promotion-conditional checks, drop checks
+2. **Random legal positions** (~10,000): edge cases that real games
+   might not exercise
+3. **Real-game positions from training data** (~1B): if Phase 5 shards
+   exist, run the property test over the full converted training data.
+   Effectively exhaustive coverage on positions that occur in practice.
+4. **Adversarial positions**: positions with maximum complexity (many
+   pinned pieces, many drops, promotion zone, in-check)
+
+The test suite should pass on **every single position in tier 3** before
+the new generator is wired into the mate check.
+
+### Acceptance criteria for Phase 6
+
+- ✅ Property test passes on all 4 tiers (especially: zero failures
+  across the entire training-data corpus)
+- ✅ Microbenchmark shows ≥10× speedup on `GenerateCheckingMoves` vs
+  filtered `GenerateLegalMoves`
+- ✅ End-to-end mate check is ≥3× faster than the Phase 1 filter
+  version
+- ✅ Integration test: 5-ply check verdicts (mate / no-mate) are
+  identical to Phase 1 filter version on a 100K-position corpus
+- ✅ 100-game match shows no Elo regression vs Phase 1 filter version
+
+### Wire-up
+
+Phase 6 is a one-line change in the mate-check code:
+
+```cpp
+// Before (Phase 1):
+auto moves = filter(b.GenerateLegalMoves(), MoveGivesCheck);
+
+// After (Phase 6):
+auto moves = b.GenerateCheckingMoves();
+```
+
+Keep both paths behind a flag during validation:
+
+```cpp
+auto moves = config_.use_specialized_check_generator
+           ? b.GenerateCheckingMoves()
+           : filter(b.GenerateLegalMoves(), MoveGivesCheck);
+```
+
+Once Phase 6 acceptance criteria pass, default the flag to true and
+delete the filter path in a separate commit.
 
 ---
 

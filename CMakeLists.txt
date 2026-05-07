@@ -160,3 +160,7 @@ target_link_libraries(bench_movegen PRIVATE shogi_core)
 # ---- Test: mate problem solver ----
 add_executable(test_mate test/test_mate.cc)
 target_link_libraries(test_mate PRIVATE mate_solver shogi_core)
+
+# ---- Test: shallow mate (Phase 0+) ----
+add_executable(test_shallow_mate test/test_shallow_mate.cc)
+target_link_libraries(test_shallow_mate PRIVATE shogi_core)
