@@ -100,10 +100,12 @@ template <int depth, bool INCHECK = false> bool MateInOddPly(ShogiBoard& board);
 template <bool INCHECK = false>
 inline bool MateIn3Ply(ShogiBoard& board) {
     // OR node (depth 1): try each checking move.
-    auto checking_moves = board.GenerateLegalMoves();
+    // Use specialized GenerateCheckingMoves (Phase 6) — direct
+    // bitboard-based enumeration of moves that cause check, ~10–50×
+    // faster than GenerateLegalMoves + filter.
+    auto checking_moves = board.GenerateCheckingMoves();
     for (size_t i = 0; i < checking_moves.size(); ++i) {
         Move m1 = checking_moves[i];
-        if (!MoveGivesCheck(board, m1)) continue;
 
         UndoInfo undo1 = board.DoMove(m1);
 
@@ -161,11 +163,11 @@ inline bool MateIn3Ply(ShogiBoard& board) {
             }
 
             // OR node (depth 3): attacker plays mate-in-1.
-            auto attacker_moves = board.GenerateLegalMoves();
+            // Specialized check-only generator (Phase 6).
+            auto attacker_moves = board.GenerateCheckingMoves();
             bool found_mate1 = false;
             for (size_t k = 0; k < attacker_moves.size(); ++k) {
                 Move m3 = attacker_moves[k];
-                if (!MoveGivesCheck(board, m3)) continue;
                 UndoInfo undo3 = board.DoMove(m3);
                 if (board.GenerateLegalMoves().empty()) {
                     found_mate1 = true;
@@ -200,10 +202,10 @@ inline bool MateInOddPly(ShogiBoard& board) {
     static_assert(depth >= 1 && (depth % 2) == 1,
                   "MateInOddPly: depth must be positive odd");
 
-    auto moves = board.GenerateLegalMoves();
+    // Specialized check-only generator (Phase 6).
+    auto moves = board.GenerateCheckingMoves();
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
-        if (!MoveGivesCheck(board, m)) continue;
 
         UndoInfo undo = board.DoMove(m);
 
@@ -306,10 +308,9 @@ inline bool MateInOddPly<3, true>(ShogiBoard& board) {
 // MateInOddPly<1> — direct mate-in-1 detection
 template <>
 inline bool MateInOddPly<1, false>(ShogiBoard& board) {
-    auto moves = board.GenerateLegalMoves();
+    auto moves = board.GenerateCheckingMoves();
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
-        if (!MoveGivesCheck(board, m)) continue;
         UndoInfo undo = board.DoMove(m);
         bool no_escape = board.GenerateLegalMoves().empty();
         board.UndoMove(m, undo);

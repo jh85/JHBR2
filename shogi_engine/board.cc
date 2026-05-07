@@ -539,6 +539,92 @@ MoveList ShogiBoard::GenerateLegalMoves() {
   return legal;
 }
 
+// =====================================================================
+// GenerateCheckingMoves: subset of legal moves that give check.
+// =====================================================================
+//
+// For each legal move, classify "gives check" via bitboard ops without
+// DoMove/UndoMove. Two cases:
+//
+//   1. Direct check: post-move, the piece at the destination attacks
+//      the enemy king. Computed as
+//          PieceAttacks(post_move_type, us, dst, occ_after) ∋ king_sq
+//
+//   2. Discovered check: a piece moves out of the way of one of OUR
+//      sliders that would then attack the enemy king. Only possible
+//      if the moved piece was a "blocker" (sat on a king-line of one
+//      of our sliders) AND the destination square is not on that
+//      same line.
+//
+// Drops can only give direct check (no piece is moved out of the way).
+//
+// The implementation uses a fall-back DoMove/UndoMove for the rare
+// discovered-check candidates, keeping the code simple while
+// preserving the speedup on the common direct-check path.
+//
+MoveList ShogiBoard::GenerateCheckingMoves() {
+  Color us = side_to_move_;
+  Color them = ~us;
+  Square king_sq = king_sq_[them];
+  Bitboard occ = occupied();
+
+  // Pieces that, if moved, may discover a check.
+  // ComputeBlockersForKing(them) returns pieces (any color) blocking
+  // attackers of the enemy king. The attackers behind those blockers
+  // are necessarily of the opposite color (us). So the intersection
+  // with our pieces gives our pieces whose movement may expose check.
+  Bitboard our_blockers = ComputeBlockersForKing(them) & pieces(us);
+
+  MoveList legal = GenerateLegalMoves();
+  MoveList result;
+  result.reserve(legal.size());
+
+  for (size_t i = 0; i < legal.size(); ++i) {
+    const Move m = legal[i];
+    bool gives_check = false;
+
+    if (m.is_drop()) {
+      // Drops can only give direct check.
+      PieceType pt = m.drop_piece();
+      Square dst = m.to();
+      Bitboard occ_after = occ;
+      occ_after.Set(dst);
+      gives_check = PieceAttacks(pt, us, dst, occ_after).Test(king_sq);
+    } else {
+      Square src = m.from();
+      Square dst = m.to();
+      PieceType pt = piece_on(src).GetType();
+      if (m.is_promotion()) pt = pt.Promote();
+
+      // Post-move occupancy: src cleared, dst set. (If dst was a
+      // capture target, the bit was already set; the result is the
+      // same — dst is set after.)
+      Bitboard occ_after = occ;
+      occ_after.Clear(src);
+      occ_after.Set(dst);
+
+      // Direct check.
+      if (PieceAttacks(pt, us, dst, occ_after).Test(king_sq)) {
+        gives_check = true;
+      } else if (our_blockers.Test(src)) {
+        // Discovered-check candidate. Verify with do/undo (rare path,
+        // correctness > micro-perf here). The temporary DoMove gives
+        // us the post-move attackers automatically.
+        UndoInfo undo = DoMove(m);
+        // After DoMove, side_to_move flipped to `them`. InCheck() with
+        // no arg checks the current side-to-move's king — exactly the
+        // enemy king we care about.
+        gives_check = InCheck();
+        UndoMove(m, undo);
+      }
+    }
+
+    if (gives_check) result.push_back(m);
+  }
+
+  return result;
+}
+
 bool ShogiBoard::IsLegal(Move m, const Bitboard& pinned) {
   Color us = side_to_move_;
   Square ksq = king_sq_[us];

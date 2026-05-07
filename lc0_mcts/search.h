@@ -119,7 +119,11 @@ struct SearchConfig {
 
   // Search depth (plies) when leaf_mate_mode == kShallow.
   // Must be odd; supported values: 1, 3, 5, 7.
-  int leaf_mate_depth = 5;
+  // Default 3: provides best NPS-vs-coverage tradeoff. Depth 5 explores
+  // a much wider tree without catching meaningfully more mates than
+  // df-pn finds at LeafDfpnNodes=10. Mate-in-5+ detection is better
+  // handled by a background PV mate thread (future work).
+  int leaf_mate_depth = 3;
 
   // Multi-GPU: number of GPUs (1 or 2).
   int num_gpus = 1;

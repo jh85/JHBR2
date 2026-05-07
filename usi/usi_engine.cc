@@ -102,7 +102,7 @@ void USIEngine::CmdUsi() {
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
   Send("option name LeafMateMode type combo default dfpn var off var dfpn var shallow");
-  Send("option name LeafMateDepth type spin default 5 min 1 max 7");
+  Send("option name LeafMateDepth type spin default 3 min 1 max 7");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");

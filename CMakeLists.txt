@@ -168,3 +168,7 @@ target_link_libraries(test_shallow_mate PRIVATE mate_solver shogi_core)
 # ---- Bench: shallow mate vs df-pn ----
 add_executable(bench_shallow_mate test/bench_shallow_mate.cc)
 target_link_libraries(bench_shallow_mate PRIVATE mate_solver shogi_core)
+
+# ---- Test: GenerateCheckingMoves property test ----
+add_executable(test_check_movegen test/test_check_movegen.cc)
+target_link_libraries(test_check_movegen PRIVATE shogi_core)
