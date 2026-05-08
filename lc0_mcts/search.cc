@@ -414,12 +414,21 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
     float best_score = -1e10f;
     Edge_Iterator<false> best_edge;
 
+    const float vl_weight = config_.virtual_loss_weight;
     for (auto edge = node->Edges(); edge != edge.end(); ++edge) {
       float q = (edge.HasNode() && edge.GetN() > 0)
                     ? edge.GetQ(fpu, draw_score) : fpu;
       if (!std::isfinite(q)) q = 0.0f;
-      int n_started = (edge.HasNode()) ? edge.GetNStarted() : 0;
-      float u = edge.GetP() * puct_mult / (1 + n_started);
+      // Standard lc0 uses n_started = N + N_in_flight for U's denominator.
+      // We scale only the in-flight portion by virtual_loss_weight so a
+      // weight > 1.0 amplifies repulsion at contended nodes without
+      // distorting U at fully-resolved nodes.
+      const int n_real = edge.HasNode() ? static_cast<int>(edge.GetN()) : 0;
+      const int n_inflight =
+          edge.HasNode() ? static_cast<int>(edge.GetNInFlight()) : 0;
+      const float weighted_started =
+          static_cast<float>(n_real) + vl_weight * static_cast<float>(n_inflight);
+      float u = edge.GetP() * puct_mult / (1.0f + weighted_started);
       float score = q + u;
       if (!std::isfinite(score)) score = fpu;
       if (best_edge.edge() == nullptr || score > best_score) {

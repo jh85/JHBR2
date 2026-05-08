@@ -106,6 +106,7 @@ void USIEngine::CmdUsi() {
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name MaxGpuBatch type spin default 4096 min 64 max 16384");
+  Send("option name VirtualLossWeight type string default 1.0");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
@@ -193,6 +194,11 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
     lc0_config_.num_gpus = num_gpus_;
+  } else if (name_lower == "virtuallossweight") {
+    float w = std::stof(value);
+    if (w < 0.1f) w = 0.1f;
+    if (w > 100.0f) w = 100.0f;
+    lc0_config_.virtual_loss_weight = w;
   } else if (name_lower == "maxgpubatch") {
     max_gpu_batch_ = std::stoi(value);
     lc0_config_.max_gpu_batch = max_gpu_batch_;
