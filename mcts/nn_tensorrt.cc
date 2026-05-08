@@ -93,11 +93,17 @@ struct NNEvaluator::Impl {
   void* d_wdl = nullptr;
   void* d_mlh = nullptr;
 
-  // Host buffers.
-  std::vector<float> h_input;
-  std::vector<float> h_policy;
-  std::vector<float> h_wdl;
-  std::vector<float> h_mlh;
+  // Pinned host buffers (allocated via cudaMallocHost so that
+  // cudaMemcpyAsync can actually overlap with computation; with a
+  // pageable buffer the call falls back to synchronous behavior).
+  float* h_input  = nullptr;
+  float* h_policy = nullptr;
+  float* h_wdl    = nullptr;
+  float* h_mlh    = nullptr;
+  size_t h_input_count  = 0;   // floats, not bytes
+  size_t h_policy_count = 0;
+  size_t h_wdl_count    = 0;
+  size_t h_mlh_count    = 0;
 
   // Output sizes per sample.
   int policy_size = 0;
@@ -106,11 +112,15 @@ struct NNEvaluator::Impl {
   cudaStream_t stream = nullptr;
 
   ~Impl() {
-    if (d_input) cudaFree(d_input);
+    if (d_input)  cudaFree(d_input);
     if (d_policy) cudaFree(d_policy);
-    if (d_wdl) cudaFree(d_wdl);
-    if (d_mlh) cudaFree(d_mlh);
-    if (stream) cudaStreamDestroy(stream);
+    if (d_wdl)    cudaFree(d_wdl);
+    if (d_mlh)    cudaFree(d_mlh);
+    if (h_input)  cudaFreeHost(h_input);
+    if (h_policy) cudaFreeHost(h_policy);
+    if (h_wdl)    cudaFreeHost(h_wdl);
+    if (h_mlh)    cudaFreeHost(h_mlh);
+    if (stream)   cudaStreamDestroy(stream);
   }
 };
 
@@ -215,11 +225,22 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
   CUDA_CHECK(cudaMalloc(&impl_->d_wdl, B * 3 * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&impl_->d_mlh, B * 1 * sizeof(float)));
 
-  // Allocate host buffers.
-  impl_->h_input.resize(B * C * 81);
-  impl_->h_policy.resize(B * P);
-  impl_->h_wdl.resize(B * 3);
-  impl_->h_mlh.resize(B * 1);
+  // Allocate pinned host buffers. Pinned memory enables true async
+  // overlap between H2D copy, kernel execution, and D2H copy in
+  // cudaMemcpyAsync calls (with pageable memory the calls fall back
+  // to synchronous behavior internally).
+  impl_->h_input_count  = static_cast<size_t>(B) * C * 81;
+  impl_->h_policy_count = static_cast<size_t>(B) * P;
+  impl_->h_wdl_count    = static_cast<size_t>(B) * 3;
+  impl_->h_mlh_count    = static_cast<size_t>(B) * 1;
+  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_input),
+                            impl_->h_input_count * sizeof(float)));
+  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_policy),
+                            impl_->h_policy_count * sizeof(float)));
+  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_wdl),
+                            impl_->h_wdl_count * sizeof(float)));
+  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_mlh),
+                            impl_->h_mlh_count * sizeof(float)));
 }
 
 NNEvaluator::~NNEvaluator() = default;
@@ -272,12 +293,12 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   }
 
   // Encode input planes (zero-padded to run_batch).
-  std::fill(impl_->h_input.begin(),
-            impl_->h_input.begin() + run_batch * C * sq, 0.0f);
+  std::fill(impl_->h_input,
+            impl_->h_input + static_cast<size_t>(run_batch) * C * sq, 0.0f);
 
   for (int b = 0; b < batch_size; b++) {
     auto planes = EncodeShogiPosition(batch[b].first);
-    float* dst = impl_->h_input.data() + b * C * sq;
+    float* dst = impl_->h_input + b * C * sq;
     for (int c = 0; c < C && c < kShogiInputPlanes; c++) {
       std::copy(planes[c].data, planes[c].data + sq, dst + c * sq);
     }
@@ -296,7 +317,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   }
 
   // Copy input to GPU (full run_batch, including padding).
-  CUDA_CHECK(cudaMemcpyAsync(impl_->d_input, impl_->h_input.data(),
+  CUDA_CHECK(cudaMemcpyAsync(impl_->d_input, impl_->h_input,
       run_batch * C * sq * sizeof(float),
       cudaMemcpyHostToDevice, impl_->stream));
 
@@ -307,10 +328,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   }
 
   // Copy outputs to host (only need batch_size results, but copy run_batch for simplicity).
-  CUDA_CHECK(cudaMemcpyAsync(impl_->h_policy.data(), impl_->d_policy,
+  CUDA_CHECK(cudaMemcpyAsync(impl_->h_policy, impl_->d_policy,
       run_batch * P * sizeof(float),
       cudaMemcpyDeviceToHost, impl_->stream));
-  CUDA_CHECK(cudaMemcpyAsync(impl_->h_wdl.data(), impl_->d_wdl,
+  CUDA_CHECK(cudaMemcpyAsync(impl_->h_wdl, impl_->d_wdl,
       run_batch * 3 * sizeof(float),
       cudaMemcpyDeviceToHost, impl_->stream));
 
@@ -327,8 +348,8 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 
     // WDL softmax.
     float wdl[3];
-    std::copy(impl_->h_wdl.data() + b * 3,
-              impl_->h_wdl.data() + b * 3 + 3, wdl);
+    std::copy(impl_->h_wdl + b * 3,
+              impl_->h_wdl + b * 3 + 3, wdl);
     Softmax(wdl, 3);
     result.wdl[0] = wdl[0];
     result.wdl[1] = wdl[1];
@@ -337,7 +358,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     result.draw = wdl[1];
 
     // Policy.
-    float* logits = impl_->h_policy.data() + b * P;
+    float* logits = impl_->h_policy + b * P;
     bool is_white = (board.side_to_move() == lczero::WHITE);
 
     std::vector<float> legal_logits(legal_moves.size());
