@@ -77,7 +77,7 @@ struct NNEvaluator::Impl {
 };
 
 NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
-                         int device_id)
+                         int device_id, int max_batch_size)
     : impl_(std::make_unique<Impl>()) {
 
   ShogiEncoderTables::Init();
@@ -99,15 +99,24 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
       OrtTensorRTProviderOptionsV2* trt_provider_opts = nullptr;
       Ort::GetApi().CreateTensorRTProviderOptions(&trt_provider_opts);
 
-      // Dynamic batch profiles: min=1, opt=32, max=128.
-      // ONNX Runtime builds a TensorRT engine with these optimization profiles,
-      // so any batch size 1-128 runs efficiently without padding.
+      // Dynamic batch profiles: min=1, opt=32, max=max_batch_size.
+      // ONNX Runtime builds a TensorRT engine with these optimization
+      // profiles, so any batch size in [min, max] runs efficiently
+      // without padding. max_batch_size is set by the USI MaxGpuBatch
+      // option (default 4096); going higher costs build time and
+      // workspace memory but is needed when MinibatchSize * Threads
+      // can exceed it.
+      const int trt_max = max_batch_size > 0 ? max_batch_size : 1024;
       std::string min_shapes = "input_planes:1x" + std::to_string(kShogiInputPlanes) + "x9x9";
       std::string opt_shapes = "input_planes:32x" + std::to_string(kShogiInputPlanes) + "x9x9";
-      std::string max_shapes = "input_planes:1024x" + std::to_string(kShogiInputPlanes) + "x9x9";
+      std::string max_shapes = "input_planes:" + std::to_string(trt_max) +
+                               "x" + std::to_string(kShogiInputPlanes) + "x9x9";
 
       std::string device_id_str = std::to_string(device_id);
-      std::string cache_path = "./trt_cache/gpu" + device_id_str;
+      // Per-(GPU, max_batch) cache dir so changing MaxGpuBatch doesn't
+      // load a stale TRT engine built with a different profile.
+      std::string cache_path = "./trt_cache/gpu" + device_id_str +
+                               "_b" + std::to_string(trt_max);
       std::system(("mkdir -p " + cache_path + " 2>/dev/null").c_str());
       std::vector<const char*> trt_keys = {
         "device_id",
@@ -126,9 +135,9 @@ NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
         "1",                    // Enable FP16
         "1",                    // Cache the TRT engine
         cache_path.c_str(),     // Per-GPU cache directory
-        min_shapes.c_str(),     // Min batch = 1
-        opt_shapes.c_str(),     // Optimal batch = 32
-        max_shapes.c_str(),     // Max batch = 512
+        min_shapes.c_str(),     // Min batch
+        opt_shapes.c_str(),     // Optimal batch
+        max_shapes.c_str(),     // Max batch (= MaxGpuBatch)
         "3",                    // Builder optimization level
       };
       Ort::GetApi().UpdateTensorRTProviderOptions(
@@ -381,7 +390,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 // Stub implementation.
 struct NNEvaluator::Impl {};
 
-NNEvaluator::NNEvaluator(const std::string&, bool)
+NNEvaluator::NNEvaluator(const std::string&, bool, int, int)
     : impl_(std::make_unique<Impl>()) {
   ShogiEncoderTables::Init();
 }

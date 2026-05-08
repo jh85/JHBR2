@@ -81,11 +81,15 @@ class Computation {
 class Backend {
  public:
   // N-GPU constructor. Pass pointers to all evaluators (one per GPU).
+  // max_gpu_batch caps the combined batch submitted to a single GPU
+  // call; oversize batches are chunked. Must be ≤ each evaluator's
+  // TRT max profile.
   Backend(std::vector<NNEvaluator*> evaluators, int num_workers = 1,
-          size_t nn_cache_size = 0)
+          size_t nn_cache_size = 0, int max_gpu_batch = 4096)
       : evaluators_(std::move(evaluators)),
         num_workers_(num_workers),
-        nn_cache_(nn_cache_size) {
+        nn_cache_(nn_cache_size),
+        max_gpu_batch_(max_gpu_batch > 0 ? max_gpu_batch : 4096) {
     if (num_workers_ > 1) {
       worker_results_.resize(num_workers_);
       worker_ready_.resize(num_workers_, false);
@@ -208,6 +212,29 @@ class Backend {
     return results;
   }
 
+  // Chunked variant: caps each GPU call at max_gpu_batch_ and
+  // concatenates results. The TRT engine's max optimization profile
+  // must be ≥ max_gpu_batch_; otherwise the underlying call hits the
+  // setInputShape error and falls back to one-at-a-time.
+  std::vector<NNOutput> EvalChunked(
+      const std::vector<std::pair<ShogiBoard, MoveList>>& batch,
+      int evaluator_idx) {
+    const int total = static_cast<int>(batch.size());
+    if (total <= max_gpu_batch_) {
+      return EvalBatchWithCache(batch, evaluator_idx);
+    }
+    std::vector<NNOutput> out;
+    out.reserve(total);
+    for (int s = 0; s < total; s += max_gpu_batch_) {
+      int e = std::min(s + max_gpu_batch_, total);
+      std::vector<std::pair<ShogiBoard, MoveList>> chunk(
+          batch.begin() + s, batch.begin() + e);
+      auto chunk_results = EvalBatchWithCache(chunk, evaluator_idx);
+      for (auto& r : chunk_results) out.push_back(std::move(r));
+    }
+    return out;
+  }
+
  private:
   friend class Computation;
 
@@ -283,10 +310,12 @@ class Backend {
 
       if (num_gpus <= 1) {
         // Cache-aware: filters hits, sends only misses to GPU 0.
-        all_results = EvalBatchWithCache(combined, /*evaluator_idx=*/0);
+        // Chunk if combined batch exceeds the TRT max profile.
+        all_results = EvalChunked(combined, /*evaluator_idx=*/0);
       } else {
         // Split batch evenly across GPUs. Each GPU's sub-batch goes
-        // through the cache layer (filter + GPU + cache insert).
+        // through the cache layer (filter + GPU + cache insert), and
+        // is itself chunked if it exceeds max_gpu_batch_.
         int per_gpu = (total + num_gpus - 1) / num_gpus;
         std::vector<std::vector<NNOutput>> gpu_results(num_gpus);
         std::vector<std::thread> gpu_threads;
@@ -300,7 +329,7 @@ class Backend {
             try {
               std::vector<std::pair<ShogiBoard, MoveList>> sub(
                   combined.begin() + start, combined.begin() + end);
-              gpu_results[g] = EvalBatchWithCache(sub, /*evaluator_idx=*/g);
+              gpu_results[g] = EvalChunked(sub, /*evaluator_idx=*/g);
             } catch (const std::exception& e) {
               std::cerr << "GPU " << g << " error: " << e.what() << std::endl;
               gpu_error.store(true);
@@ -349,6 +378,7 @@ class Backend {
   std::vector<NNEvaluator*> evaluators_;  // One per GPU
   int num_workers_;
   jhbr2::NNCache nn_cache_;
+  int max_gpu_batch_;
 
   // Solo mode.
   std::mutex gpu_mutex_;

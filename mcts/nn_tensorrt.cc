@@ -125,7 +125,7 @@ struct NNEvaluator::Impl {
 };
 
 NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
-                         int device_id)
+                         int device_id, int /*max_batch_size*/)
     : impl_(std::make_unique<Impl>()) {
 
   CUDA_CHECK(cudaSetDevice(device_id));

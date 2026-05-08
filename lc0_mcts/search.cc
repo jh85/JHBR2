@@ -89,7 +89,8 @@ Search::Search(std::vector<NNEvaluator*> evaluators, const SearchConfig& config)
     : config_(config) {
   backend_ = std::make_unique<Backend>(std::move(evaluators),
                                         config.num_threads,
-                                        config.nn_cache_size);
+                                        config.nn_cache_size,
+                                        config.max_gpu_batch);
 }
 
 Search::~Search() = default;

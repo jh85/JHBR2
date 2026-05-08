@@ -44,8 +44,11 @@ struct NNOutput {
 
 class NNEvaluator {
  public:
+  // max_batch_size is only used by the ONNX Runtime path (nn_eval.cc)
+  // to set the TRT max profile shape. The direct-TRT path here reads
+  // max batch from the prebuilt engine file, so the param is ignored.
   explicit NNEvaluator(const std::string& engine_path, bool use_gpu = true,
-                       int device_id = 0);
+                       int device_id = 0, int max_batch_size = 1024);
   ~NNEvaluator();
 
   NNOutput Evaluate(const ShogiBoard& board, const MoveList& legal_moves);

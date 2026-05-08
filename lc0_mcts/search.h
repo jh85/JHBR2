@@ -133,6 +133,12 @@ struct SearchConfig {
   // Multi-GPU: number of GPUs (1 or 2).
   int num_gpus = 1;
 
+  // Cap for the combined batch sent to a single GPU call from
+  // Backend::GPULoop. If the merged worker submissions exceed this,
+  // GPULoop chunks the batch into back-to-back calls. Must be ≤ the
+  // TRT engine's max profile (NNEvaluator's max_batch_size).
+  int max_gpu_batch = 4096;
+
   // Info callback: called periodically during search for GUI output.
   InfoCallback info_callback = nullptr;
   float info_interval = 1.0f;  // seconds between info outputs

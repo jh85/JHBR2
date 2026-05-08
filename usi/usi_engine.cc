@@ -105,6 +105,7 @@ void USIEngine::CmdUsi() {
   Send("option name LeafMateDepth type spin default 3 min 1 max 7");
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
+  Send("option name MaxGpuBatch type spin default 4096 min 64 max 16384");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
@@ -121,7 +122,8 @@ void USIEngine::CmdIsReady() {
     for (int g = 0; g < num_gpus_; g++) {
       Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
       evaluators_.push_back(
-          std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g));
+          std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
+                                        max_gpu_batch_));
     }
 
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
@@ -191,6 +193,13 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
     lc0_config_.num_gpus = num_gpus_;
+  } else if (name_lower == "maxgpubatch") {
+    max_gpu_batch_ = std::stoi(value);
+    lc0_config_.max_gpu_batch = max_gpu_batch_;
+    // Evaluators bake the TRT max_shapes profile at construction time, so
+    // a change here only takes effect after isready rebuilds them.
+    evaluators_.clear();
+    lc0_search_.reset();
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
