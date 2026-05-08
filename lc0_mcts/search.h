@@ -67,12 +67,14 @@ struct SearchConfig {
   float fpu_value = 0.330f;
   float fpu_value_at_root = 1.0f;
 
-  // Virtual-loss weight applied to in-flight visits in PUCT selection.
-  // U = P * cpuct * sqrt(parent_N) / (1 + N + W * N_in_flight). Higher W
-  // pushes parallel workers off contended children harder. 1.0 = lc0
-  // default (in-flight visits count the same as completed visits in U).
-  // Increase to 2-5 to test stronger collision avoidance; the cost is
-  // exploring lower-policy children when the strongest move is in-flight.
+  // Virtual-loss weight applied to in-flight visits from OTHER workers
+  // in PUCT child selection. U = P * cpuct * sqrt(parent_N) /
+  // (1 + N + W * N_in_flight). Higher W pushes parallel workers off
+  // contended children harder. 1.0 = lc0 default (in-flight visits count
+  // the same as completed visits in U). Increase to 2-5 to test stronger
+  // collision avoidance; the cost is exploring lower-policy children
+  // when the strongest move is in-flight. Applied in both per-leaf and
+  // bulk gathering paths.
   float virtual_loss_weight = 1.0f;
 
   // Noise

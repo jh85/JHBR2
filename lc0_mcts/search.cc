@@ -620,6 +620,7 @@ void SearchWorker::PickNodesToExtendTask(
       const float cpuct = ComputeCpuct(config_, node->GetN(), is_root_node);
       const float puct_mult =
           cpuct * std::sqrt(std::max(node->GetChildrenVisits(), 1u));
+      const float vl_weight = config_.virtual_loss_weight;
       int cache_filled_idx = -1;
 
       // Distribute visits to children via PUCT.
@@ -639,7 +640,17 @@ void SearchWorker::PickNodesToExtendTask(
               cur_iters_[idx] = cur_iters_[idx - 1];
               ++cur_iters_[idx];
             }
-            current_nstarted[idx] = cur_iters_[idx].GetNStarted();
+            // Seed with weighted in-flight from OTHER workers; this
+            // worker's own within-iteration increments below stay at
+            // weight 1 because they will be fulfilled by this same
+            // gather call.
+            const int n_real = static_cast<int>(cur_iters_[idx].GetN());
+            const int n_inflight =
+                static_cast<int>(cur_iters_[idx].GetNInFlight());
+            const float weighted =
+                static_cast<float>(n_real) +
+                vl_weight * static_cast<float>(n_inflight);
+            current_nstarted[idx] = static_cast<int>(weighted + 0.5f);
           }
           int nstarted = current_nstarted[idx];
           const float util = current_util[idx];
