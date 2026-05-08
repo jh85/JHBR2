@@ -393,7 +393,35 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
     lc0_search_ = std::make_unique<lc0_shogi::Search>(eval_ptrs, lc0_config_);
   }
+  // Persistent Search holds its own config snapshot — push per-move
+  // updates so max_time / max_nodes reflect THIS go command, not the
+  // first one ever issued.
+  lc0_search_->SetMaxTime(lc0_config_.max_time);
+  lc0_search_->SetMaxNodes(lc0_config_.max_nodes);
+
+  // Watchdog: hard deadline enforcement. Search::IsSearchActive() is
+  // only checked between worker iterations; if any single iteration
+  // blocks (GPU eval hang, lock contention, large reused tree walk,
+  // first-call TRT compilation, etc.), the search can run far longer
+  // than max_time. The watchdog calls Stop() after hard_deadline_ms
+  // of wall time to guarantee we don't blow past MaxMoveTime.
+  std::atomic<bool> search_done{false};
+  std::thread watchdog([this, &search_done, hard_deadline_ms,
+                        move_start_time]() {
+    while (!search_done.load(std::memory_order_acquire)) {
+      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - move_start_time).count();
+      if (elapsed_ms >= hard_deadline_ms) {
+        if (lc0_search_) lc0_search_->Stop();
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+  });
+
   auto result = lc0_search_->Run(board_, game_ply_);
+  search_done.store(true, std::memory_order_release);
+  watchdog.join();
 
   // --- Stop df-pn and wait ---
   dfpn->solver.stop();

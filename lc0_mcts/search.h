@@ -169,6 +169,13 @@ class Search {
   // Stop search (can be called from another thread).
   void Stop() { stop_.store(true, std::memory_order_release); }
 
+  // Update per-Run config knobs. Persistent Search keeps a snapshot of
+  // SearchConfig from construction time, so per-move updates from the
+  // USI layer (max_time, max_nodes) need to be pushed in explicitly
+  // before each Run.
+  void SetMaxTime(float seconds) { config_.max_time = seconds; }
+  void SetMaxNodes(size_t n) { config_.max_nodes = n; }
+
  private:
   friend class SearchWorker;
 
