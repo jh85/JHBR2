@@ -100,6 +100,20 @@ class Backend {
   // Start/stop GPU thread for shared batching mode.
   void StartGPUThread() {
     if (num_workers_ <= 1) return;
+    // Reset worker-ready flags. StopGPUThread() (called at end of the
+    // previous Run) sets these to true to wake any in-flight waiters,
+    // but in persistent-Search mode that leaves stale "true" flags
+    // for the next Run — workers would then skip their wait and read
+    // empty worker_results_, causing a segfault in FetchMinibatchResults.
+    {
+      std::lock_guard<std::mutex> lock(result_mutex_);
+      for (int i = 0; i < num_workers_; i++) worker_ready_[i] = false;
+      for (auto& wr : worker_results_) wr.clear();
+    }
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      pending_.clear();
+    }
     gpu_stop_.store(false);
     gpu_thread_ = std::thread([this]() { GPULoop(); });
   }

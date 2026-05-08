@@ -402,20 +402,94 @@ void NodeTree::TrimTreeAtHead() {
 
 bool NodeTree::ResetToPosition(const ShogiBoard& board,
                                const std::vector<Move>& moves) {
-  // For simplicity, always rebuild the tree.
-  // TODO: implement tree reuse by comparing positions.
-  DeallocateTree();
+  // Tree reuse: if the new position is reachable from the current
+  // head_board_ by 0, 1, or 2 moves through existing tree edges, just
+  // navigate there via MakeMove (preserves all the visit counts and
+  // NN evaluations in that subtree). Otherwise, fall back to a full
+  // rebuild.
+  //
+  // The typical USI flow is: we play move m0, opponent plays m1,
+  // then `position` arrives with the new board. So 2-ply navigation
+  // is the most common case. 1-ply covers ponder/single-step skip.
+  // 0-ply covers re-search of the same position (rare but cheap).
+  //
+  // We match by board hash. uint64_t Zobrist hash collisions are
+  // negligible at MCTS scale (~10^-15 per pair).
 
-  gamebegin_node_ = std::make_unique<Node>(nullptr, 0);
-  head_board_ = board;
-  ply_count_ = 0;
+  auto rebuild = [&]() {
+    DeallocateTree();
+    gamebegin_node_ = std::make_unique<Node>(nullptr, 0);
+    head_board_ = board;
+    ply_count_ = 0;
+    current_head_ = gamebegin_node_.get();
+    for (const Move& m : moves) {
+      MakeMove(m);
+    }
+    return false;
+  };
 
-  current_head_ = gamebegin_node_.get();
-  for (const Move& m : moves) {
-    MakeMove(m);
+  if (!current_head_ || !gamebegin_node_) {
+    std::fprintf(stderr, "info string tree_reuse: rebuild (first call)\n");
+    return rebuild();
+  }
+  if (!moves.empty()) {
+    // Caller wants to apply explicit moves on top of `board`. The
+    // existing semantics are "set head to `board` then play these".
+    // Reuse path doesn't try to handle this — fall back.
+    std::fprintf(stderr, "info string tree_reuse: rebuild (moves= non-empty)\n");
+    return rebuild();
   }
 
-  return false;  // No tree reuse for now.
+  const uint64_t target_hash = board.Hash();
+
+  // 0-ply: same position as current head.
+  if (head_board_.Hash() == target_hash) {
+    std::fprintf(stderr, "info string tree_reuse: 0-ply hit (visits=%u)\n",
+                 current_head_->GetN());
+    return true;
+  }
+
+  // 1-ply: navigate via one existing edge.
+  for (auto edge : current_head_->Edges()) {
+    ShogiBoard tmp = head_board_;
+    tmp.DoMove(edge.GetMove());
+    if (tmp.Hash() == target_hash) {
+      uint32_t reused_n = 0;
+      if (edge.HasNode()) reused_n = edge.node()->GetN();
+      MakeMove(edge.GetMove());
+      std::fprintf(stderr, "info string tree_reuse: 1-ply hit (reused_n=%u)\n",
+                   reused_n);
+      return true;
+    }
+  }
+
+  // 2-ply: navigate via two existing edges. Only consider edges whose
+  // child has already been spawned (avoid creating new nodes during
+  // this probe).
+  for (auto e1 : current_head_->Edges()) {
+    if (!e1.HasNode()) continue;
+    Node* child1 = e1.node();
+    ShogiBoard tmp1 = head_board_;
+    tmp1.DoMove(e1.GetMove());
+
+    for (auto e2 : child1->Edges()) {
+      ShogiBoard tmp2 = tmp1;
+      tmp2.DoMove(e2.GetMove());
+      if (tmp2.Hash() == target_hash) {
+        uint32_t reused_n = 0;
+        if (e2.HasNode()) reused_n = e2.node()->GetN();
+        MakeMove(e1.GetMove());
+        MakeMove(e2.GetMove());
+        std::fprintf(stderr, "info string tree_reuse: 2-ply hit (reused_n=%u)\n",
+                     reused_n);
+        return true;
+      }
+    }
+  }
+
+  // Fallback: full rebuild.
+  std::fprintf(stderr, "info string tree_reuse: rebuild (no path found)\n");
+  return rebuild();
 }
 
 void NodeTree::DeallocateTree() {

@@ -204,6 +204,10 @@ void USIEngine::CmdUsiNewGame() {
   board_.SetStartPos();
   board_.ClearHistory();
   game_ply_ = 0;
+  // Drop the Search object so the next `go` rebuilds it with a fresh
+  // tree. Otherwise tree reuse would carry over visit counts from the
+  // previous game's positions, which is incorrect.
+  lc0_search_.reset();
 }
 
 void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
@@ -377,9 +381,12 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
          (pv_str.empty() ? "" : " pv " + pv_str));
   };
 
-  std::vector<jhbr2::NNEvaluator*> eval_ptrs;
-  for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
-  lc0_search_ = std::make_unique<lc0_shogi::Search>(eval_ptrs, lc0_config_);
+  // Persistent Search across `go` commands (tree reuse).
+  if (!lc0_search_) {
+    std::vector<jhbr2::NNEvaluator*> eval_ptrs;
+    for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
+    lc0_search_ = std::make_unique<lc0_shogi::Search>(eval_ptrs, lc0_config_);
+  }
   auto result = lc0_search_->Run(board_, game_ply_);
 
   // --- Stop df-pn and wait ---
