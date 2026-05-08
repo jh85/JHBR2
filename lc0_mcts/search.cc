@@ -87,7 +87,9 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 
 Search::Search(std::vector<NNEvaluator*> evaluators, const SearchConfig& config)
     : config_(config) {
-  backend_ = std::make_unique<Backend>(std::move(evaluators), config.num_threads);
+  backend_ = std::make_unique<Backend>(std::move(evaluators),
+                                        config.num_threads,
+                                        config.nn_cache_size);
 }
 
 Search::~Search() = default;
@@ -191,6 +193,20 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
   result.root_d = root_node_->GetD();
   result.score_cp = QToCentipawns(stm_q);
   result.pv = GetPV(root_node_);
+
+  // NN cache stats (cumulative across all searches with this Search
+  // instance). Helps diagnose whether the cache is paying for itself.
+  if (backend_->nn_cache().Capacity() > 0) {
+    uint64_t hits = backend_->nn_cache().Hits();
+    uint64_t misses = backend_->nn_cache().Misses();
+    uint64_t total = hits + misses;
+    double rate = total > 0 ? (100.0 * hits / total) : 0.0;
+    std::fprintf(stderr,
+                 "info string nn_cache: size=%zu/%zu  hits=%lu  misses=%lu"
+                 "  hit_rate=%.1f%%\n",
+                 backend_->nn_cache().Size(), backend_->nn_cache().Capacity(),
+                 (unsigned long)hits, (unsigned long)misses, rate);
+  }
 
   return result;
 }

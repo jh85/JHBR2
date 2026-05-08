@@ -28,6 +28,7 @@
 #else
 #include "mcts/nn_eval.h"
 #endif
+#include "mcts/nn_cache.h"
 #include "shogi/board.h"
 #include "shogi/encoder.h"
 
@@ -80,14 +81,19 @@ class Computation {
 class Backend {
  public:
   // N-GPU constructor. Pass pointers to all evaluators (one per GPU).
-  Backend(std::vector<NNEvaluator*> evaluators, int num_workers = 1)
-      : evaluators_(std::move(evaluators)), num_workers_(num_workers) {
+  Backend(std::vector<NNEvaluator*> evaluators, int num_workers = 1,
+          size_t nn_cache_size = 0)
+      : evaluators_(std::move(evaluators)),
+        num_workers_(num_workers),
+        nn_cache_(nn_cache_size) {
     if (num_workers_ > 1) {
       worker_results_.resize(num_workers_);
       worker_ready_.resize(num_workers_, false);
       worker_cvs_ = std::make_unique<std::condition_variable[]>(num_workers_);
     }
   }
+
+  jhbr2::NNCache& nn_cache() { return nn_cache_; }
 
   ~Backend() { StopGPUThread(); }
 
@@ -131,10 +137,75 @@ class Backend {
     for (int i = 0; i < num_workers_; i++) worker_cvs_[i].notify_all();
   }
 
-  // Direct GPU eval (bypasses shared queue). Used for root eval.
+  // Direct GPU eval (bypasses shared queue). Used for root eval and
+  // for solo (single-worker) mode. Goes through the cache layer.
   void EvalDirect(Computation* comp) {
     std::lock_guard<std::mutex> lock(gpu_mutex_);
-    comp->results_ = evaluators_[0]->EvaluateBatch(comp->inputs_);
+    comp->results_ = EvalBatchWithCache(comp->inputs_, /*evaluator_idx=*/0);
+  }
+
+  // Cache-aware batch eval. Filters out cache hits (fills results
+  // directly) and only sends cache misses to the GPU. After GPU
+  // returns, inserts the new evaluations into the cache.
+  //
+  // Used by both EvalDirect (here) and the GPU loop's per-GPU
+  // sub-batch eval (in GPULoop, after SubmitAndWait merges worker
+  // submissions).
+  std::vector<NNOutput> EvalBatchWithCache(
+      const std::vector<std::pair<ShogiBoard, MoveList>>& batch,
+      int evaluator_idx) {
+    const size_t N = batch.size();
+    std::vector<NNOutput> results(N);
+    if (N == 0) return results;
+
+    // Stage 1: scan for cache hits.
+    std::vector<size_t> miss_indices;   // indices into `batch` and `results`
+    std::vector<std::pair<ShogiBoard, MoveList>> miss_batch;
+    std::vector<uint64_t> miss_keys;    // cached for insertion after GPU
+    miss_indices.reserve(N);
+    miss_batch.reserve(N);
+    miss_keys.reserve(N);
+
+    for (size_t i = 0; i < N; ++i) {
+      const ShogiBoard& board = batch[i].first;
+      const MoveList& legal = batch[i].second;
+      const uint64_t key = board.Hash();
+      jhbr2::CachedNNValue cached;
+      if (nn_cache_.Lookup(key, static_cast<uint16_t>(legal.size()), &cached)) {
+        // Hit — synthesize NNOutput from cached value.
+        results[i].wdl[0] = cached.wdl[0];
+        results[i].wdl[1] = cached.wdl[1];
+        results[i].wdl[2] = cached.wdl[2];
+        results[i].value  = cached.wdl[0] - cached.wdl[2];
+        results[i].draw   = cached.wdl[1];
+        results[i].policy = cached.policy;
+      } else {
+        miss_indices.push_back(i);
+        miss_batch.emplace_back(board, legal);
+        miss_keys.push_back(key);
+      }
+    }
+
+    // Stage 2: GPU eval for misses.
+    if (!miss_batch.empty()) {
+      auto miss_results = evaluators_[evaluator_idx]->EvaluateBatch(miss_batch);
+      for (size_t k = 0; k < miss_results.size(); ++k) {
+        size_t i = miss_indices[k];
+        results[i] = std::move(miss_results[k]);
+
+        // Stage 3: insert into cache.
+        jhbr2::CachedNNValue to_cache;
+        to_cache.wdl[0] = results[i].wdl[0];
+        to_cache.wdl[1] = results[i].wdl[1];
+        to_cache.wdl[2] = results[i].wdl[2];
+        to_cache.policy = results[i].policy;
+        to_cache.num_legal_moves =
+            static_cast<uint16_t>(batch[i].second.size());
+        nn_cache_.Insert(miss_keys[k], std::move(to_cache));
+      }
+    }
+
+    return results;
   }
 
  private:
@@ -211,9 +282,11 @@ class Backend {
       int total = static_cast<int>(combined.size());
 
       if (num_gpus <= 1) {
-        all_results = evaluators_[0]->EvaluateBatch(combined);
+        // Cache-aware: filters hits, sends only misses to GPU 0.
+        all_results = EvalBatchWithCache(combined, /*evaluator_idx=*/0);
       } else {
-        // Split batch evenly across GPUs.
+        // Split batch evenly across GPUs. Each GPU's sub-batch goes
+        // through the cache layer (filter + GPU + cache insert).
         int per_gpu = (total + num_gpus - 1) / num_gpus;
         std::vector<std::vector<NNOutput>> gpu_results(num_gpus);
         std::vector<std::thread> gpu_threads;
@@ -227,7 +300,7 @@ class Backend {
             try {
               std::vector<std::pair<ShogiBoard, MoveList>> sub(
                   combined.begin() + start, combined.begin() + end);
-              gpu_results[g] = evaluators_[g]->EvaluateBatch(sub);
+              gpu_results[g] = EvalBatchWithCache(sub, /*evaluator_idx=*/g);
             } catch (const std::exception& e) {
               std::cerr << "GPU " << g << " error: " << e.what() << std::endl;
               gpu_error.store(true);
@@ -275,6 +348,7 @@ class Backend {
 
   std::vector<NNEvaluator*> evaluators_;  // One per GPU
   int num_workers_;
+  jhbr2::NNCache nn_cache_;
 
   // Solo mode.
   std::mutex gpu_mutex_;

@@ -125,6 +125,11 @@ struct SearchConfig {
   // handled by a background PV mate thread (future work).
   int leaf_mate_depth = 3;
 
+  // NN inference cache size (number of entries). 0 disables.
+  // Each entry is ~32 bytes overhead + 4 bytes per legal-move policy
+  // (~150 bytes total at 30 legal moves), so 2M entries ≈ 300 MB.
+  size_t nn_cache_size = 0;
+
   // Multi-GPU: number of GPUs (1 or 2).
   int num_gpus = 1;
 

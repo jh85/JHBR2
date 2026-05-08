@@ -103,6 +103,7 @@ void USIEngine::CmdUsi() {
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
   Send("option name LeafMateMode type combo default dfpn var off var dfpn var shallow");
   Send("option name LeafMateDepth type spin default 3 min 1 max 7");
+  Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
@@ -182,6 +183,11 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     if (d > 7) d = 7;
     if (d % 2 == 0) d -= 1;          // round even down to odd
     lc0_config_.leaf_mate_depth = d;
+  } else if (name_lower == "nncachesize") {
+    lc0_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
+    // If a Search is already constructed it has the OLD cache size.
+    // Drop it so the next `go` rebuilds with the new cache.
+    lc0_search_.reset();
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
     lc0_config_.num_gpus = num_gpus_;
