@@ -164,6 +164,9 @@ def main():
     p.add_argument('--gpus', type=int, default=1)
     p.add_argument('--minibatch', type=int, default=32,
                    help='MinibatchSize (dlshogi: DNN_Batch_Size)')
+    p.add_argument('--max-gpu-batch', type=int, default=4096,
+                   help='MaxGpuBatch (cap on combined GPU batch). '
+                        'Must be >= threads*minibatch to avoid chunking.')
     p.add_argument('--nodelimit', type=int, default=10_000_000,
                    help='MaxNodes (dlshogi: UCT_NodeLimit)')
     p.add_argument('--byoyomi', type=int, default=1000,
@@ -217,6 +220,7 @@ def main():
     send(f'setoption name Threads value {args.threads}')
     send(f'setoption name NumGPUs value {args.gpus}')
     send(f'setoption name MinibatchSize value {args.minibatch}')
+    send(f'setoption name MaxGpuBatch value {args.max_gpu_batch}')
     send(f'setoption name MaxNodes value {args.nodelimit}')
     send(f'setoption name PerLeafGathering value {args.per_leaf_gathering}')
     send(f'setoption name LeafMateMode value {args.leaf_mate_mode}')
@@ -229,7 +233,8 @@ def main():
 
     print(f'engine    : {args.engine}', flush=True)
     print(f'model     : {args.model}', flush=True)
-    print(f'threads={args.threads}  gpus={args.gpus}  minibatch={args.minibatch}',
+    print(f'threads={args.threads}  gpus={args.gpus}  '
+          f'minibatch={args.minibatch}  max_gpu_batch={args.max_gpu_batch}',
           flush=True)
     print(f'leaf-mate-mode={args.leaf_mate_mode}  '
           f'leaf-mate-depth={args.leaf_mate_depth}  '
