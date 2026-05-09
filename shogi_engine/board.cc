@@ -290,9 +290,12 @@ UndoInfo ShogiBoard::DoMove(Move m) {
   side_to_move_ = ~us;
   ply_++;
 
-  // Update continuous check counter.
+  // Update continuous check counter. Counted in plies (increment by 2
+  // per check move), matching dlshogi's convention so that the counter
+  // can be compared directly against the ply distance to the prior
+  // occurrence in CheckRepetition().
   if (InCheck(~us)) {
-    continuous_check_[us] += 1;
+    continuous_check_[us] += 2;
   } else {
     continuous_check_[us] = 0;
   }
@@ -1025,40 +1028,33 @@ int ShogiBoard::RepetitionCount() const {
 }
 
 ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition() const {
-  // Count how many times the current position has appeared in history.
-  // Sennichite occurs on the 4th occurrence (3 previous + current = 4).
-
-  int occurrences = 0;
-  int last_match_distance = 0;
+  // Detect repetition at the FIRST prior occurrence (search-time policy
+  // matching dlshogi and YaneuraOu). The actual rule fires on the 4th
+  // occurrence, but treating the 2nd occurrence as already-perpetual
+  // lets the search avoid the cycle with shallow lookahead — otherwise
+  // the engine has to look 12+ plies ahead to see the 4-fold and may
+  // walk into OUTE_SENNICHITE losses (see oute_sennichite1.csa).
+  //
+  // dist = ply distance to the prior occurrence. continuous_check_[c]
+  // is also in plies (incremented by 2 per check). If our side has
+  // been continuously checking for the entire cycle, we LOSE; if the
+  // opponent has, we WIN; otherwise it's a normal draw.
 
   for (int i = static_cast<int>(history_.size()) - 1; i >= 0; --i) {
     const auto& entry = history_[i];
     if (entry.hash == hash_ &&
         entry.hand_black == hand_[BLACK].raw() &&
         entry.hand_white == hand_[WHITE].raw()) {
-      occurrences++;
-      if (occurrences == 1) {
-        last_match_distance = static_cast<int>(history_.size()) - i;
-      }
-      if (occurrences >= 3) {
-        // 4th occurrence (3 in history + current) → sennichite.
-        // Check for perpetual check.
-        // If the side to move has been continuously checking for at least
-        // as many plies as the distance to the first repetition,
-        // that side LOSES (perpetual check).
-        // If the opponent was continuously checking, we WIN.
+      Color us = side_to_move_;
+      int dist = static_cast<int>(history_.size()) - i;
 
-        Color us = side_to_move_;
-        int dist = static_cast<int>(history_.size()) - i;
-
-        if (continuous_check_[us] >= dist) {
-          return RepetitionResult::kLoss;  // We were giving perpetual check
-        }
-        if (continuous_check_[~us] >= dist) {
-          return RepetitionResult::kWin;   // Opponent was giving perpetual check
-        }
-        return RepetitionResult::kDraw;
+      if (continuous_check_[us] >= dist) {
+        return RepetitionResult::kLoss;  // We were giving perpetual check
       }
+      if (continuous_check_[~us] >= dist) {
+        return RepetitionResult::kWin;   // Opponent was giving perpetual check
+      }
+      return RepetitionResult::kDraw;
     }
   }
 
