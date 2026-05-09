@@ -90,7 +90,12 @@ struct SearchConfig {
   float max_time = 0.0f;  // seconds, 0 = unlimited
 
   // Threading
-  int num_threads = 1;
+  // Total search workers = num_gpus * workers_per_gpu. Each worker is
+  // pinned to one (evaluator, slot). num_threads is kept as an alias
+  // for workers_per_gpu (backward-compatibility with the Threads USI
+  // option) and is no longer used directly by the search loop.
+  int num_threads = 2;
+  int workers_per_gpu = 2;
   int minibatch_size = 32;  // Target leaves per worker iteration
 
   // Draw score (positive = prefer draws)
@@ -153,11 +158,11 @@ struct SearchConfig {
   // have. See discussion in dlshogi WCSC36 vs Suisho draw incident.
   int max_moves_to_draw = 100000;
 
-  // Cap for the combined batch sent to a single GPU call from
-  // Backend::GPULoop. If the merged worker submissions exceed this,
-  // GPULoop chunks the batch into back-to-back calls. Must be ≤ the
-  // TRT engine's max profile (NNEvaluator's max_batch_size).
-  int max_gpu_batch = 4096;
+  // Per-GPU-call max batch. The TRT engine is built with this as
+  // its max profile shape, and per-worker submissions exceeding it
+  // are chunked. With per-worker submission this should equal
+  // minibatch_size (no combining happens).
+  int max_gpu_batch = 1024;
 
   // Info callback: called periodically during search for GUI output.
   InfoCallback info_callback = nullptr;

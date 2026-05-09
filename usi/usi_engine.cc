@@ -97,15 +97,20 @@ void USIEngine::CmdUsi() {
   Send("option name OnnxModel type string default shogi_bt4.onnx");
   Send("option name NoiseEpsilon type string default 0.0");
   Send("option name UseGPU type check default true");
-  Send("option name Threads type spin default 1 min 1 max 128");
-  Send("option name MinibatchSize type spin default 32 min 1 max 4096");
+  // Threads is kept as an alias for WorkersPerGpu (backward compat).
+  Send("option name Threads type spin default 2 min 1 max 8");
+  Send("option name WorkersPerGpu type spin default 2 min 1 max 8");
+  Send("option name MinibatchSize type spin default 256 min 1 max 4096");
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
   Send("option name LeafMateMode type combo default dfpn var off var dfpn var shallow");
   Send("option name LeafMateDepth type spin default 3 min 1 max 7");
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
-  Send("option name MaxGpuBatch type spin default 4096 min 64 max 16384");
+  // MaxGpuBatch sets the TRT engine's max profile shape (and the
+  // per-slot buffer size). With per-worker submission there is no
+  // combining, so this should match MinibatchSize.
+  Send("option name MaxGpuBatch type spin default 1024 min 64 max 16384");
   Send("option name VirtualLossWeight type string default 1.0");
   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
@@ -125,7 +130,8 @@ void USIEngine::CmdIsReady() {
       Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
       evaluators_.push_back(
           std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
-                                        max_gpu_batch_));
+                                        max_gpu_batch_,
+                                        lc0_config_.workers_per_gpu));
     }
 
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
@@ -166,7 +172,21 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   } else if (name_lower == "usegpu") {
     use_gpu_ = (value == "true");
   } else if (name_lower == "threads") {
-    lc0_config_.num_threads = std::stoi(value);
+    // Backward-compat alias for WorkersPerGpu.
+    int n = std::stoi(value);
+    lc0_config_.num_threads = n;
+    lc0_config_.workers_per_gpu = n;
+    lc0_search_.reset();
+    evaluators_.clear();
+  } else if (name_lower == "workerspergpu") {
+    int n = std::stoi(value);
+    if (n < 1) n = 1;
+    lc0_config_.workers_per_gpu = n;
+    lc0_config_.num_threads = n;
+    // Each evaluator must be (re-)constructed with this many TRT
+    // execution slots, so drop both Search and evaluators.
+    lc0_search_.reset();
+    evaluators_.clear();
   } else if (name_lower == "minibatchsize") {
     lc0_config_.minibatch_size = std::stoi(value);
   } else if (name_lower == "perleafgathering") {

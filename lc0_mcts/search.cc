@@ -87,10 +87,13 @@ void ApplyDirichletNoise(Node* node, float epsilon, float alpha) {
 
 Search::Search(std::vector<NNEvaluator*> evaluators, const SearchConfig& config)
     : config_(config) {
-  backend_ = std::make_unique<Backend>(std::move(evaluators),
-                                        config.num_threads,
-                                        config.nn_cache_size,
-                                        config.max_gpu_batch);
+  // Total workers = num_gpus * workers_per_gpu. Worker i is pinned to
+  // evaluator (i / workers_per_gpu) and slot (i % workers_per_gpu).
+  int num_gpus = std::max(1, config.num_gpus);
+  int wpg = std::max(1, config.workers_per_gpu);
+  int num_workers = num_gpus * wpg;
+  backend_ = std::make_unique<Backend>(std::move(evaluators), num_workers,
+                                       wpg, config.nn_cache_size);
 }
 
 Search::~Search() = default;
@@ -124,10 +127,10 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
       return result;
     }
 
-    // Evaluate root position (direct call, before GPU thread starts).
-    auto root_comp = backend_->CreateComputation();
+    // Evaluate root position via worker 0's slot.
+    auto root_comp = backend_->CreateComputation(0);
     root_comp->AddInput(board, legal_moves);
-    backend_->EvalDirect(root_comp.get());
+    root_comp->ComputeBlocking();
 
     NNOutput root_eval;
     root_eval.value = root_comp->GetQ(0);
@@ -160,21 +163,17 @@ SearchResult Search::Run(ShogiBoard board, int game_ply) {
   shared_collisions_.clear();
   current_best_edge_ = GetBestChildNoTemperature(root_node_);
 
-  // Start GPU thread for shared batching (multi-worker only).
-  backend_->StartGPUThread();
-
-  // Launch worker threads.
+  // Launch search workers — one per (gpu, slot) pair.
+  const int num_workers = backend_->num_workers();
   std::vector<std::thread> threads;
-  for (int t = 0; t < config_.num_threads; t++) {
+  threads.reserve(num_workers);
+  for (int t = 0; t < num_workers; t++) {
     threads.emplace_back([this, t]() {
       SearchWorker worker(this, config_, t);
       worker.RunBlocking();
     });
   }
-
-  // Wait for all workers, then stop GPU thread.
   for (auto& t : threads) t.join();
-  backend_->StopGPUThread();
 
   // Collect result.
   auto t1 = std::chrono::steady_clock::now();
@@ -338,11 +337,12 @@ void SearchWorker::ExecuteOneIteration() {
 // =====================================================================
 
 void SearchWorker::GatherMinibatch() {
-  if (config_.per_leaf_gathering) {
-    GatherMinibatchPerLeaf();
-  } else {
-    GatherMinibatchBulk();
-  }
+  // Per-leaf is the only supported gathering strategy. The bulk path
+  // existed for the lc0-style combining backend and was removed when
+  // the backend switched to per-worker direct submission (dlshogi-style
+  // multi-context model). config_.per_leaf_gathering is preserved as
+  // a no-op USI knob for backward compatibility.
+  GatherMinibatchPerLeaf();
 }
 
 // =====================================================================

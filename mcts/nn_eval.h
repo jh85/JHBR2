@@ -46,8 +46,11 @@ class NNEvaluator {
  public:
   // Load model from ONNX file.
   // use_gpu: try CUDA provider first, fall back to CPU.
+  // num_slots is accepted for signature parity with the direct-TRT
+  // path but ignored here — ORT sessions are themselves single-threaded.
   explicit NNEvaluator(const std::string& onnx_path, bool use_gpu = true,
-                       int device_id = 0, int max_batch_size = 1024);
+                       int device_id = 0, int max_batch_size = 1024,
+                       int num_slots = 1);
   ~NNEvaluator();
 
   // Evaluate a single position.
@@ -59,6 +62,18 @@ class NNEvaluator {
   // Each element: (board, legal_moves).
   std::vector<NNOutput> EvaluateBatch(
       const std::vector<std::pair<ShogiBoard, MoveList>>& batch);
+
+  // Slot-aware variant; for the ORT path slot_id is ignored (and a
+  // mutex serializes calls). Provided only for signature compatibility
+  // with the direct-TRT path.
+  std::vector<NNOutput> EvaluateBatchSlot(
+      int slot_id,
+      const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
+    (void)slot_id;
+    return EvaluateBatch(batch);
+  }
+
+  int num_slots() const { return 1; }
 
   // Is the evaluator using GPU?
   bool using_gpu() const { return using_gpu_; }

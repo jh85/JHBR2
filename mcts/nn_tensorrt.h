@@ -44,18 +44,30 @@ struct NNOutput {
 
 class NNEvaluator {
  public:
-  // max_batch_size is only used by the ONNX Runtime path (nn_eval.cc)
-  // to set the TRT max profile shape. The direct-TRT path here reads
-  // max batch from the prebuilt engine file, so the param is ignored.
+  // num_slots controls how many independent execution contexts (each
+  // with its own CUDA stream and pre-allocated H/D buffers) are
+  // created on this GPU. Multiple workers can call EvaluateBatchSlot
+  // concurrently — one worker per slot. Slot 0 is always allocated
+  // and used by the legacy single-threaded entry points.
+  // max_batch_size is forwarded to the ONNX Runtime path only.
   explicit NNEvaluator(const std::string& engine_path, bool use_gpu = true,
-                       int device_id = 0, int max_batch_size = 1024);
+                       int device_id = 0, int max_batch_size = 1024,
+                       int num_slots = 1);
   ~NNEvaluator();
 
+  // Single-position / single-threaded helpers (always use slot 0).
   NNOutput Evaluate(const ShogiBoard& board, const MoveList& legal_moves);
-
   std::vector<NNOutput> EvaluateBatch(
       const std::vector<std::pair<ShogiBoard, MoveList>>& batch);
 
+  // Multi-worker entry: each worker passes its own slot_id (0 ..
+  // num_slots-1). Slots are independent — no synchronization needed
+  // between concurrent EvaluateBatchSlot calls on different slots.
+  std::vector<NNOutput> EvaluateBatchSlot(
+      int slot_id,
+      const std::vector<std::pair<ShogiBoard, MoveList>>& batch);
+
+  int num_slots() const;
   bool using_gpu() const { return true; }
 
  private:

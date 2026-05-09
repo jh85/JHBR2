@@ -1,8 +1,10 @@
 /*
   JHBR2 Shogi Engine — Native TensorRT Backend
 
-  Uses TensorRT C++ API directly for NN inference.
-  Supports dynamic batch sizes and FP16 inference.
+  Uses TensorRT C++ API directly. Supports multiple execution slots
+  per GPU: each slot owns its own IExecutionContext + CUDA stream +
+  pinned host buffers + device buffers, allowing N workers to keep
+  the GPU busy concurrently (dlshogi-style design).
 */
 
 #ifdef USE_TENSORRT
@@ -17,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <numeric>
 #include <vector>
 
@@ -68,50 +71,22 @@ static void Softmax(float* data, int size) {
 } while(0)
 
 // =====================================================================
-// Implementation
+// Per-slot resources: one IExecutionContext + stream + buffers.
 // =====================================================================
 
-struct NNEvaluator::Impl {
-  TrtLogger logger;
-  std::unique_ptr<nvinfer1::IRuntime> runtime;
-  std::unique_ptr<nvinfer1::ICudaEngine> engine;
+struct Slot {
   std::unique_ptr<nvinfer1::IExecutionContext> context;
-
-  // Binding indices for input/output tensors.
-  int input_idx = -1;
-  int policy_idx = -1;
-  int wdl_idx = -1;
-  int mlh_idx = -1;
-
-  // Input dimensions.
-  int input_channels = 48;
-  int max_batch_size = 32;
-
-  // GPU buffers (pre-allocated for max batch size).
+  cudaStream_t stream = nullptr;
   void* d_input = nullptr;
   void* d_policy = nullptr;
   void* d_wdl = nullptr;
   void* d_mlh = nullptr;
-
-  // Pinned host buffers (allocated via cudaMallocHost so that
-  // cudaMemcpyAsync can actually overlap with computation; with a
-  // pageable buffer the call falls back to synchronous behavior).
-  float* h_input  = nullptr;
+  float* h_input = nullptr;
   float* h_policy = nullptr;
-  float* h_wdl    = nullptr;
-  float* h_mlh    = nullptr;
-  size_t h_input_count  = 0;   // floats, not bytes
-  size_t h_policy_count = 0;
-  size_t h_wdl_count    = 0;
-  size_t h_mlh_count    = 0;
+  float* h_wdl = nullptr;
+  float* h_mlh = nullptr;
 
-  // Output sizes per sample.
-  int policy_size = 0;
-  bool dynamic_batch = false;
-
-  cudaStream_t stream = nullptr;
-
-  ~Impl() {
+  ~Slot() {
     if (d_input)  cudaFree(d_input);
     if (d_policy) cudaFree(d_policy);
     if (d_wdl)    cudaFree(d_wdl);
@@ -124,22 +99,42 @@ struct NNEvaluator::Impl {
   }
 };
 
+// =====================================================================
+// Implementation
+// =====================================================================
+
+struct NNEvaluator::Impl {
+  TrtLogger logger;
+  std::unique_ptr<nvinfer1::IRuntime> runtime;
+  std::unique_ptr<nvinfer1::ICudaEngine> engine;
+  std::vector<std::unique_ptr<Slot>> slots;
+
+  int input_idx = -1;
+  int policy_idx = -1;
+  int wdl_idx = -1;
+  int mlh_idx = -1;
+
+  int input_channels = 48;
+  int max_batch_size = 32;
+  int policy_size = 0;
+  bool dynamic_batch = false;
+
+  int device_id = 0;
+};
+
+
 NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
-                         int device_id, int /*max_batch_size*/)
+                         int device_id, int /*max_batch_size*/,
+                         int num_slots)
     : impl_(std::make_unique<Impl>()) {
 
   CUDA_CHECK(cudaSetDevice(device_id));
+  impl_->device_id = device_id;
   ShogiEncoderTables::Init();
 
-  // Load serialized engine from file.
   std::ifstream file(engine_path, std::ios::binary | std::ios::ate);
   if (!file.good()) {
     fprintf(stderr, "[TRT] Cannot open engine file: %s\n", engine_path.c_str());
-    fprintf(stderr, "[TRT] Convert with: trtexec --onnx=model.onnx "
-            "--saveEngine=model.engine --fp16 "
-            "--minShapes=input_planes:1x48x9x9 "
-            "--optShapes=input_planes:16x48x9x9 "
-            "--maxShapes=input_planes:32x48x9x9\n");
     return;
   }
 
@@ -148,7 +143,6 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
   std::vector<char> engine_data(file_size);
   file.read(engine_data.data(), file_size);
 
-  // Create runtime and deserialize engine.
   impl_->runtime.reset(nvinfer1::createInferRuntime(impl_->logger));
   impl_->engine.reset(impl_->runtime->deserializeCudaEngine(
       engine_data.data(), engine_data.size()));
@@ -158,10 +152,7 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
     return;
   }
 
-  // Create execution context.
-  impl_->context.reset(impl_->engine->createExecutionContext());
-
-  // Find binding indices by name.
+  // Find tensor binding indices.
   int nb = impl_->engine->getNbIOTensors();
   for (int i = 0; i < nb; i++) {
     const char* name = impl_->engine->getIOTensorName(i);
@@ -172,27 +163,21 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
   }
 
   if (impl_->input_idx < 0 || impl_->policy_idx < 0 || impl_->wdl_idx < 0) {
-    fprintf(stderr, "[TRT] Missing expected tensor names (input_planes, policy, wdl)\n");
+    fprintf(stderr, "[TRT] Missing expected tensor names\n");
     return;
   }
 
-  // Get input channel count from the engine.
   auto input_dims = impl_->engine->getTensorShape("input_planes");
   if (input_dims.nbDims >= 2) {
     impl_->input_channels = input_dims.d[1];
   }
 
-  // Determine batch size from the engine's input shape.
-  // For static-batch engines, this is the fixed batch size.
-  // For dynamic-batch engines, use the max profile shape.
   auto engine_input_dims = impl_->engine->getTensorShape("input_planes");
   if (engine_input_dims.nbDims >= 1 && engine_input_dims.d[0] > 0) {
-    // Static batch — the batch dim is fixed.
     impl_->max_batch_size = engine_input_dims.d[0];
     impl_->dynamic_batch = false;
   } else {
-    // Dynamic batch — check optimization profile.
-    impl_->max_batch_size = 32;  // default
+    impl_->max_batch_size = 32;
     impl_->dynamic_batch = true;
     int nb_profiles = impl_->engine->getNbOptimizationProfiles();
     if (nb_profiles > 0) {
@@ -204,55 +189,67 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
     }
   }
 
-  // Determine policy size.
   auto policy_dims = impl_->engine->getTensorShape("policy");
   impl_->policy_size = (policy_dims.nbDims >= 2) ? policy_dims.d[1] : 2187;
 
-  fprintf(stderr, "[TRT] Engine loaded: channels=%d, max_batch=%d, policy_size=%d, dynamic=%s\n",
-          impl_->input_channels, impl_->max_batch_size, impl_->policy_size,
-          impl_->dynamic_batch ? "yes" : "no");
+  if (num_slots < 1) num_slots = 1;
+  fprintf(stderr,
+          "[TRT] Engine loaded gpu=%d: channels=%d max_batch=%d "
+          "policy=%d dynamic=%s slots=%d\n",
+          device_id, impl_->input_channels, impl_->max_batch_size,
+          impl_->policy_size, impl_->dynamic_batch ? "yes" : "no", num_slots);
 
-  // Create CUDA stream.
-  CUDA_CHECK(cudaStreamCreate(&impl_->stream));
-
-  // Allocate GPU buffers for max batch size.
-  int B = impl_->max_batch_size;
-  int C = impl_->input_channels;
-  int P = impl_->policy_size;
-
-  CUDA_CHECK(cudaMalloc(&impl_->d_input, B * C * 81 * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&impl_->d_policy, B * P * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&impl_->d_wdl, B * 3 * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&impl_->d_mlh, B * 1 * sizeof(float)));
-
-  // Allocate pinned host buffers. Pinned memory enables true async
-  // overlap between H2D copy, kernel execution, and D2H copy in
-  // cudaMemcpyAsync calls (with pageable memory the calls fall back
-  // to synchronous behavior internally).
-  impl_->h_input_count  = static_cast<size_t>(B) * C * 81;
-  impl_->h_policy_count = static_cast<size_t>(B) * P;
-  impl_->h_wdl_count    = static_cast<size_t>(B) * 3;
-  impl_->h_mlh_count    = static_cast<size_t>(B) * 1;
-  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_input),
-                            impl_->h_input_count * sizeof(float)));
-  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_policy),
-                            impl_->h_policy_count * sizeof(float)));
-  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_wdl),
-                            impl_->h_wdl_count * sizeof(float)));
-  CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&impl_->h_mlh),
-                            impl_->h_mlh_count * sizeof(float)));
+  // Allocate per-slot resources: one execution context + stream + buffers.
+  impl_->slots.reserve(num_slots);
+  const int B = impl_->max_batch_size;
+  const int C = impl_->input_channels;
+  const int P = impl_->policy_size;
+  for (int s = 0; s < num_slots; s++) {
+    auto slot = std::make_unique<Slot>();
+    slot->context.reset(impl_->engine->createExecutionContext());
+    if (!slot->context) {
+      fprintf(stderr, "[TRT] Failed to create execution context (slot=%d)\n", s);
+      continue;
+    }
+    CUDA_CHECK(cudaStreamCreate(&slot->stream));
+    CUDA_CHECK(cudaMalloc(&slot->d_input,  static_cast<size_t>(B) * C * 81 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&slot->d_policy, static_cast<size_t>(B) * P * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&slot->d_wdl,    static_cast<size_t>(B) * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&slot->d_mlh,    static_cast<size_t>(B) * 1 * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
+                              static_cast<size_t>(B) * C * 81 * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_policy),
+                              static_cast<size_t>(B) * P * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_wdl),
+                              static_cast<size_t>(B) * 3 * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_mlh),
+                              static_cast<size_t>(B) * 1 * sizeof(float)));
+    impl_->slots.push_back(std::move(slot));
+  }
 }
 
-NNEvaluator::~NNEvaluator() = default;
+NNEvaluator::~NNEvaluator() {
+  if (impl_) cudaSetDevice(impl_->device_id);
+}
+
+int NNEvaluator::num_slots() const {
+  return impl_ ? static_cast<int>(impl_->slots.size()) : 0;
+}
 
 NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,
                                 const MoveList& legal_moves) {
   std::vector<std::pair<ShogiBoard, MoveList>> batch;
   batch.emplace_back(board, legal_moves);
-  return EvaluateBatch(batch)[0];
+  return EvaluateBatchSlot(0, batch)[0];
 }
 
 std::vector<NNOutput> NNEvaluator::EvaluateBatch(
+    const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
+  return EvaluateBatchSlot(0, batch);
+}
+
+std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
+    int slot_id,
     const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
 
   const int batch_size = static_cast<int>(batch.size());
@@ -260,8 +257,8 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   const int P = impl_->policy_size;
   constexpr int sq = 81;
 
-  if (!impl_->engine || !impl_->context) {
-    // Engine not loaded — return uniform policy.
+  if (!impl_->engine || impl_->slots.empty()) {
+    // Engine not loaded — return uniform policy (matches old fallback).
     std::vector<NNOutput> results(batch_size);
     for (int b = 0; b < batch_size; b++) {
       results[b].value = 0.0f;
@@ -275,81 +272,77 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     return results;
   }
 
-  // For dynamic-batch engines, use the actual batch size (no padding waste).
-  // For static-batch engines, always use the full batch size (pad with zeros).
+  if (slot_id < 0 || slot_id >= static_cast<int>(impl_->slots.size())) {
+    slot_id = 0;
+  }
+  Slot& slot = *impl_->slots[slot_id];
+
+  // Multi-GPU contexts: ensure CUDA calls in this thread go to our device.
+  cudaSetDevice(impl_->device_id);
+
+  // For dynamic engines: use actual batch size. For static: pad to max.
   int run_batch = impl_->dynamic_batch ? batch_size : impl_->max_batch_size;
   if (batch_size > run_batch) {
-    // Batch too large — evaluate in chunks.
+    // Batch too large — chunk and recurse on the same slot.
     std::vector<NNOutput> results;
     results.reserve(batch_size);
     for (int start = 0; start < batch_size; start += run_batch) {
       int end = std::min(start + run_batch, batch_size);
       std::vector<std::pair<ShogiBoard, MoveList>> chunk(
           batch.begin() + start, batch.begin() + end);
-      auto chunk_results = EvaluateBatch(chunk);
+      auto chunk_results = EvaluateBatchSlot(slot_id, chunk);
       results.insert(results.end(), chunk_results.begin(), chunk_results.end());
     }
     return results;
   }
 
-  // Encode input planes (zero-padded to run_batch).
-  std::fill(impl_->h_input,
-            impl_->h_input + static_cast<size_t>(run_batch) * C * sq, 0.0f);
+  std::fill(slot.h_input,
+            slot.h_input + static_cast<size_t>(run_batch) * C * sq, 0.0f);
 
   for (int b = 0; b < batch_size; b++) {
     auto planes = EncodeShogiPosition(batch[b].first);
-    float* dst = impl_->h_input + b * C * sq;
+    float* dst = slot.h_input + b * C * sq;
     for (int c = 0; c < C && c < kShogiInputPlanes; c++) {
       std::copy(planes[c].data, planes[c].data + sq, dst + c * sq);
     }
   }
 
-  // Set input shape for this batch.
   nvinfer1::Dims4 input_dims{run_batch, C, 9, 9};
-  impl_->context->setInputShape("input_planes", input_dims);
+  slot.context->setInputShape("input_planes", input_dims);
 
-  // Set tensor addresses.
-  impl_->context->setTensorAddress("input_planes", impl_->d_input);
-  impl_->context->setTensorAddress("policy", impl_->d_policy);
-  impl_->context->setTensorAddress("wdl", impl_->d_wdl);
+  slot.context->setTensorAddress("input_planes", slot.d_input);
+  slot.context->setTensorAddress("policy", slot.d_policy);
+  slot.context->setTensorAddress("wdl", slot.d_wdl);
   if (impl_->mlh_idx >= 0) {
-    impl_->context->setTensorAddress("mlh", impl_->d_mlh);
+    slot.context->setTensorAddress("mlh", slot.d_mlh);
   }
 
-  // Copy input to GPU (full run_batch, including padding).
-  CUDA_CHECK(cudaMemcpyAsync(impl_->d_input, impl_->h_input,
+  CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_input,
       run_batch * C * sq * sizeof(float),
-      cudaMemcpyHostToDevice, impl_->stream));
+      cudaMemcpyHostToDevice, slot.stream));
 
-  // Run inference.
-  bool ok = impl_->context->enqueueV3(impl_->stream);
+  bool ok = slot.context->enqueueV3(slot.stream);
   if (!ok) {
-    fprintf(stderr, "[TRT] Inference failed\n");
+    fprintf(stderr, "[TRT] Inference failed (slot=%d)\n", slot_id);
   }
 
-  // Copy outputs to host (only need batch_size results, but copy run_batch for simplicity).
-  CUDA_CHECK(cudaMemcpyAsync(impl_->h_policy, impl_->d_policy,
+  CUDA_CHECK(cudaMemcpyAsync(slot.h_policy, slot.d_policy,
       run_batch * P * sizeof(float),
-      cudaMemcpyDeviceToHost, impl_->stream));
-  CUDA_CHECK(cudaMemcpyAsync(impl_->h_wdl, impl_->d_wdl,
+      cudaMemcpyDeviceToHost, slot.stream));
+  CUDA_CHECK(cudaMemcpyAsync(slot.h_wdl, slot.d_wdl,
       run_batch * 3 * sizeof(float),
-      cudaMemcpyDeviceToHost, impl_->stream));
+      cudaMemcpyDeviceToHost, slot.stream));
 
-  // Wait for completion.
-  CUDA_CHECK(cudaStreamSynchronize(impl_->stream));
+  CUDA_CHECK(cudaStreamSynchronize(slot.stream));
 
-  // Parse outputs.
   std::vector<NNOutput> results(batch_size);
-
   for (int b = 0; b < batch_size; b++) {
     auto& result = results[b];
     const auto& board = batch[b].first;
     const auto& legal_moves = batch[b].second;
 
-    // WDL softmax.
     float wdl[3];
-    std::copy(impl_->h_wdl + b * 3,
-              impl_->h_wdl + b * 3 + 3, wdl);
+    std::copy(slot.h_wdl + b * 3, slot.h_wdl + b * 3 + 3, wdl);
     Softmax(wdl, 3);
     result.wdl[0] = wdl[0];
     result.wdl[1] = wdl[1];
@@ -357,8 +350,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     result.value = wdl[0] - wdl[2];
     result.draw = wdl[1];
 
-    // Policy.
-    float* logits = impl_->h_policy + b * P;
+    float* logits = slot.h_policy + b * P;
     bool is_white = (board.side_to_move() == lczero::WHITE);
 
     std::vector<float> legal_logits(legal_moves.size());
@@ -376,7 +368,6 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
       max_logit = std::max(max_logit, legal_logits[i]);
     }
 
-    // Softmax over legal moves.
     result.policy.resize(legal_moves.size());
     float total = 0.0f;
     for (size_t i = 0; i < legal_moves.size(); i++) {
