@@ -265,6 +265,13 @@ class Node {
   // PickNodeToExtend walks (taking only shared_lock) see consistent
   // values and CAS correctly serializes leaf claims.
   std::atomic<uint32_t> n_in_flight_{0};
+  // Per-node spinlock for the running-mean update in
+  // FinalizeScoreUpdate / AdjustForTerminal / RevertTerminalVisits.
+  // Held briefly (a few ns) so workers backing up different subtrees
+  // proceed concurrently. Reads of wl_/d_/m_ outside this lock are
+  // eventually-consistent (acceptable for PUCT / info output).
+  // 1 byte; padding makes it free.
+  mutable std::atomic_flag stats_spin_ = ATOMIC_FLAG_INIT;
   uint16_t index_;
   uint16_t num_edges_ = 0;  // Shogi can have 500+ legal moves (chess only ~218)
   Terminal terminal_type_ : 2;

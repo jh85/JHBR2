@@ -293,21 +293,29 @@ void Node::CancelScoreUpdate(int multivisit) {
 }
 
 void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
+  // Per-node spinlock around the running-mean update. Held only for
+  // the few cycles needed to compute and write the new wl_/d_/m_/n_;
+  // workers backing up different subtrees never contend.
+  while (stats_spin_.test_and_set(std::memory_order_acquire)) {}
   wl_ += multivisit * (v - wl_) / (n_ + multivisit);
   d_ += multivisit * (d - d_) / (n_ + multivisit);
   m_ += multivisit * (m - m_) / (n_ + multivisit);
   n_ += multivisit;
+  stats_spin_.clear(std::memory_order_release);
   n_in_flight_.fetch_sub(static_cast<uint32_t>(multivisit),
                          std::memory_order_acq_rel);
 }
 
 void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
+  while (stats_spin_.test_and_set(std::memory_order_acquire)) {}
   wl_ += multivisit * v / n_;
   d_ += multivisit * d / n_;
   m_ += multivisit * m / n_;
+  stats_spin_.clear(std::memory_order_release);
 }
 
 void Node::RevertTerminalVisits(float v, float d, float m, int multivisit) {
+  while (stats_spin_.test_and_set(std::memory_order_acquire)) {}
   const int n_new = n_ - multivisit;
   if (n_new <= 0) {
     wl_ = 0.0;
@@ -320,6 +328,7 @@ void Node::RevertTerminalVisits(float v, float d, float m, int multivisit) {
     m_ -= multivisit * (m - m_) / n_new;
     n_ -= multivisit;
   }
+  stats_spin_.clear(std::memory_order_release);
 }
 
 void Node::UpdateChildrenParents() {

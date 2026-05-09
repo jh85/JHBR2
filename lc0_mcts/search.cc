@@ -967,22 +967,28 @@ void SearchWorker::FetchMinibatchResults() {
 // =====================================================================
 
 void SearchWorker::DoBackupUpdate() {
-  std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
+  // No global lock: per-node spinlock in FinalizeScoreUpdate /
+  // AdjustForTerminal / RevertTerminalVisits handles synchronization
+  // for the running-mean update. Workers backing up different
+  // subtrees proceed concurrently; same-node collisions briefly spin.
+  //
+  // Collision cancellation moved to per-worker (each cancels its own
+  // collisions before the backup loop). The previously shared
+  // shared_collisions_ list required the global mutex; eliminating
+  // it lets backup run lock-free.
 
-  // First pass: record collisions into shared_collisions_.
-  // We must cancel them BEFORE the backup loop, because
-  // DoBackupUpdateSingleNode may call MakeSolid() which moves
-  // child nodes to a new array and GCs the old ones — invalidating
-  // any collision pointers that refer to those children.
   bool work_done = false;
   for (const auto& ntp : minibatch_) {
     if (ntp.is_collision) {
-      search_->shared_collisions_.emplace_back(ntp.node, ntp.multivisit);
+      // Cancel virtual loss along the path. n_in_flight_ is atomic,
+      // so concurrent cancels on different paths are safe.
+      for (Node* n = ntp.node; n != nullptr; n = n->GetParent()) {
+        n->CancelScoreUpdate(ntp.multivisit);
+      }
     } else {
       work_done = true;
     }
   }
-  search_->CancelSharedCollisions();
 
   if (!work_done) return;
 
