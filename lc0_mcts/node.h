@@ -11,6 +11,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -77,8 +78,46 @@ class Node {
         upper_bound_(GameResult::WHITE_WON),
         solid_children_(false) {}
 
-  Node(Node&& move_from) = default;
-  Node& operator=(Node&& move_from) = default;
+  // Explicit move-ops because std::atomic<uint32_t> n_in_flight_ is
+  // neither movable nor copyable; the implicit defaults would be
+  // deleted. Move semantics for the atomic mean: load source, store
+  // dest. This is fine in single-threaded reuse paths (e.g.
+  // NodeTree::TrimTreeAtHead) but not safe under concurrency.
+  Node(Node&& o) noexcept
+      : wl_(o.wl_),
+        edges_(std::move(o.edges_)),
+        parent_(o.parent_),
+        child_(std::move(o.child_)),
+        sibling_(std::move(o.sibling_)),
+        d_(o.d_),
+        m_(o.m_),
+        n_(o.n_),
+        n_in_flight_(o.n_in_flight_.load(std::memory_order_relaxed)),
+        index_(o.index_),
+        num_edges_(o.num_edges_),
+        terminal_type_(o.terminal_type_),
+        lower_bound_(o.lower_bound_),
+        upper_bound_(o.upper_bound_),
+        solid_children_(o.solid_children_) {}
+  Node& operator=(Node&& o) noexcept {
+    wl_ = o.wl_;
+    edges_ = std::move(o.edges_);
+    parent_ = o.parent_;
+    child_ = std::move(o.child_);
+    sibling_ = std::move(o.sibling_);
+    d_ = o.d_;
+    m_ = o.m_;
+    n_ = o.n_;
+    n_in_flight_.store(o.n_in_flight_.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+    index_ = o.index_;
+    num_edges_ = o.num_edges_;
+    terminal_type_ = o.terminal_type_;
+    lower_bound_ = o.lower_bound_;
+    upper_bound_ = o.upper_bound_;
+    solid_children_ = o.solid_children_;
+    return *this;
+  }
 
   // Allocates a new edge and a new node.
   Node* CreateSingleChildNode(Move m);
@@ -91,10 +130,13 @@ class Node {
 
   float GetVisitedPolicy() const;
   uint32_t GetN() const { return n_; }
-  uint32_t GetNInFlight() const { return n_in_flight_; }
+  uint32_t GetNInFlight() const {
+    return n_in_flight_.load(std::memory_order_acquire);
+  }
   uint32_t GetChildrenVisits() const { return n_ > 0 ? n_ - 1 : 0; }
   int GetNStarted() const {
-    uint64_t started = static_cast<uint64_t>(n_) + n_in_flight_;
+    uint64_t started = static_cast<uint64_t>(n_) +
+                       n_in_flight_.load(std::memory_order_acquire);
     constexpr uint64_t kMaxSafeStarted =
         static_cast<uint64_t>(std::numeric_limits<int>::max() / 4);
     return static_cast<int>(std::min(started, kMaxSafeStarted));
@@ -128,7 +170,10 @@ class Node {
   void FinalizeScoreUpdate(float v, float d, float m, int multivisit);
   void AdjustForTerminal(float v, float d, float m, int multivisit);
   void RevertTerminalVisits(float v, float d, float m, int multivisit);
-  void IncrementNInFlight(int multivisit) { n_in_flight_ += multivisit; }
+  void IncrementNInFlight(int multivisit) {
+    n_in_flight_.fetch_add(static_cast<uint32_t>(multivisit),
+                           std::memory_order_acq_rel);
+  }
 
   void UpdateMaxDepth(int depth);
   bool UpdateFullDepth(uint16_t* depth);
@@ -174,7 +219,12 @@ class Node {
   float d_ = 0.0f;
   float m_ = 0.0f;
   uint32_t n_ = 0;
-  uint32_t n_in_flight_ = 0;
+  // Mutated outside the unique-lock backup path (workers concurrently
+  // claim and release via TryStartScoreUpdate / IncrementNInFlight /
+  // FinalizeScoreUpdate). Must be atomic so that concurrent
+  // PickNodeToExtend walks (taking only shared_lock) see consistent
+  // values and CAS correctly serializes leaf claims.
+  std::atomic<uint32_t> n_in_flight_{0};
   uint16_t index_;
   uint16_t num_edges_ = 0;  // Shogi can have 500+ legal moves (chess only ~218)
   Terminal terminal_type_ : 2;

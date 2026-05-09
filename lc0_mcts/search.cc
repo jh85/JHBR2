@@ -388,6 +388,14 @@ SearchWorker::NodeToProcess SearchWorker::PickNodeToExtend() {
   std::vector<Move> moves;
   bool is_root = true;
 
+  // TODO(concurrency): atomic n_in_flight_ is in place, but
+  // Edge_Iterator::GetOrSpawnNode mutates the parent's child
+  // unique_ptr chain non-atomically. Two workers concurrently
+  // spawning siblings on the same parent corrupt the linked list
+  // and trigger a double-free in libc free (verified via SIGSEGV
+  // trace with shared_lock here at WorkersPerGpu>=2). Keep
+  // unique_lock until GetOrSpawnNode is made concurrency-safe
+  // (e.g. via per-parent spawn mutex or a CAS-based child list).
   std::unique_lock<std::shared_mutex> lock(search_->nodes_mutex_);
 
   while (true) {

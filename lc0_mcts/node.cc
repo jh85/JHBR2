@@ -182,7 +182,7 @@ std::string Node::DebugString() const {
   oss << " Term:" << static_cast<int>(terminal_type_) << " This:" << this
       << " Parent:" << parent_ << " Index:" << index_
       << " Child:" << child_.get() << " Sibling:" << sibling_.get()
-      << " WL:" << wl_ << " N:" << n_ << " NIF:" << n_in_flight_
+      << " WL:" << wl_ << " N:" << n_ << " NIF:" << n_in_flight_.load()
       << " Edges:" << static_cast<int>(num_edges_) << " Solid:" << solid_children_;
   return oss.str();
 }
@@ -272,15 +272,24 @@ void Node::SetBounds(GameResult lower, GameResult upper) {
 }
 
 bool Node::TryStartScoreUpdate() {
-  if (n_ == 0 && n_in_flight_ > 0) return false;
-  ++n_in_flight_;
-  return true;
+  // Atomic CAS: increment n_in_flight_ unless this is an unvisited
+  // node that someone else has already claimed (n_==0 && nif>0).
+  uint32_t expected = n_in_flight_.load(std::memory_order_acquire);
+  while (true) {
+    if (n_ == 0 && expected > 0) return false;
+    if (n_in_flight_.compare_exchange_weak(
+            expected, expected + 1,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+      return true;
+    }
+    // expected has been refreshed by compare_exchange_weak; loop.
+  }
 }
 
 void Node::CancelScoreUpdate(int multivisit) {
   assert(multivisit >= 0);
-  assert(n_in_flight_ >= static_cast<uint32_t>(multivisit));
-  n_in_flight_ -= multivisit;
+  n_in_flight_.fetch_sub(static_cast<uint32_t>(multivisit),
+                         std::memory_order_acq_rel);
 }
 
 void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
@@ -288,7 +297,8 @@ void Node::FinalizeScoreUpdate(float v, float d, float m, int multivisit) {
   d_ += multivisit * (d - d_) / (n_ + multivisit);
   m_ += multivisit * (m - m_) / (n_ + multivisit);
   n_ += multivisit;
-  n_in_flight_ -= multivisit;
+  n_in_flight_.fetch_sub(static_cast<uint32_t>(multivisit),
+                         std::memory_order_acq_rel);
 }
 
 void Node::AdjustForTerminal(float v, float d, float m, int multivisit) {
