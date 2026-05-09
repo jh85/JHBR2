@@ -11,8 +11,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -22,6 +24,44 @@
 #include "lc0_mcts/types.h"
 
 namespace lc0_shogi {
+
+// =====================================================================
+// Per-parent spawn locks (bucket-hashed). Serialize concurrent reads
+// of and writes to a parent's child sibling-list. Used by PickNodeToExtend
+// during PUCT iteration and by Edge_Iterator::GetOrSpawnNode when
+// inserting a fresh child Node into the chain.
+//
+// 256 buckets is a textbook size: collision probability between two
+// unrelated parents is ~0.4%; total memory is ~10 KB. Bucket selection
+// hashes the parent address, mixing high bits so that pointer alignment
+// doesn't cause clustering.
+// =====================================================================
+namespace spawn_lock {
+
+inline constexpr int kBuckets = 256;
+
+inline std::array<std::mutex, kBuckets>& Mutexes() {
+  static std::array<std::mutex, kBuckets> arr;
+  return arr;
+}
+
+inline std::mutex& MutexFor(const void* parent) {
+  uintptr_t h = reinterpret_cast<uintptr_t>(parent);
+  h ^= h >> 16;
+  h ^= h >> 8;
+  return Mutexes()[h & (kBuckets - 1)];
+}
+
+class Guard {
+ public:
+  explicit Guard(const void* parent) : lock_(MutexFor(parent)) {}
+  Guard(const Guard&) = delete;
+  Guard& operator=(const Guard&) = delete;
+ private:
+  std::lock_guard<std::mutex> lock_;
+};
+
+}  // namespace spawn_lock
 
 class Node;
 
@@ -341,6 +381,17 @@ class Edge_Iterator : public EdgeAndNode {
   Node* GetOrSpawnNode(Node* parent) {
     if (node_) return node_;
     assert(node_ptr_ != nullptr);
+    // Bucket-hashed lock on parent: serializes concurrent modifications
+    // to parent's child sibling-list. Reads of the same chain (in
+    // PickNodeToExtend's PUCT iteration) must take the same lock.
+    spawn_lock::Guard g(parent);
+    return SpawnUnlocked(parent);
+  }
+
+  // Same as GetOrSpawnNode but assumes the caller already holds the
+  // appropriate spawn_lock on `parent` (used by PickNodeToExtend to
+  // avoid re-acquiring the non-recursive mutex).
+  Node* SpawnUnlocked(Node* parent) {
     Actualize();
     if (node_) return node_;
     std::unique_ptr<Node> tmp = std::move(*node_ptr_);
