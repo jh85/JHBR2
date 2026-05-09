@@ -86,6 +86,10 @@ class ShogiBoard {
   // --- Queries ---
 
   Color side_to_move() const { return side_to_move_; }
+  // Plies played from the SetStartPos / SetFromSfen origin. DoMove
+  // increments by 1, undo_move decrements by 1. Used for draw-by-
+  // move-limit detection (e.g. floodgate's 320-ply cap).
+  int ply() const { return ply_; }
   Piece piece_on(Square sq) const { return board_[sq.as_idx()]; }
   bool empty(Square sq) const { return board_[sq.as_idx()].IsNone(); }
   Hand hand(Color c) const { return hand_[c]; }

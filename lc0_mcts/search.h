@@ -143,6 +143,16 @@ struct SearchConfig {
   // Multi-GPU: number of GPUs (1 or 2).
   int num_gpus = 1;
 
+  // Game-end-by-move-limit cap. Positions reached at ply > this are
+  // treated as draw terminals before NN evaluation. floodgate uses
+  // 320 plies; wdoor uses 512. Default 100000 effectively disables.
+  // The check fires only after the limit is within search horizon
+  // (typically the last 30-50 plies of a long game). It does NOT
+  // help engines "plan ahead" hundreds of plies in advance — that
+  // requires moves-remaining as an NN input feature, which we don't
+  // have. See discussion in dlshogi WCSC36 vs Suisho draw incident.
+  int max_moves_to_draw = 100000;
+
   // Cap for the combined batch sent to a single GPU call from
   // Backend::GPULoop. If the merged worker submissions exceed this,
   // GPULoop chunks the batch into back-to-back calls. Must be ≤ the

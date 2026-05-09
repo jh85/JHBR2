@@ -457,6 +457,15 @@ void SearchWorker::ExtendNodeInPlace(NodeToProcess& ntp) {
   ShogiBoard board = search_->root_board_;
   for (const auto& m : ntp.moves_to_node) board.DoMove(m);
 
+  // Draw by move-limit (e.g. floodgate's 320-ply cap). Checked before
+  // legal-move generation, mate detection, and NN eval — the position
+  // is dead at this depth regardless of what's playable.
+  if (node != search_->root_node_ &&
+      board.ply() > config_.max_moves_to_draw) {
+    node->MakeTerminal(GameResult::DRAW);
+    return;
+  }
+
   auto legal_moves = board.GenerateLegalMoves();
 
   if (legal_moves.empty()) {
@@ -825,6 +834,14 @@ void SearchWorker::ExtendNode(Node* node, int depth,
                               const std::vector<Move>& moves) {
   ShogiBoard board = search_->root_board_;
   for (const auto& m : moves) board.DoMove(m);
+
+  // Draw by move-limit (e.g. floodgate's 320-ply cap). See
+  // ExtendNodeInPlace for rationale.
+  if (node != search_->root_node_ &&
+      board.ply() > config_.max_moves_to_draw) {
+    node->MakeTerminal(GameResult::DRAW);
+    return;
+  }
 
   auto legal_moves = board.GenerateLegalMoves();
 
