@@ -60,6 +60,7 @@ struct UndoInfo {
   Hand prev_hand;           // Hand of the side that moved, before the move
   uint64_t prev_hash;       // Position hash before the move
   int prev_continuous_check; // Continuous check counter for the moving side
+  bool updated_auxiliary = true; // Hash/history/check counters were updated
 };
 
 // =====================================================================
@@ -242,8 +243,16 @@ class ShogiBoard {
   // Move a piece (remove from src, place at dst). Does not handle captures.
   void MovePiece(Square from, Square to);
 
+  // Internal move application. Move generation uses the lightweight mode
+  // because temporary legality checks do not need hash/history/check counters.
+  UndoInfo DoMoveInternal(Move m, bool update_auxiliary);
+  UndoInfo DoMoveForMovegen(Move m) { return DoMoveInternal(m, false); }
+
   // Generate pseudo-legal board moves (non-drop).
   void GenerateBoardMoves(MoveList& moves) const;
+
+  // Generate legal board moves when the side to move is not in check.
+  void GenerateBoardMovesNonCheck(MoveList& moves, const Bitboard& pinned) const;
 
   // Generate pseudo-legal drop moves.
   void GenerateDropMoves(MoveList& moves) const;
@@ -258,6 +267,9 @@ class ShogiBoard {
   // Combined attacks for a piece (step + sliding as applicable).
   Bitboard PieceAttacks(PieceType pt, Color c, Square sq,
                         const Bitboard& occ) const;
+
+  // Fast yes/no attack query. Avoids building a full attackers bitboard.
+  bool IsSquareAttacked(Square sq, const Bitboard& occ, Color attacker) const;
 
   // Compute hash from scratch (called after SetFromSfen).
   void ComputeHash();

@@ -34,6 +34,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <cstdint>
 #include <functional>
@@ -215,10 +216,18 @@ class Bitboard {
   // Layout: plane[rank][file] matches the input tensor convention.
   // The square at (file f, rank r) = f*9+r maps to plane[r][f].
   void ToPlane(float* plane_81) const {
-    for (int i = 0; i < 81; ++i) {
-      int f = i / 9;
-      int r = i % 9;
-      plane_81[r * 9 + f] = Test(Square::FromIdx(i)) ? 1.0f : 0.0f;
+    std::fill(plane_81, plane_81 + 81, 0.0f);
+    uint64_t lo = p_[0];
+    while (lo) {
+      int bit = std::countr_zero(lo);
+      lo &= lo - 1;
+      plane_81[(bit % 9) * 9 + bit / 9] = 1.0f;
+    }
+    uint64_t hi = p_[1];
+    while (hi) {
+      int bit = std::countr_zero(hi) + kBBSplit;
+      hi &= hi - 1;
+      plane_81[(bit % 9) * 9 + bit / 9] = 1.0f;
     }
   }
 
@@ -383,6 +392,11 @@ extern Bitboard DragonStepBB[kSquareNB];
 // LanceMaskBB[sq][WHITE] = squares on same file with rank > sq's rank.
 extern Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
 
+// Empty-board slider effects. These are equivalent to calling the
+// corresponding effect function with Bitboard::Zero().
+extern Bitboard RookEffectBB[kSquareNB];
+extern Bitboard BishopEffectBB[kSquareNB];
+
 // =====================================================================
 // CHECK TABLES — used by GenerateCheckingMovesFast (Phase 7).
 //
@@ -529,7 +543,33 @@ inline Bitboard LanceEffect(Color c, Square sq, const Bitboard& occ) {
 
 // Rook file (vertical) effect = BLACK lance + WHITE lance.
 inline Bitboard RookFileEffect(Square sq, const Bitboard& occ) {
-  return LanceEffect(BLACK, sq, occ) | LanceEffect(WHITE, sq, occ);
+  int i = sq.as_idx();
+  if (Bitboard::Part(sq) == 0) {
+    uint64_t white_mask = LanceMaskBB[i][WHITE].Lo();
+    uint64_t white_occ = occ.Lo() & white_mask;
+    uint64_t white = (white_occ ^ (white_occ - 1)) & white_mask;
+
+    uint64_t black_mask = LanceMaskBB[i][BLACK].Lo();
+    uint64_t black_occ = occ.Lo() & black_mask;
+    int msb = 63 - __builtin_clzll(black_occ | 1);
+    uint64_t black = (UINT64_C(0xFFFFFFFFFFFFFFFF) << msb) & black_mask;
+    return Bitboard::FromRaw(white | black, 0);
+  }
+
+  uint64_t white_mask = LanceMaskBB[i][WHITE].Hi();
+  uint64_t white_occ = occ.Hi() & white_mask;
+  uint64_t white = (white_occ ^ (white_occ - 1)) & white_mask;
+
+  uint64_t black_mask = LanceMaskBB[i][BLACK].Hi();
+  uint64_t black_occ = occ.Hi() & black_mask;
+  int msb = 63 - __builtin_clzll(black_occ | 1);
+  uint64_t black = (UINT64_C(0xFFFFFFFFFFFFFFFF) << msb) & black_mask;
+  return Bitboard::FromRaw(0, white | black);
+}
+
+// Rook full effect = file + rank.
+inline Bitboard RookEffect(Square sq, const Bitboard& occ) {
+  return RookFileEffect(sq, occ) | RookRankEffect(sq, occ);
 }
 
 // Initialize all tables.  Must be called once at startup.

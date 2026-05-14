@@ -24,6 +24,8 @@ Bitboard KingEffectBB[kSquareNB];
 Bitboard HorseStepBB[kSquareNB];
 Bitboard DragonStepBB[kSquareNB];
 Bitboard LanceMaskBB[kSquareNB][COLOR_NB];
+Bitboard RookEffectBB[kSquareNB];
+Bitboard BishopEffectBB[kSquareNB];
 Bitboard PawnCheckBB[kSquareNB][COLOR_NB];
 Bitboard KnightCheckBB[kSquareNB][COLOR_NB];
 Bitboard SilverCheckBB[kSquareNB][COLOR_NB];
@@ -206,11 +208,11 @@ static void InitDirectAttackTables() {
       if (SilverEffectBB[s_idx][WHITE].Test(ksq)) SilverCheckBB[ksq_idx][WHITE].Set(s);
       if (GoldEffectBB[s_idx][BLACK].Test(ksq))   GoldCheckBB[ksq_idx][BLACK].Set(s);
       if (GoldEffectBB[s_idx][WHITE].Test(ksq))   GoldCheckBB[ksq_idx][WHITE].Set(s);
-      if (LanceEffect(BLACK, s, Bitboard::Zero()).Test(ksq))
+      if (LanceMaskBB[s_idx][BLACK].Test(ksq))
         LanceCheckBB[ksq_idx][BLACK].Set(s);
-      if (LanceEffect(WHITE, s, Bitboard::Zero()).Test(ksq))
+      if (LanceMaskBB[s_idx][WHITE].Test(ksq))
         LanceCheckBB[ksq_idx][WHITE].Set(s);
-      if (BishopEffect(s, Bitboard::Zero()).Test(ksq))
+      if (BishopEffectBB[s_idx].Test(ksq))
         BishopCheckBB[ksq_idx].Set(s);
     }
     HorseCheckBB[ksq_idx] = BishopCheckBB[ksq_idx] | HorseStepBB[ksq_idx];
@@ -315,13 +317,13 @@ static void InitMoveCheckTables() {
       // -------- Lance --------
       {
         // Start with the file ray (the natural lance reach to ksq).
-        Bitboard tbl = LanceEffect(opp, ksq, Bitboard::Zero());
+        Bitboard tbl = LanceMaskBB[ksq_idx][opp];
         // Add: squares from which lance moves to ksq's gold-attack-zone
         // INSIDE promo zone (lance promotes to gold there).
         Bitboard candidates = GoldEffectBB[ksq_idx][opp] & promo_zone;
         while (candidates.Any()) {
           Square checkSq = candidates.Pop();
-          tbl |= LanceEffect(opp, checkSq, Bitboard::Zero());
+          tbl |= LanceMaskBB[checkSq.as_idx()][opp];
         }
         // Subtract: ksq itself and pawn-attack-ksq squares (already-checking).
         tbl = tbl & ~ksq_bit & ~PawnEffectBB[ksq_idx][opp];
@@ -357,10 +359,10 @@ static void InitMoveCheckTables() {
         Bitboard tbl = Bitboard::Zero();
         // Part 1: bishop moves to a square attacking ksq (non-promoting).
         {
-          Bitboard candidates = BishopEffect(ksq, Bitboard::Zero());
+          Bitboard candidates = BishopEffectBB[ksq_idx];
           while (candidates.Any()) {
             Square checkSq = candidates.Pop();
-            tbl |= BishopEffect(checkSq, Bitboard::Zero());
+            tbl |= BishopEffectBB[checkSq.as_idx()];
           }
         }
         // Part 2: bishop promotes (target in promo zone) — promoted
@@ -370,7 +372,7 @@ static void InitMoveCheckTables() {
           Bitboard candidates = KingEffectBB[ksq_idx] & promo_zone;
           while (candidates.Any()) {
             Square checkSq = candidates.Pop();
-            tbl |= BishopEffect(checkSq, Bitboard::Zero());
+            tbl |= BishopEffectBB[checkSq.as_idx()];
           }
         }
         // Part 3: bishop in promo zone moves (and promotes — horse
@@ -379,7 +381,7 @@ static void InitMoveCheckTables() {
           Bitboard candidates = KingEffectBB[ksq_idx];
           while (candidates.Any()) {
             Square checkSq = candidates.Pop();
-            tbl |= BishopEffect(checkSq, Bitboard::Zero()) & promo_zone;
+            tbl |= BishopEffectBB[checkSq.as_idx()] & promo_zone;
           }
         }
         tbl = tbl & ~ksq_bit;
@@ -391,10 +393,10 @@ static void InitMoveCheckTables() {
       if (c_int == 0) {
         Bitboard tbl = Bitboard::Zero();
         // Horse attack pattern = bishop diagonals + 4-cardinal step.
-        Bitboard candidates = BishopEffect(ksq, Bitboard::Zero()) | HorseStepBB[ksq_idx];
+        Bitboard candidates = BishopEffectBB[ksq_idx] | HorseStepBB[ksq_idx];
         while (candidates.Any()) {
           Square checkSq = candidates.Pop();
-          tbl |= BishopEffect(checkSq, Bitboard::Zero()) | HorseStepBB[checkSq.as_idx()];
+          tbl |= BishopEffectBB[checkSq.as_idx()] | HorseStepBB[checkSq.as_idx()];
         }
         tbl = tbl & ~ksq_bit;
         HorseMoveCheckBB[ksq_idx] = tbl;
@@ -466,6 +468,15 @@ static void InitQugiyMasks() {
   }
 }
 
+static void InitEmptySliderEffects() {
+  for (int sq = 0; sq < kSquareNB; ++sq) {
+    const int f = sq / kBoardSize;
+    const int r = sq % kBoardSize;
+    RookEffectBB[sq] = (FileBB[f] | RankBB[r]) & ~SquareBB[sq];
+    BishopEffectBB[sq] = BishopEffect(Square::FromIdx(sq), Bitboard::Zero());
+  }
+}
+
 void Init() {
   // Square bitboards.
   for (int sq = 0; sq < kSquareNB; ++sq) {
@@ -501,6 +512,9 @@ void Init() {
 
   // Qugiy sliding attack masks.
   InitQugiyMasks();
+
+  // Empty-board slider effects.
+  InitEmptySliderEffects();
 
   // Direct-attack check tables (used for drop classification).
   InitDirectAttackTables();

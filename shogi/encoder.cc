@@ -86,11 +86,10 @@ void Init() {
 // --- Input encoding ---
 
 ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
-  ShogiInputPlanes planes;
+  ShogiInputPlanes planes{};
 
   // Flip board if WHITE to move (always encode from mover's perspective).
   ShogiBoard b = (board.side_to_move() == WHITE) ? board.Flipped() : board;
-  // After flipping, side_to_move is always effectively BLACK.
 
   Color us = BLACK;
   Color them = WHITE;
@@ -102,12 +101,12 @@ ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
   };
 
   for (int i = 0; i < 14; ++i) {
-    planes[i].SetFromBitboard(b.pieces(us, piece_types[i]));
+    planes[i].SetBitsFromBitboard(b.pieces(us, piece_types[i]));
   }
 
   // Planes 14-27: Their 14 piece types.
   for (int i = 0; i < 14; ++i) {
-    planes[14 + i].SetFromBitboard(b.pieces(them, piece_types[i]));
+    planes[14 + i].SetBitsFromBitboard(b.pieces(them, piece_types[i]));
   }
 
   // Plane 28: Repetition flag (1 if current position has occurred before).

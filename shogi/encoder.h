@@ -30,7 +30,10 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -51,7 +54,7 @@ struct ShogiInputPlane {
   float data[81] = {};
 
   void SetAll(float val = 1.0f) {
-    for (int i = 0; i < 81; ++i) data[i] = val;
+    std::fill(data, data + 81, val);
   }
   void Clear() { SetAll(0.0f); }
 
@@ -59,12 +62,23 @@ struct ShogiInputPlane {
   // Layout: data[rank * 9 + file] to match the training convention.
   void SetFromBitboard(const Bitboard& bb) {
     Clear();
-    Bitboard tmp = bb;
-    while (tmp.Any()) {
-      Square sq = tmp.Pop();
-      int f = sq.as_idx() / 9;
-      int r = sq.as_idx() % 9;
-      data[r * 9 + f] = 1.0f;
+    SetBitsFromBitboard(bb);
+  }
+
+  // Set 1.0 where bb has bits. Existing zero values are preserved, so callers
+  // must only use this on a freshly-cleared plane.
+  void SetBitsFromBitboard(const Bitboard& bb) {
+    uint64_t lo = bb.Lo();
+    while (lo) {
+      int bit = std::countr_zero(lo);
+      lo &= lo - 1;
+      data[(bit % 9) * 9 + bit / 9] = 1.0f;
+    }
+    uint64_t hi = bb.Hi();
+    while (hi) {
+      int bit = std::countr_zero(hi) + kBBSplit;
+      hi &= hi - 1;
+      data[(bit % 9) * 9 + bit / 9] = 1.0f;
     }
   }
 };
