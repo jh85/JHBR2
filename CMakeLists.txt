@@ -61,9 +61,9 @@ endif()
 
 # Shogi engine (board, bitboard, types, encoder)
 set(SHOGI_ENGINE_SRCS
-  shogi_engine/board.cc
-  shogi_engine/bitboard.cc
-  shogi_engine/encoder.cc
+  shogi/board.cc
+  shogi/bitboard.cc
+  shogi/encoder.cc
 )
 
 # MCTS (lc0-style port + NN backend)
@@ -98,19 +98,9 @@ set(USI_SRCS
 )
 
 # ---- Include directories ----
-# The shogi_engine/ headers use #include "shogi/board.h" etc.
-# We need to map shogi_engine/ -> shogi/ for includes.
-# Solution: add the parent with a symlink, or adjust includes.
-# Simplest: use the actual directory as include path.
+# The shogi/ headers use #include "shogi/board.h" — directory and
+# include path now match, no shim needed.
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
-
-# For #include "shogi/..." to work, create the mapping
-# shogi_engine headers are included as "shogi/board.h" in lc0 style
-# We'll fix this by adding an include alias
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/shogi)
-  file(CREATE_LINK ${CMAKE_CURRENT_SOURCE_DIR}/shogi_engine
-    ${CMAKE_CURRENT_SOURCE_DIR}/shogi SYMBOLIC)
-endif()
 
 # ---- Library: shogi engine core ----
 add_library(shogi_core STATIC ${SHOGI_ENGINE_SRCS})

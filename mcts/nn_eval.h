@@ -2,7 +2,7 @@
   JHBR2 Shogi Engine — Neural Network Evaluator
 
   ONNX Runtime C++ interface for batched NN inference.
-  Uses the encoder from shogi_engine/encoder.h for input/output mapping.
+  Uses the encoder from shogi/encoder.h for input/output mapping.
 
   Reference: lc0 src/neural/onnx/builder.h
 */

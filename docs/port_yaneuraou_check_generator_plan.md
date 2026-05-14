@@ -39,9 +39,9 @@ Any regression is caught immediately on the 5,200+ position corpus.
 
 | File | Action | Notes |
 |---|---|---|
-| `shogi_engine/bitboard.h`, `bitboard.cc` | Add precomputed check tables to `ShogiTables` | One bitboard per (color, king_sq, piece_type) for steppers; one per (color, king_sq) for lances; per king_sq for bishop/rook |
-| `shogi_engine/board.h` | Add `DiscoveredCheckBB()` method | Bitboard of OUR pieces whose move would discover check |
-| `shogi_engine/board.h`, `board.cc` | Add `GenerateCheckingMovesFast` | The main port |
+| `shogi/bitboard.h`, `bitboard.cc` | Add precomputed check tables to `ShogiTables` | One bitboard per (color, king_sq, piece_type) for steppers; one per (color, king_sq) for lances; per king_sq for bishop/rook |
+| `shogi/board.h` | Add `DiscoveredCheckBB()` method | Bitboard of OUR pieces whose move would discover check |
+| `shogi/board.h`, `board.cc` | Add `GenerateCheckingMovesFast` | The main port |
 | `test/test_check_movegen.cc` | Add Fast vs Slow property test | Existing test extended |
 | `mate/shallow_mate.h` | Switch to Fast (after validation) | One-line change per call site |
 

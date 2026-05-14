@@ -49,7 +49,7 @@ flat-Node-array approach.
 - `mcts/nn_tensorrt.{h,cc}` — multi-slot direct TRT. Per-worker
   `IExecutionContext` + CUDA stream + buffers. Already correct.
 - `mcts/nn_eval.{h,cc}` — ORT fallback path.
-- `shogi/board.{h,cc}`, `shogi_engine/` — board representation,
+- `shogi/board.{h,cc}`, `shogi/` — board representation,
   move generation, encoder. Includes recent fixes: OUTE_SENNICHITE
   detection (`continuous_check_` += 2, 2nd-occurrence detect),
   `MaxMovesToDraw`, `ply()` accessor, `CanDeclareWin`.
@@ -242,9 +242,6 @@ acceptance for step 3 in the master plan.
   default to set instead of clear. Use `static` inside an inline
   function (Meyers singleton pattern) or just make sure the array
   initializes to clear.
-- **`shogi/` is a symlink to `shogi_engine/`** in our repo. `git add
-  shogi/board.h` fails with "beyond a symbolic link" — use the real
-  path `shogi_engine/board.h`.
 - **TRT engine cache files** are keyed by file path under
   `trt_cache/`. Changing input plane count or max batch invalidates
   the cache (will rebuild on first run, takes a few minutes).
@@ -265,7 +262,7 @@ acceptance for step 3 in the master plan.
 │   ├── usi/UctSearch.{h,cpp}  # ← port from
 │   ├── usi/main.cpp           # ← USI loop reference
 │   └── cppshogi/Node.h        # ← port from
-├── shogi_engine/              # our board (real path; shogi/ is a symlink)
+├── shogi/                     # our board (real path; shogi/ is a symlink)
 ├── lc0_mcts/                  # current MCTS (don't touch in this step)
 ├── mcts/                      # NN evaluator (keep, don't touch)
 ├── usi/                       # USI engine (touch only for build flag)
