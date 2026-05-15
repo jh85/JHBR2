@@ -168,13 +168,12 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     onnx_path_ = value;
   } else if (name_lower == "noiseepsilon") {
     noise_epsilon_ = std::stof(value);
-    lc0_config_.noise_epsilon = noise_epsilon_;
+    // dlshogi-style search does not inject root noise in USI play.
   } else if (name_lower == "usegpu") {
     use_gpu_ = (value == "true");
   } else if (name_lower == "threads") {
     // Backward-compat alias for WorkersPerGpu.
     int n = std::stoi(value);
-    lc0_config_.num_threads = n;
     lc0_config_.workers_per_gpu = n;
     lc0_search_.reset();
     evaluators_.clear();
@@ -182,24 +181,21 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     int n = std::stoi(value);
     if (n < 1) n = 1;
     lc0_config_.workers_per_gpu = n;
-    lc0_config_.num_threads = n;
     // Each evaluator must be (re-)constructed with this many TRT
     // execution slots, so drop both Search and evaluators.
     lc0_search_.reset();
     evaluators_.clear();
   } else if (name_lower == "minibatchsize") {
     lc0_config_.minibatch_size = std::stoi(value);
+    lc0_search_.reset();
   } else if (name_lower == "perleafgathering") {
-    lc0_config_.per_leaf_gathering = (value == "true");
+    // Per-leaf gathering is always enabled by the dlshogi-style worker loop.
   } else if (name_lower == "leafdfpnnodes") {
-    lc0_config_.leaf_dfpn_nodes = std::stoi(value);
+    // df-pn at MCTS leaves is not part of this backend; use shallow mate.
   } else if (name_lower == "leafmatemode") {
-    using Mode = lc0_shogi::SearchConfig::LeafMateMode;
     std::string v = value;
     for (auto& c : v) c = std::tolower(c);
-    if (v == "off") lc0_config_.leaf_mate_mode = Mode::kOff;
-    else if (v == "shallow") lc0_config_.leaf_mate_mode = Mode::kShallow;
-    else lc0_config_.leaf_mate_mode = Mode::kDfpn;  // default fallback
+    lc0_config_.leaf_mate_depth = (v == "shallow") ? 3 : 0;
   } else if (name_lower == "leafmatedepth") {
     int d = std::stoi(value);
     // Clamp to supported odd values: 1, 3, 5, 7.
@@ -208,13 +204,12 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     if (d % 2 == 0) d -= 1;          // round even down to odd
     lc0_config_.leaf_mate_depth = d;
   } else if (name_lower == "nncachesize") {
-    lc0_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
-    // If a Search is already constructed it has the OLD cache size.
-    // Drop it so the next `go` rebuilds with the new cache.
-    lc0_search_.reset();
+    // The dlshogi-style backend submits direct batches and has no NN cache.
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
     lc0_config_.num_gpus = num_gpus_;
+    evaluators_.clear();
+    lc0_search_.reset();
   } else if (name_lower == "maxmovestodraw") {
     int n = std::stoi(value);
     if (n < 1) n = 1;
@@ -223,10 +218,9 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     float w = std::stof(value);
     if (w < 0.1f) w = 0.1f;
     if (w > 100.0f) w = 100.0f;
-    lc0_config_.virtual_loss_weight = w;
+    (void)w;
   } else if (name_lower == "maxgpubatch") {
     max_gpu_batch_ = std::stoi(value);
-    lc0_config_.max_gpu_batch = max_gpu_batch_;
     // Evaluators bake the TRT max_shapes profile at construction time, so
     // a change here only takes effect after isready rebuilds them.
     evaluators_.clear();
@@ -411,9 +405,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     dfpn->done = true;
   });
 
-  // --- Run lc0-style MCTS ---
+  // --- Run dlshogi-style MCTS ---
   // Set info callback for periodic GUI output during search.
-  lc0_config_.info_callback = [this](const lc0_shogi::SearchInfo& info) {
+  lc0_config_.info_callback = [this](const dlshogi_mcts::SearchInfo& info) {
     std::string pv_str;
     for (const auto& m : info.pv) {
       if (!pv_str.empty()) pv_str += " ";
@@ -427,13 +421,13 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
          (pv_str.empty() ? "" : " pv " + pv_str));
   };
 
-  // Persistent Search across `go` commands (tree reuse).
+  // Persistent Search object across `go` commands.
   if (!lc0_search_) {
     std::vector<jhbr2::NNEvaluator*> eval_ptrs;
     for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
-    lc0_search_ = std::make_unique<lc0_shogi::Search>(eval_ptrs, lc0_config_);
+    lc0_search_ = std::make_unique<dlshogi_mcts::Search>(eval_ptrs, lc0_config_);
   }
-  // Persistent Search holds its own config snapshot — push per-move
+  // Search holds its own config snapshot — push per-move
   // updates so max_time / max_nodes reflect THIS go command, not the
   // first one ever issued.
   lc0_search_->SetMaxTime(lc0_config_.max_time);

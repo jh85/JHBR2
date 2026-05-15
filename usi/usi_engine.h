@@ -18,8 +18,8 @@
 #else
 #include "mcts/nn_eval.h"
 #endif
+#include "dlshogi_mcts/uct_search.h"
 #include "lc0_mcts/book.h"
-#include "lc0_mcts/search.h"
 #include "shogi/board.h"
 
 namespace jhbr2 {
@@ -54,8 +54,8 @@ class USIEngine {
   // --- Members ---
   lczero::ShogiBoard board_;
   std::vector<std::unique_ptr<NNEvaluator>> evaluators_;
-  std::unique_ptr<lc0_shogi::Search> lc0_search_;
-  lc0_shogi::SearchConfig lc0_config_;
+  std::unique_ptr<dlshogi_mcts::Search> lc0_search_;
+  dlshogi_mcts::SearchConfig lc0_config_;
   int game_ply_ = 0;
 
   // Options

@@ -75,14 +75,21 @@ set(LC0_MCTS_SRCS
   lc0_mcts/book.cc
 )
 
+set(DLSHOGI_MCTS_SRCS
+  dlshogi_mcts/uct_node.cc
+  dlshogi_mcts/uct_search.cc
+)
+
 if(USE_TENSORRT)
   set(MCTS_SRCS
     ${LC0_MCTS_SRCS}
+    ${DLSHOGI_MCTS_SRCS}
     mcts/nn_tensorrt.cc
   )
 else()
   set(MCTS_SRCS
     ${LC0_MCTS_SRCS}
+    ${DLSHOGI_MCTS_SRCS}
     mcts/nn_eval.cc
   )
 endif()
@@ -117,9 +124,39 @@ target_link_libraries(mcts PUBLIC shogi_core mate_solver)
 if(USE_TENSORRT)
   # Native TensorRT backend.
   find_package(CUDAToolkit REQUIRED)
+  set(TENSORRT_ROOT "" CACHE PATH "TensorRT installation root")
+  set(CUDNN_ROOT "" CACHE PATH "cuDNN installation root")
+  if(NOT TENSORRT_ROOT)
+    find_path(TENSORRT_INCLUDE_DIR NvInfer.h)
+    find_library(TENSORRT_NVINFER nvinfer)
+  else()
+    find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+      PATHS ${TENSORRT_ROOT}/include NO_DEFAULT_PATH)
+    find_library(TENSORRT_NVINFER nvinfer
+      PATHS ${TENSORRT_ROOT}/lib NO_DEFAULT_PATH)
+  endif()
+  if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_NVINFER)
+    message(FATAL_ERROR "TensorRT not found. Set -DTENSORRT_ROOT=/path/to/TensorRT")
+  endif()
+  message(STATUS "TensorRT include: ${TENSORRT_INCLUDE_DIR}")
+  message(STATUS "TensorRT nvinfer: ${TENSORRT_NVINFER}")
   target_compile_definitions(mcts PUBLIC USE_TENSORRT=1)
-  target_include_directories(mcts PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
-  target_link_libraries(mcts PUBLIC nvinfer CUDA::cudart)
+  target_include_directories(mcts PUBLIC
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${TENSORRT_INCLUDE_DIR}
+  )
+  target_link_libraries(mcts PUBLIC ${TENSORRT_NVINFER} CUDA::cudart)
+  if(CUDNN_ROOT)
+    target_include_directories(mcts PUBLIC ${CUDNN_ROOT}/include)
+    target_link_directories(mcts PUBLIC ${CUDNN_ROOT}/lib)
+    set_target_properties(mcts PROPERTIES
+      BUILD_RPATH "${TENSORRT_ROOT}/lib;${CUDNN_ROOT}/lib;${CUDAToolkit_LIBRARY_DIR}"
+    )
+  else()
+    set_target_properties(mcts PROPERTIES
+      BUILD_RPATH "${TENSORRT_ROOT}/lib;${CUDAToolkit_LIBRARY_DIR}"
+    )
+  endif()
 elseif(ORT_INCLUDE)
   # ONNX Runtime backend.
   target_include_directories(mcts PUBLIC ${ORT_INCLUDE})
