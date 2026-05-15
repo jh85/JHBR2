@@ -689,6 +689,40 @@ mutex bucket scheme) while writing only the integration/glue
 fresh. The algorithm correctness comes from dlshogi's tested
 formulas; the code structure comes from jhbr2's idioms.
 
+## 19.5. Reference: prior #ifdef cleanup work
+
+A previous attempt at mechanical porting produced an
+ifdef-stripped version of dlshogi's source at
+`~/Downloads/dlsport/JHBR2/dlshogi_mcts/` (local-only, not in
+git). The following compile options were determined to be
+**unneeded for our use case** and stripped from that local copy
+via `unifdef -U`:
+
+- `PV_MATE_SEARCH` — dlshogi's background mate search on principal
+  variation. Defer; revisit if shallow mate proves insufficient.
+- `ONNXRUNTIME` — alternate NN backend. We use direct TRT only.
+- `MULTI_PONDER` — cluster-mode pondering across multiple machines.
+  Not relevant for our single-machine setup.
+- `MAKE_BOOK` — opening-book builder binary. Separate target,
+  not search.
+- `BOOK_POLICY` — opening-book policy bias inside MCTS. Defer;
+  jhbr2's existing book integration handles this at the USI layer
+  (book lookup before MCTS is invoked).
+
+For the implementing agent: the `~/Downloads/dlsport/...` source
+is **easier to read** than the original DeepLearningShogi/ source
+because the dead #ifdef branches are gone. Use it as a reference
+for the *algorithm structure* (PUCT, backup, batching, time
+management). But **don't** carry over its stub files
+(`color.hpp`, `position.hpp`, `move.hpp`, etc.) — those exist
+only to make the mechanical port compile and serve no purpose in
+the clean reimplementation specified by this design.
+
+If `~/Downloads/dlsport/JHBR2/dlshogi_mcts/` doesn't exist on
+your machine, the original `DeepLearningShogi/usi/UctSearch.cpp`
+is the same algorithm; just mentally skip the
+`#ifdef ONNXRUNTIME / MULTI_PONDER / etc.` branches.
+
 ## 20. Final word for the implementing agent
 
 Read dlshogi's `uct_search.cpp` and `uct_node.h` carefully — they
