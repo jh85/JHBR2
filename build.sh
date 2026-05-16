@@ -1,0 +1,36 @@
+#!/bin/bash
+
+export CUDA_PATH=/usr/local/cuda
+export TENSORRT_PATH=/data/work2/TensorRT-10.16.1.11
+export CUDNN_PATH=/data/work2/cudnn-linux-x86_64-9.22.0.52_cuda13-archive
+export MODEL_ONNX=/data/work2/shogi_bt4_epoch23_dynamic.onnx
+export CC=clang
+export CXX=clang++
+export BUILD_DIR=build-trt
+
+export LD_LIBRARY_PATH=$TENSORRT_PATH/lib:$CUDNN_PATH/lib:$CUDA_PATH/lib64:$LD_LIBRARY_PATH
+
+
+rm -rf "$BUILD_DIR"
+
+cmake -S . -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON \
+  -DCUDAToolkit_ROOT="$CUDA_PATH" \
+  -DTENSORRT_ROOT="$TENSORRT_PATH" \
+  -DCUDNN_ROOT="$CUDNN_PATH"
+
+cmake --build "$BUILD_DIR" -j"$(nproc)"
+
+./"$BUILD_DIR"/test_movegen test/positions.txt
+./"$BUILD_DIR"/test_check_movegen
+./"$BUILD_DIR"/test_shallow_mate
+
+mkdir -p engines
+
+$TENSORRT_PATH/bin/trtexec \
+  --onnx="$MODEL_ONNX" \
+  --saveEngine=engines/shogi_bt4_epoch23_trt_o128_m128_ws8192.engine \
+  --fp16 \
+  --minShapes=input_planes:1x48x9x9 \
+  --optShapes=input_planes:128x48x9x9 \
+  --maxShapes=input_planes:128x48x9x9 \
+  --memPoolSize=workspace:8192M
