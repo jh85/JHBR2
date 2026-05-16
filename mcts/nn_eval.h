@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "mcts/model_format.h"
 #include "shogi/board.h"
 #include "shogi/encoder.h"
 #include "shogi/types.h"
@@ -50,7 +51,8 @@ class NNEvaluator {
   // path but ignored here — ORT sessions are themselves single-threaded.
   explicit NNEvaluator(const std::string& onnx_path, bool use_gpu = true,
                        int device_id = 0, int max_batch_size = 1024,
-                       int num_slots = 1);
+                       int num_slots = 1,
+                       ModelFormat model_format = ModelFormat::kAuto);
   ~NNEvaluator();
 
   // Evaluate a single position.

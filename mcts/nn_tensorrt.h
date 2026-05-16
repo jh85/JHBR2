@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 
+#include "mcts/model_format.h"
 #include "shogi/board.h"
 #include "shogi/encoder.h"
 #include "shogi/types.h"
@@ -52,7 +53,8 @@ class NNEvaluator {
   // max_batch_size is forwarded to the ONNX Runtime path only.
   explicit NNEvaluator(const std::string& engine_path, bool use_gpu = true,
                        int device_id = 0, int max_batch_size = 1024,
-                       int num_slots = 1);
+                       int num_slots = 1,
+                       ModelFormat model_format = ModelFormat::kAuto);
   ~NNEvaluator();
 
   // Single-position / single-threaded helpers (always use slot 0).

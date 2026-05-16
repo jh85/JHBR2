@@ -40,6 +40,25 @@ static std::string ToLower(const std::string& s) {
   return r;
 }
 
+static ModelFormat ParseModelFormat(const std::string& s) {
+  std::string v = ToLower(s);
+  if (v == "dlshogi" || v == "dlshogimodel") return ModelFormat::kDlshogi;
+  if (v == "jhbr2" || v == "default") return ModelFormat::kJHBR2;
+  return ModelFormat::kAuto;
+}
+
+static std::string ModelFormatToString(ModelFormat format) {
+  switch (format) {
+    case ModelFormat::kAuto:
+      return "auto";
+    case ModelFormat::kJHBR2:
+      return "jhbr2";
+    case ModelFormat::kDlshogi:
+      return "dlshogi";
+  }
+  return "auto";
+}
+
 // =====================================================================
 // Constructor
 // =====================================================================
@@ -95,6 +114,8 @@ void USIEngine::CmdUsi() {
 
   Send("option name MaxNodes type spin default 800 min 1 max 10000000");
   Send("option name OnnxModel type string default shogi_bt4.onnx");
+  Send("option name ModelFormat type combo default auto var auto var jhbr2 var dlshogi");
+  Send("option name DlshogiModel type check default false");
   Send("option name NoiseEpsilon type string default 0.0");
   Send("option name UseGPU type check default true");
   // Threads is kept as an alias for WorkersPerGpu (backward compat).
@@ -131,10 +152,12 @@ void USIEngine::CmdIsReady() {
       evaluators_.push_back(
           std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
                                         max_gpu_batch_,
-                                        lc0_config_.workers_per_gpu));
+                                        lc0_config_.workers_per_gpu,
+                                        model_format_));
     }
 
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
+        ", format=" + ModelFormatToString(model_format_) +
         ", max_nodes=" + std::to_string(max_nodes_));
 
     // Load opening book if specified.
@@ -166,6 +189,17 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     max_nodes_ = std::stoi(value);
   } else if (name_lower == "onnxmodel") {
     onnx_path_ = value;
+    evaluators_.clear();
+    lc0_search_.reset();
+  } else if (name_lower == "modelformat") {
+    model_format_ = ParseModelFormat(value);
+    evaluators_.clear();
+    lc0_search_.reset();
+  } else if (name_lower == "dlshogimodel") {
+    model_format_ = (value == "true") ? ModelFormat::kDlshogi
+                                      : ModelFormat::kAuto;
+    evaluators_.clear();
+    lc0_search_.reset();
   } else if (name_lower == "noiseepsilon") {
     noise_epsilon_ = std::stof(value);
     // dlshogi-style search does not inject root noise in USI play.
@@ -195,7 +229,14 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   } else if (name_lower == "leafmatemode") {
     std::string v = value;
     for (auto& c : v) c = std::tolower(c);
-    lc0_config_.leaf_mate_depth = (v == "shallow") ? 3 : 0;
+    if (v == "shallow") {
+      if (lc0_config_.leaf_mate_depth <= 0 ||
+          lc0_config_.leaf_mate_depth % 2 == 0) {
+        lc0_config_.leaf_mate_depth = 5;
+      }
+    } else {
+      lc0_config_.leaf_mate_depth = 0;
+    }
   } else if (name_lower == "leafmatedepth") {
     int d = std::stoi(value);
     // Clamp to supported odd values: 1, 3, 5, 7.
@@ -386,9 +427,12 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   auto move_start_time = std::chrono::steady_clock::now();
-  int hard_deadline_ms = (max_move_time_ms_ > 0)
-      ? max_move_time_ms_
-      : static_cast<int>(max_time * 1000) + 2000;
+  int hard_deadline_ms = 0;
+  if (max_move_time_ms_ > 0) {
+    hard_deadline_ms = max_move_time_ms_;
+  } else if (max_time > 0.0f) {
+    hard_deadline_ms = static_cast<int>(max_time * 1000) + 2000;
+  }
 
   // Use shared_ptr so detached thread doesn't access destroyed locals.
   struct DfpnState {
@@ -433,35 +477,36 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   lc0_search_->SetMaxTime(lc0_config_.max_time);
   lc0_search_->SetMaxNodes(lc0_config_.max_nodes);
 
-  // Watchdog: hard deadline enforcement. Search::IsSearchActive() is
-  // only checked between worker iterations; if any single iteration
-  // blocks (GPU eval hang, lock contention, large reused tree walk,
-  // first-call TRT compilation, etc.), the search can run far longer
-  // than max_time. The watchdog calls Stop() after hard_deadline_ms
-  // of wall time to guarantee we don't blow past MaxMoveTime.
+  // Watchdog: hard deadline enforcement for timed searches. Pure node-limited
+  // searches intentionally have no implicit time cap.
   std::atomic<bool> search_done{false};
-  std::thread watchdog([this, &search_done, hard_deadline_ms,
-                        move_start_time]() {
-    while (!search_done.load(std::memory_order_acquire)) {
-      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - move_start_time).count();
-      if (elapsed_ms >= hard_deadline_ms) {
-        if (lc0_search_) lc0_search_->Stop();
-        return;
+  std::thread watchdog;
+  if (hard_deadline_ms > 0) {
+    watchdog = std::thread([this, &search_done, hard_deadline_ms,
+                            move_start_time]() {
+      while (!search_done.load(std::memory_order_acquire)) {
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - move_start_time).count();
+        if (elapsed_ms >= hard_deadline_ms) {
+          if (lc0_search_) lc0_search_->Stop();
+          return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-  });
+    });
+  }
 
   auto result = lc0_search_->Run(board_, game_ply_);
   search_done.store(true, std::memory_order_release);
-  watchdog.join();
+  if (watchdog.joinable()) watchdog.join();
 
   // --- Stop df-pn and wait ---
   dfpn->solver.stop();
 
-  // Wait for df-pn with hard deadline — never exceed MaxMoveTime.
-  {
+  if (hard_deadline_ms <= 0) {
+    if (dfpn_thread.joinable()) dfpn_thread.join();
+  } else {
+    // Wait for df-pn with hard deadline — never exceed MaxMoveTime.
     auto wait_start = std::chrono::steady_clock::now();
     int max_wait_ms = std::max(hard_deadline_ms - (int)std::chrono::duration_cast<
         std::chrono::milliseconds>(wait_start - move_start_time).count(), 100);

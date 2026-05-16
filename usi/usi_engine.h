@@ -60,6 +60,7 @@ class USIEngine {
 
   // Options
   std::string onnx_path_ = "shogi_bt4.onnx";
+  ModelFormat model_format_ = ModelFormat::kAuto;
   int max_nodes_ = 800;
   int num_gpus_ = 1;
   int max_gpu_batch_ = 4096;

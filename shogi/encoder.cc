@@ -71,6 +71,80 @@ void InitDirectionTable() {
   }
 }
 
+Bitboard DlshogiPieceAttacks(PieceType pt, Color c, Square sq,
+                             const Bitboard& occ) {
+  const int i = sq.as_idx();
+  switch (pt.idx) {
+    case kPawn.idx:
+      return ShogiTables::PawnEffectBB[i][c];
+    case kLance.idx:
+      return ShogiTables::LanceEffect(c, sq, occ);
+    case kKnight.idx:
+      return ShogiTables::KnightEffectBB[i][c];
+    case kSilver.idx:
+      return ShogiTables::SilverEffectBB[i][c];
+    case kBishop.idx:
+      return ShogiTables::BishopEffect(sq, occ);
+    case kRook.idx:
+      return ShogiTables::RookEffect(sq, occ);
+    case kGold.idx:
+    case kProPawn.idx:
+    case kProLance.idx:
+    case kProKnight.idx:
+    case kProSilver.idx:
+      return ShogiTables::GoldEffectBB[i][c];
+    case kKing.idx:
+      return ShogiTables::KingEffectBB[i];
+    case kHorse.idx:
+      return ShogiTables::BishopEffect(sq, occ) | ShogiTables::HorseStepBB[i];
+    case kDragon.idx:
+      return ShogiTables::RookEffect(sq, occ) | ShogiTables::DragonStepBB[i];
+    default:
+      return Bitboard::Zero();
+  }
+}
+
+void SetDlshogiPlane(float* planes, int plane, Square sq, float value = 1.0f) {
+  planes[plane * 81 + sq.as_idx()] = value;
+}
+
+void SetDlshogiPlaneAll(float* planes, int plane, float value = 1.0f) {
+  std::fill(planes + plane * 81, planes + (plane + 1) * 81, value);
+}
+
+int DlshogiPiecePlane(PieceType pt) {
+  if (pt.idx >= kPawn.idx && pt.idx <= kDragon.idx) return pt.idx - 1;
+  return -1;
+}
+
+int DlshogiDropPieceLabel(PieceType pt) {
+  switch (pt.idx) {
+    case kPawn.idx:
+    case kLance.idx:
+    case kKnight.idx:
+    case kSilver.idx:
+    case kBishop.idx:
+    case kRook.idx:
+    case kGold.idx:
+      return pt.idx - 1;
+    default:
+      return -1;
+  }
+}
+
+int DlshogiMoveDirection(int dir_x, int dir_y) {
+  if (dir_y < 0 && dir_x == 0) return 0;       // UP
+  if (dir_y == -2 && dir_x == -1) return 8;    // UP2_LEFT
+  if (dir_y == -2 && dir_x == 1) return 9;     // UP2_RIGHT
+  if (dir_y < 0 && dir_x < 0) return 1;        // UP_LEFT
+  if (dir_y < 0 && dir_x > 0) return 2;        // UP_RIGHT
+  if (dir_y == 0 && dir_x < 0) return 3;       // LEFT
+  if (dir_y == 0 && dir_x > 0) return 4;       // RIGHT
+  if (dir_y > 0 && dir_x == 0) return 5;       // DOWN
+  if (dir_y > 0 && dir_x < 0) return 6;        // DOWN_LEFT
+  return 7;                                    // DOWN_RIGHT
+}
+
 }  // anonymous namespace
 
 // =====================================================================
@@ -145,6 +219,58 @@ ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
   return planes;
 }
 
+void EncodeDlshogiPosition(const ShogiBoard& board, float* input1,
+                           float* input2) {
+  std::fill(input1, input1 + kDlshogiInput1Planes * 81, 0.0f);
+  std::fill(input2, input2 + kDlshogiInput2Planes * 81, 0.0f);
+
+  ShogiBoard b = (board.side_to_move() == WHITE) ? board.Flipped() : board;
+  const Bitboard occ = b.occupied();
+  int attack_num[COLOR_NB][kSquareNB] = {};
+
+  for (int sq_idx = 0; sq_idx < kSquareNB; ++sq_idx) {
+    Square sq = Square::FromIdx(sq_idx);
+    Piece pc = b.piece_on(sq);
+    if (pc.IsNone()) continue;
+
+    Color c = pc.GetColor();
+    PieceType pt = pc.GetType();
+    int piece_plane = DlshogiPiecePlane(pt);
+    if (piece_plane < 0) continue;
+
+    const int color_offset = static_cast<int>(c) * 31;
+    SetDlshogiPlane(input1, color_offset + piece_plane, sq);
+
+    Bitboard attacks = DlshogiPieceAttacks(pt, c, sq, occ);
+    attacks.ForEach([&](Square to) {
+      SetDlshogiPlane(input1, color_offset + 14 + piece_plane, to);
+      int& num = attack_num[c][to.as_idx()];
+      if (num < 3) {
+        SetDlshogiPlane(input1, color_offset + 28 + num, to);
+        ++num;
+      }
+    });
+  }
+
+  const PieceType hand_order[] = {
+      kPawn, kLance, kKnight, kSilver, kGold, kBishop, kRook};
+  const int hand_max[] = {8, 4, 4, 4, 4, 2, 2};
+  for (Color c : {BLACK, WHITE}) {
+    int plane = static_cast<int>(c) * 28;
+    for (int i = 0; i < 7; ++i) {
+      int count = std::min(b.hand(c).Count(hand_order[i]), hand_max[i]);
+      for (int n = 0; n < count; ++n) {
+        SetDlshogiPlaneAll(input2, plane + n);
+      }
+      plane += hand_max[i];
+    }
+  }
+
+  if (b.InCheck()) {
+    SetDlshogiPlaneAll(input2, 56);
+  }
+}
+
 // --- Policy mapping (v2: direction-based) ---
 
 int ShogiMoveToNNIndex(Move move) {
@@ -164,6 +290,29 @@ int ShogiMoveToNNIndex(Move move) {
   }
 
   return dir * 81 + to;
+}
+
+int DlshogiMoveToNNIndex(Move move, Color side_to_move) {
+  if (side_to_move == WHITE) move.Flip();
+
+  const int to_sq = move.to().as_idx();
+  if (move.is_drop()) {
+    const int hand_piece = DlshogiDropPieceLabel(move.drop_piece());
+    if (hand_piece < 0) return -1;
+    return (20 + hand_piece) * 81 + to_sq;
+  }
+
+  const int from_sq = move.from().as_idx();
+  const int to_x = to_sq / 9;
+  const int to_y = to_sq % 9;
+  const int from_x = from_sq / 9;
+  const int from_y = from_sq % 9;
+  const int dir_x = from_x - to_x;
+  const int dir_y = to_y - from_y;
+
+  int direction = DlshogiMoveDirection(dir_x, dir_y);
+  if (move.is_promotion()) direction += 10;
+  return direction * 81 + to_sq;
 }
 
 }  // namespace lczero

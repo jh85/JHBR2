@@ -253,6 +253,73 @@ USI integration, and dlshogi-style MCTS wiring, but the 60k NPS target is not
 reachable with this ONNX/TensorRT engine on 2x RTX 3090. The bottleneck is raw
 model inference throughput, not the search loop or missing GPU utilization.
 
+## Dlshogi Model Evaluator Experiment - 2026-05-15
+
+JHBR2 can now load the dlshogi ONNX/TensorRT signature through:
+
+```text
+setoption name ModelFormat value dlshogi
+```
+
+The direct TensorRT path detects:
+
+```text
+input1         Bx62x9x9
+input2         Bx57x9x9
+output_policy  Bx2187
+output_value   Bx1
+```
+
+The first implementation uses CPU-side float feature encoding matching
+dlshogi's 62/57 plane layout. A TensorRT 10 batch-128 engine was built:
+
+```bash
+LD_LIBRARY_PATH=/data/dlsport2/TensorRT-10.16.1.11/lib:/data/dlsport2/cudnn-linux-x86_64-9.22.0.52_cuda13-archive/lib:/usr/local/cuda/lib64 \
+/data/dlsport2/TensorRT-10.16.1.11/bin/trtexec \
+  --onnx=/data/work1/dlshogi_models/model-dr2_exhi.onnx \
+  --saveEngine=engines/model-dr2_exhi_trt10_b128.engine \
+  --fp16 \
+  --minShapes=input1:1x62x9x9,input2:1x57x9x9 \
+  --optShapes=input1:128x62x9x9,input2:128x57x9x9 \
+  --maxShapes=input1:128x62x9x9,input2:128x57x9x9 \
+  --memPoolSize=workspace:1024M
+```
+
+`trtexec` reported batch-128 host latency around 3.54 ms and throughput around
+326.6 batches/s on one RTX 3090.
+
+Five-position benchmark, matching the prior dlshogi-style 10s setup:
+
+```bash
+LD_LIBRARY_PATH=/data/dlsport2/TensorRT-10.16.1.11/lib:/data/dlsport2/cudnn-linux-x86_64-9.22.0.52_cuda13-archive/lib:/usr/local/cuda/lib64 \
+python3 tools/benchmark.py ./build-trt10/jhbr2 \
+  /data/dlsport2/JHBR2/engines/model-dr2_exhi_trt10_b128.engine \
+  --threads 8 --gpus 2 --minibatch 128 --max-gpu-batch 128 \
+  --byoyomi 10000 --limit 5 --leaf-mate-mode off \
+  --options ModelFormat:dlshogi
+```
+
+Result:
+
+```text
+NPS mean   : 69,648
+NPS median : 73,561
+NPS min/max: 51,403 / 85,731
+```
+
+The same configuration on the 100-position 1s benchmark parsed 99/100 NPS
+lines and reported:
+
+```text
+NPS mean   : 69,385
+NPS median : 74,067
+NPS p10/p90: 45,411 / 81,059
+```
+
+This confirms the MCTS port is capable of dlshogi-range NPS when driven by the
+fast dlshogi model. Remaining variance is position/search-shape dependent and
+should be investigated separately from raw model throughput.
+
 If observed NPS is far below target:
 
 1. Verify both GPUs are loaded.

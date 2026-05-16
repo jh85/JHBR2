@@ -45,6 +45,8 @@ namespace lczero {
 
 constexpr int kShogiInputPlanes = 48;
 constexpr int kShogiBoardSize = 9;
+constexpr int kDlshogiInput1Planes = 62;
+constexpr int kDlshogiInput2Planes = 57;
 
 // --- Input Plane ---
 
@@ -92,6 +94,13 @@ using ShogiInputPlanes = std::array<ShogiInputPlane, kShogiInputPlanes>;
 // if it's WHITE's turn, the board is flipped 180° before encoding.
 ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board);
 
+// Encode the dlshogi model inputs:
+//   input1: 2 colors * (14 piece + 14 attack + 3 attack-count) planes.
+//   input2: 28 hand-count planes per color plus one side-in-check plane.
+// Both buffers must have room for planes * 81 floats. They are zeroed here.
+void EncodeDlshogiPosition(const ShogiBoard& board, float* input1,
+                           float* input2);
+
 // --- Policy mapping (v2: direction-based, 2187 outputs) ---
 //
 // Encoding: direction * 81 + to_sq
@@ -108,6 +117,11 @@ constexpr int kNumDropTypes = 7;
 // The move must be from BLACK's perspective (flip for WHITE before calling).
 // Returns -1 if the move direction is not recognized.
 int ShogiMoveToNNIndex(Move move);
+
+// Convert a move to dlshogi's 27*81 policy label. The move is passed in the
+// board's native coordinates; side_to_move controls the 180-degree flip used
+// by dlshogi when WHITE is to move.
+int DlshogiMoveToNNIndex(Move move, Color side_to_move);
 
 // --- Tables (initialized at startup) ---
 

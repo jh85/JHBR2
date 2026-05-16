@@ -77,8 +77,10 @@ struct NNEvaluator::Impl {
 };
 
 NNEvaluator::NNEvaluator(const std::string& onnx_path, bool use_gpu,
-                         int device_id, int max_batch_size, int /*num_slots*/)
+                         int device_id, int max_batch_size, int /*num_slots*/,
+                         ModelFormat model_format)
     : impl_(std::make_unique<Impl>()) {
+  (void)model_format;
 
   ShogiEncoderTables::Init();
 
@@ -390,7 +392,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 // Stub implementation.
 struct NNEvaluator::Impl {};
 
-NNEvaluator::NNEvaluator(const std::string&, bool, int, int, int)
+NNEvaluator::NNEvaluator(const std::string&, bool, int, int, int, ModelFormat)
     : impl_(std::make_unique<Impl>()) {
   ShogiEncoderTables::Init();
 }
