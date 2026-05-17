@@ -142,6 +142,7 @@ class ShogiBoard {
   // Used by mate/shallow_mate.h. See docs/port_5ply_mate_check_plan.md
   // (Phase 6) and docs/port_yaneuraou_check_generator_plan.md (Phase 7).
   MoveList GenerateCheckingMoves();
+  MoveList GenerateCheckingMovesNonCheck();  // caller guarantees !InCheck()
   MoveList GenerateCheckingMovesViaFilter();  // oracle; slower but obviously correct
 
   // Is the given move legal in the current position?

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <limits>
+#include <unordered_map>
 #include <utility>
 
 #include "mate/shallow_mate.h"
@@ -50,6 +51,46 @@ void UpdateResult(child_node_t* child, float result, uct_node_t* current) {
 
 float DrawValue(const SearchConfig& cfg, lczero::Color color) {
   return color == BLACK ? cfg.draw_value_black : cfg.draw_value_white;
+}
+
+struct BatchCacheKey {
+  uint64_t hash = 0;
+  uint16_t num_moves = 0;
+
+  bool operator==(const BatchCacheKey& other) const {
+    return hash == other.hash && num_moves == other.num_moves;
+  }
+};
+
+struct BatchCacheKeyHash {
+  size_t operator()(const BatchCacheKey& key) const {
+    size_t h = std::hash<uint64_t>{}(key.hash);
+    h ^= std::hash<uint16_t>{}(key.num_moves) + 0x9e3779b97f4a7c15ULL +
+         (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
+jhbr2::NNOutput FromCachedNNValue(const jhbr2::CachedNNValue& cached) {
+  jhbr2::NNOutput out;
+  out.wdl[0] = cached.wdl[0];
+  out.wdl[1] = cached.wdl[1];
+  out.wdl[2] = cached.wdl[2];
+  out.value = cached.wdl[0] - cached.wdl[2];
+  out.draw = cached.wdl[1];
+  out.policy = cached.policy;
+  return out;
+}
+
+jhbr2::CachedNNValue ToCachedNNValue(const jhbr2::NNOutput& out,
+                                     uint16_t num_legal_moves) {
+  jhbr2::CachedNNValue cached;
+  cached.wdl[0] = out.wdl[0];
+  cached.wdl[1] = out.wdl[1];
+  cached.wdl[2] = out.wdl[2];
+  cached.policy = out.policy;
+  cached.num_legal_moves = num_legal_moves;
+  return cached;
 }
 
 }  // namespace
@@ -135,7 +176,9 @@ void UCTSearcherGroup::Term() {
 
 Search::Search(std::vector<jhbr2::NNEvaluator*> evaluators,
                const SearchConfig& config)
-    : config_(config), evaluators_(std::move(evaluators)) {
+    : config_(config),
+      evaluators_(std::move(evaluators)),
+      nn_cache_(config.nn_cache_size) {
   groups_.reserve(evaluators_.size());
   for (int g = 0; g < static_cast<int>(evaluators_.size()); ++g) {
     groups_.emplace_back(this, evaluators_[g], g, config_.workers_per_gpu,
@@ -185,13 +228,20 @@ unsigned Search::SelectBestChild(const uct_node_t* node) const {
   return best;
 }
 
-SearchResult Search::Run(ShogiBoard board, int) {
+SearchResult Search::Run(ShogiBoard board, int game_ply) {
+  const uint64_t starting_pos_key = board.Hash();
+  static const std::vector<Move> kNoMoves;
+  return Run(std::move(board), starting_pos_key, kNoMoves, game_ply);
+}
+
+SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
+                         const std::vector<Move>& moves, int) {
   stop_.store(false, std::memory_order_release);
   playout_count_.store(0, std::memory_order_release);
   timer_.Restart();
   last_info_ms_ = 0;
   root_board_ = std::move(board);
-  tree_.DeallocateTree();
+  tree_.ResetToPosition(starting_pos_key, moves);
   root_ = tree_.GetCurrentHead();
 
   auto root_legal = root_board_.GenerateLegalMoves();
@@ -321,13 +371,65 @@ void UCTSearcher::QueuingNode(const ShogiBoard* board, uct_node_t* node,
 
 void UCTSearcher::EvalNode() {
   if (batch_.empty()) return;
-  std::vector<std::pair<ShogiBoard, MoveList>> nn_batch;
-  nn_batch.reserve(batch_.size());
-  for (auto& elem : batch_) {
-    nn_batch.emplace_back(elem.board, elem.legal_moves);
+
+  const size_t batch_size = batch_.size();
+  std::vector<jhbr2::NNOutput> results(batch_size);
+  std::vector<int> result_to_miss(batch_size, -1);
+  std::vector<std::pair<ShogiBoard, MoveList>> miss_batch;
+  std::vector<uint64_t> miss_keys;
+  std::vector<uint16_t> miss_num_moves;
+  std::unordered_map<BatchCacheKey, int, BatchCacheKeyHash> local_misses;
+
+  miss_batch.reserve(batch_size);
+  miss_keys.reserve(batch_size);
+  miss_num_moves.reserve(batch_size);
+  local_misses.reserve(batch_size);
+
+  auto& nn_cache = grp_->owner->nn_cache_;
+  for (size_t i = 0; i < batch_size; ++i) {
+    auto& elem = batch_[i];
+    const uint64_t key = elem.board.Hash();
+    const uint16_t num_moves =
+        static_cast<uint16_t>(elem.legal_moves.size());
+
+    jhbr2::CachedNNValue cached;
+    if (nn_cache.Lookup(key, num_moves, &cached)) {
+      results[i] = FromCachedNNValue(cached);
+      continue;
+    }
+
+    BatchCacheKey batch_key{key, num_moves};
+    auto it = local_misses.find(batch_key);
+    if (it != local_misses.end()) {
+      result_to_miss[i] = it->second;
+      continue;
+    }
+
+    const int miss_idx = static_cast<int>(miss_batch.size());
+    local_misses.emplace(batch_key, miss_idx);
+    result_to_miss[i] = miss_idx;
+    miss_batch.emplace_back(elem.board, elem.legal_moves);
+    miss_keys.push_back(key);
+    miss_num_moves.push_back(num_moves);
   }
-  auto results = grp_->nn->EvaluateBatchSlot(thread_id_, nn_batch);
-  for (int i = 0; i < static_cast<int>(batch_.size()); ++i) {
+
+  std::vector<jhbr2::NNOutput> miss_results;
+  if (!miss_batch.empty()) {
+    miss_results = grp_->nn->EvaluateBatchSlot(thread_id_, miss_batch);
+    for (size_t i = 0; i < miss_results.size(); ++i) {
+      nn_cache.Insert(miss_keys[i],
+                      ToCachedNNValue(miss_results[i], miss_num_moves[i]));
+    }
+  }
+
+  for (size_t i = 0; i < batch_size; ++i) {
+    const int miss_idx = result_to_miss[i];
+    if (miss_idx >= 0) {
+      results[i] = miss_results[miss_idx];
+    }
+  }
+
+  for (int i = 0; i < static_cast<int>(batch_size); ++i) {
     auto& elem = batch_[i];
     const auto& result = results[i];
     float visited_policy = 0.0f;

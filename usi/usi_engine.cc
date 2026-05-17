@@ -65,6 +65,7 @@ static std::string ModelFormatToString(ModelFormat format) {
 
 USIEngine::USIEngine() {
   board_.SetStartPos();
+  position_start_key_ = board_.Hash();
 }
 
 // =====================================================================
@@ -245,7 +246,10 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     if (d % 2 == 0) d -= 1;          // round even down to odd
     lc0_config_.leaf_mate_depth = d;
   } else if (name_lower == "nncachesize") {
-    // The dlshogi-style backend submits direct batches and has no NN cache.
+    lc0_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
+    // The cache is owned by the persistent Search object, so rebuild it when
+    // capacity changes. Evaluators can stay loaded.
+    lc0_search_.reset();
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
     lc0_config_.num_gpus = num_gpus_;
@@ -285,6 +289,8 @@ void USIEngine::CmdUsiNewGame() {
   board_.SetStartPos();
   board_.ClearHistory();
   game_ply_ = 0;
+  position_start_key_ = board_.Hash();
+  position_moves_.clear();
   // Drop the Search object so the next `go` rebuilds it with a fresh
   // tree. Otherwise tree reuse would carry over visit counts from the
   // previous game's positions, which is incorrect.
@@ -311,16 +317,20 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
     board_.SetFromSfen(sfen);
   }
 
+  position_start_key_ = board_.Hash();
+  position_moves_.clear();
+
   if (idx < parts.size() && parts[idx] == "moves") {
     idx++;
     while (idx < parts.size()) {
       Move m = Move::Parse(parts[idx]);
       board_.DoMove(m);
+      position_moves_.push_back(m);
       idx++;
     }
   }
 
-  game_ply_ = board_.RepetitionCount();
+  game_ply_ = board_.ply();
 }
 
 void USIEngine::CmdGo(const std::vector<std::string>& parts) {
@@ -496,7 +506,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     });
   }
 
-  auto result = lc0_search_->Run(board_, game_ply_);
+  auto result = lc0_search_->Run(board_, position_start_key_, position_moves_,
+                                 game_ply_);
   search_done.store(true, std::memory_order_release);
   if (watchdog.joinable()) watchdog.join();
 

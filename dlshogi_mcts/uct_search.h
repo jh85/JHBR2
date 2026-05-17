@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -10,6 +12,7 @@
 #include <vector>
 
 #include "dlshogi_mcts/uct_node.h"
+#include "mcts/nn_cache.h"
 #ifdef USE_TENSORRT
 #include "mcts/nn_tensorrt.h"
 #else
@@ -45,6 +48,7 @@ struct SearchConfig {
   int num_gpus = 1;
   int max_moves_to_draw = 100000;
   int leaf_mate_depth = 0;
+  size_t nn_cache_size = 0;
   float info_interval = 1.0f;
   InfoCallback info_callback = nullptr;
 };
@@ -90,6 +94,9 @@ class Search {
   ~Search();
 
   SearchResult Run(lczero::ShogiBoard board, int game_ply = 1);
+  SearchResult Run(lczero::ShogiBoard board, uint64_t starting_pos_key,
+                   const std::vector<lczero::Move>& moves,
+                   int game_ply = 1);
   void Stop() { stop_.store(true, std::memory_order_release); }
   void SetMaxTime(float seconds) { config_.max_time = seconds; }
   void SetMaxNodes(size_t n) { config_.max_nodes = static_cast<int>(n); }
@@ -110,6 +117,7 @@ class Search {
   std::vector<jhbr2::NNEvaluator*> evaluators_;
   std::vector<UCTSearcherGroup> groups_;
   NodeTree tree_;
+  jhbr2::NNCache nn_cache_;
   lczero::ShogiBoard root_board_;
   uct_node_t* root_ = nullptr;
   std::atomic<bool> stop_{false};

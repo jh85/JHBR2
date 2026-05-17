@@ -63,6 +63,7 @@ struct uct_node_t {
   void ExpandNode(const lczero::ShogiBoard* board);
   void InitChildNodes();
   uct_node_t* CreateChildNode(int i);
+  void CreateSingleChildNode(lczero::Move move);
   uct_node_t* ReleaseChildrenExceptOne(lczero::Move move);
 
   std::atomic<int> move_count{kNotExpanded};

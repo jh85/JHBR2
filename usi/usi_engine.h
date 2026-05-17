@@ -9,9 +9,11 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #ifdef USE_TENSORRT
 #include "mcts/nn_tensorrt.h"
@@ -57,6 +59,8 @@ class USIEngine {
   std::unique_ptr<dlshogi_mcts::Search> lc0_search_;
   dlshogi_mcts::SearchConfig lc0_config_;
   int game_ply_ = 0;
+  uint64_t position_start_key_ = 0;
+  std::vector<lczero::Move> position_moves_;
 
   // Options
   std::string onnx_path_ = "shogi_bt4.onnx";

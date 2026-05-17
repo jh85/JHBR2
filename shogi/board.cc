@@ -745,13 +745,25 @@ MoveList ShogiBoard::GenerateCheckingMovesViaFilter() {
 //
 MoveList ShogiBoard::GenerateCheckingMoves() {
   Color us = side_to_move_;
+
+  if (InCheck(us)) {
+    return GenerateCheckingMovesViaFilter();
+  }
+  return GenerateCheckingMovesNonCheck();
+}
+
+MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
+  Color us = side_to_move_;
   Color them = ~us;
   Square king_sq = king_sq_[them];
   int ksq_idx = king_sq.as_idx();
   Bitboard occ = occupied();
+  Bitboard our = pieces(us);
+  Bitboard pinned = Bitboard::Zero();
+  bool pinned_computed = false;
 
   // Pieces that, if moved, may discover check.
-  Bitboard our_blockers = ComputeBlockersForKing(them) & pieces(us);
+  Bitboard our_blockers = ComputeBlockersForKing(them) & our;
 
   // Direct-check candidates: pieces whose source square is in the
   // promotion-aware MoveCheckBB. A piece NOT in this set can't possibly
@@ -767,87 +779,201 @@ MoveList ShogiBoard::GenerateCheckingMoves() {
         pieces(us, kProSilver)) & ShogiTables::GoldMoveCheckBB[ksq_idx][us]) |
       (pieces(us, kBishop) & ShogiTables::BishopMoveCheckBB[ksq_idx][us]) |
       (pieces(us, kHorse)  & ShogiTables::HorseMoveCheckBB[ksq_idx])      |
-       pieces(us, kRook) | pieces(us, kDragon);
+      pieces(us, kRook) | pieces(us, kDragon);
 
-  Bitboard candidate_pieces = direct_candidates | our_blockers;
-
-  MoveList legal = GenerateLegalMoves();
   MoveList result;
-  result.reserve(legal.size());
 
-  for (size_t i = 0; i < legal.size(); ++i) {
-    const Move m = legal[i];
-    bool gives_check = false;
+  auto direct_check_zone = [&](PieceType pt) {
+    switch (pt.idx) {
+      case kPawn.idx:
+        return ShogiTables::PawnCheckBB[ksq_idx][us];
+      case kLance.idx:
+        return ShogiTables::LanceCheckBB[ksq_idx][us];
+      case kKnight.idx:
+        return ShogiTables::KnightCheckBB[ksq_idx][us];
+      case kSilver.idx:
+        return ShogiTables::SilverCheckBB[ksq_idx][us];
+      case kGold.idx:
+      case kProPawn.idx:
+      case kProLance.idx:
+      case kProKnight.idx:
+      case kProSilver.idx:
+        return ShogiTables::GoldCheckBB[ksq_idx][us];
+      case kBishop.idx:
+        return ShogiTables::BishopCheckBB[ksq_idx];
+      case kRook.idx:
+        return ShogiTables::RookEffectBB[ksq_idx];
+      case kKing.idx:
+        return ShogiTables::KingEffectBB[ksq_idx];
+      case kHorse.idx:
+        return ShogiTables::HorseCheckBB[ksq_idx];
+      case kDragon.idx:
+        return ShogiTables::RookEffectBB[ksq_idx] |
+               ShogiTables::DragonStepBB[ksq_idx];
+      default:
+        return Bitboard::Zero();
+    }
+  };
 
-    if (m.is_drop()) {
-      PieceType pt = m.drop_piece();
-      Square dst = m.to();
-      // Quick zone test: is the drop square in the per-piece check
-      // zone? If not, can't possibly give check (saves the
-      // PieceAttacks call). For sliders (lance/bishop/rook), the
-      // zone is "could potentially attack ksq with empty occ" — we
-      // still need PieceAttacks with real occ to confirm.
-      bool zone_hit = false;
-      switch (pt.idx) {
-        case kPawn.idx:
-          zone_hit = ShogiTables::PawnCheckBB[ksq_idx][us].Test(dst);
-          break;
-        case kLance.idx:
-          zone_hit = ShogiTables::LanceCheckBB[ksq_idx][us].Test(dst);
-          break;
-        case kKnight.idx:
-          zone_hit = ShogiTables::KnightCheckBB[ksq_idx][us].Test(dst);
-          break;
-        case kSilver.idx:
-          zone_hit = ShogiTables::SilverCheckBB[ksq_idx][us].Test(dst);
-          break;
-        case kGold.idx:
-          zone_hit = ShogiTables::GoldCheckBB[ksq_idx][us].Test(dst);
-          break;
-        case kBishop.idx:
-          zone_hit = ShogiTables::BishopCheckBB[ksq_idx].Test(dst);
-          break;
-        case kRook.idx:
-          zone_hit = true;  // Rook drops are universal candidates
-          break;
-        default:
-          break;
+  auto possible_direct_to = [&](PieceType pt, Square from) {
+    Bitboard zone = direct_check_zone(pt);
+    if (pt.CanPromote()) {
+      Bitboard promoted_zone = direct_check_zone(pt.Promote());
+      if (!from.InPromotionZone(us)) {
+        promoted_zone &= ShogiTables::PromotionZoneBB[us];
       }
-      if (zone_hit) {
-        // For step pieces, zone hit ⇒ gives check (no occlusion).
-        // For sliders, need occlusion-aware verification.
-        if (pt == kPawn || pt == kKnight || pt == kSilver || pt == kGold) {
-          gives_check = true;
-        } else {
-          Bitboard occ_after = occ;
-          occ_after.Set(dst);
-          gives_check = PieceAttacks(pt, us, dst, occ_after).Test(king_sq);
+      zone |= promoted_zone;
+    }
+    return zone;
+  };
+
+  auto directly_attacks = [&](PieceType pt, Square to,
+                              const Bitboard& occ_after) {
+    if (!direct_check_zone(pt).Test(to)) return false;
+    switch (pt.idx) {
+      case kPawn.idx:
+      case kKnight.idx:
+      case kSilver.idx:
+      case kGold.idx:
+      case kProPawn.idx:
+      case kProLance.idx:
+      case kProKnight.idx:
+      case kProSilver.idx:
+      case kKing.idx:
+        return true;
+      default:
+        return PieceAttacks(pt, us, to, occ_after).Test(king_sq);
+    }
+  };
+
+  auto must_promote = [&](PieceType pt, Square to) {
+    if (pt != kPawn && pt != kLance && pt != kKnight) return false;
+    Rank dest_rank = to.rank();
+    Rank rel_rank = us == BLACK ? dest_rank
+                                : Rank::FromIdx(8 - dest_rank.idx);
+    if (pt == kPawn || pt == kLance) return rel_rank.idx == 0;
+    return rel_rank.idx <= 1;
+  };
+
+  auto can_promote = [&](PieceType pt, Square from, Square to) {
+    return pt.CanPromote() &&
+           (from.InPromotionZone(us) || to.InPromotionZone(us));
+  };
+
+  auto add_if_legal = [&](Move move) {
+    if (!pinned_computed) {
+      pinned = ComputeBlockersForKing(us) & our;
+      pinned_computed = true;
+    }
+    if (IsLegal(move, pinned)) result.push_back(move);
+  };
+
+  auto add_variants = [&](Square from, Square to, PieceType pt,
+                          const auto& gives_check) {
+    if (can_promote(pt, from, to)) {
+      PieceType promoted = pt.Promote();
+      if (gives_check(promoted)) add_if_legal(Move::Promotion(from, to));
+    }
+    if (!must_promote(pt, to) && gives_check(pt)) {
+      add_if_legal(Move::Normal(from, to));
+    }
+  };
+
+  auto add_direct_variants = [&](Square from, Square to, PieceType pt) {
+    Bitboard occ_after = occ;
+    occ_after.Clear(from);
+    occ_after.Set(to);
+    add_variants(from, to, pt, [&](PieceType moved_pt) {
+      return directly_attacks(moved_pt, to, occ_after);
+    });
+  };
+
+  auto add_discovered_variants = [&](Square from, Square to, PieceType pt) {
+    add_variants(from, to, pt, [](PieceType) { return true; });
+  };
+
+  Bitboard discovered = our_blockers;
+  while (discovered.Any()) {
+    Square from = discovered.Pop();
+    PieceType pt = piece_on(from).GetType();
+    Bitboard targets = PieceAttacks(pt, us, from, occ) & ~our;
+    const Bitboard line = ShogiTables::LineBB[king_sq.as_idx()][from.as_idx()];
+
+    Bitboard discovered_targets = targets & ~line;
+    while (discovered_targets.Any()) {
+      add_discovered_variants(from, discovered_targets.Pop(), pt);
+    }
+
+    if (direct_candidates.Test(from)) {
+      Bitboard direct_targets = targets & line & possible_direct_to(pt, from);
+      while (direct_targets.Any()) {
+        add_direct_variants(from, direct_targets.Pop(), pt);
+      }
+    }
+  }
+
+  Bitboard direct = direct_candidates & ~our_blockers;
+  while (direct.Any()) {
+    Square from = direct.Pop();
+    PieceType pt = piece_on(from).GetType();
+    Bitboard targets =
+        PieceAttacks(pt, us, from, occ) & ~our & possible_direct_to(pt, from);
+    while (targets.Any()) {
+      add_direct_variants(from, targets.Pop(), pt);
+    }
+  }
+
+  auto drop_targets = [&](PieceType pt) {
+    Bitboard targets = ~occ & Bitboard::All();
+
+    if (pt == kPawn || pt == kLance) {
+      targets &= ~(us == BLACK ? ShogiTables::RankBB[0]
+                               : ShogiTables::RankBB[8]);
+    }
+    if (pt == kKnight) {
+      if (us == BLACK) {
+        targets &= ~ShogiTables::RankBB[0];
+        targets &= ~ShogiTables::RankBB[1];
+      } else {
+        targets &= ~ShogiTables::RankBB[7];
+        targets &= ~ShogiTables::RankBB[8];
+      }
+    }
+    if (pt == kPawn) {
+      Bitboard pawns = pieces(us, kPawn);
+      for (int f = 0; f < 9; ++f) {
+        if ((pawns & ShogiTables::FileBB[f]).Any()) {
+          targets &= ~ShogiTables::FileBB[f];
         }
-      }
-    } else {
-      // Board move: filter by candidate set (promotion-aware MoveCheckBB).
-      Square src = m.from();
-      if (!candidate_pieces.Test(src)) continue;
-
-      Square dst = m.to();
-      PieceType pt = piece_on(src).GetType();
-      if (m.is_promotion()) pt = pt.Promote();
-
-      Bitboard occ_after = occ;
-      occ_after.Clear(src);
-      occ_after.Set(dst);
-
-      if (PieceAttacks(pt, us, dst, occ_after).Test(king_sq)) {
-        gives_check = true;
-      } else if (our_blockers.Test(src)) {
-        UndoInfo undo = DoMoveForMovegen(m);
-        gives_check = InCheck();
-        UndoMove(m, undo);
       }
     }
 
-    if (gives_check) result.push_back(m);
-  }
+    return targets;
+  };
+
+  auto add_drop_checks = [&](PieceType pt, Bitboard check_zone,
+                             bool needs_occlusion_check) {
+    if (!hand_[us].Has(pt)) return;
+    Bitboard targets = drop_targets(pt) & check_zone;
+    while (targets.Any()) {
+      Square to = targets.Pop();
+      if (needs_occlusion_check) {
+        Bitboard occ_after = occ;
+        occ_after.Set(to);
+        if (!PieceAttacks(pt, us, to, occ_after).Test(king_sq)) continue;
+      }
+      Move move = Move::Drop(pt, to);
+      if (IsLegal(move, pinned)) result.push_back(move);
+    }
+  };
+
+  add_drop_checks(kPawn, ShogiTables::PawnCheckBB[ksq_idx][us], false);
+  add_drop_checks(kLance, ShogiTables::LanceCheckBB[ksq_idx][us], true);
+  add_drop_checks(kKnight, ShogiTables::KnightCheckBB[ksq_idx][us], false);
+  add_drop_checks(kSilver, ShogiTables::SilverCheckBB[ksq_idx][us], false);
+  add_drop_checks(kGold, ShogiTables::GoldCheckBB[ksq_idx][us], false);
+  add_drop_checks(kBishop, ShogiTables::BishopCheckBB[ksq_idx], true);
+  add_drop_checks(kRook, ShogiTables::RookEffectBB[ksq_idx], true);
 
   return result;
 }

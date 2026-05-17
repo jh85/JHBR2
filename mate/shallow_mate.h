@@ -92,18 +92,17 @@ template <int depth, bool INCHECK = false> bool MateInOddPly(ShogiBoard& board);
 // moves (depth 1), iterate evasions (depth 2), inline mate-in-1
 // detection (depth 3).
 //
-// INCHECK template param: dlshogi uses it to filter the OR-node move
-// generator. For jhbr2, GenerateLegalMoves already handles in-check
-// correctly (returns evasions), and we filter for "gives check"
-// regardless. So INCHECK is not used directly but is kept for API
-// parity with the template specialization.
+// INCHECK template param selects the safe in-check path at OR nodes.
+// The common false path uses GenerateCheckingMovesNonCheck() to avoid
+// the runtime in-check check and the legal-move fallback.
 template <bool INCHECK = false>
 inline bool MateIn3Ply(ShogiBoard& board) {
     // OR node (depth 1): try each checking move.
     // Use specialized GenerateCheckingMoves (Phase 6) — direct
-    // bitboard-based enumeration of moves that cause check, ~10–50×
-    // faster than GenerateLegalMoves + filter.
-    auto checking_moves = board.GenerateCheckingMoves();
+    // bitboard-based enumeration of moves that cause check, avoiding
+    // full legal-move generation on the common non-check path.
+    auto checking_moves = INCHECK ? board.GenerateCheckingMoves()
+                                  : board.GenerateCheckingMovesNonCheck();
     for (size_t i = 0; i < checking_moves.size(); ++i) {
         Move m1 = checking_moves[i];
 
@@ -164,7 +163,7 @@ inline bool MateIn3Ply(ShogiBoard& board) {
 
             // OR node (depth 3): attacker plays mate-in-1.
             // Specialized check-only generator (Phase 6).
-            auto attacker_moves = board.GenerateCheckingMoves();
+            auto attacker_moves = board.GenerateCheckingMovesNonCheck();
             bool found_mate1 = false;
             for (size_t k = 0; k < attacker_moves.size(); ++k) {
                 Move m3 = attacker_moves[k];
@@ -203,7 +202,8 @@ inline bool MateInOddPly(ShogiBoard& board) {
                   "MateInOddPly: depth must be positive odd");
 
     // Specialized check-only generator (Phase 6).
-    auto moves = board.GenerateCheckingMoves();
+    auto moves = INCHECK ? board.GenerateCheckingMoves()
+                         : board.GenerateCheckingMovesNonCheck();
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
 
@@ -308,7 +308,7 @@ inline bool MateInOddPly<3, true>(ShogiBoard& board) {
 // MateInOddPly<1> — direct mate-in-1 detection
 template <>
 inline bool MateInOddPly<1, false>(ShogiBoard& board) {
-    auto moves = board.GenerateCheckingMoves();
+    auto moves = board.GenerateCheckingMovesNonCheck();
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
         UndoInfo undo = board.DoMove(m);
@@ -320,7 +320,15 @@ inline bool MateInOddPly<1, false>(ShogiBoard& board) {
 }
 template <>
 inline bool MateInOddPly<1, true>(ShogiBoard& board) {
-    return MateInOddPly<1, false>(board);
+    auto moves = board.GenerateCheckingMoves();
+    for (size_t i = 0; i < moves.size(); ++i) {
+        Move m = moves[i];
+        UndoInfo undo = board.DoMove(m);
+        bool no_escape = board.GenerateLegalMoves().empty();
+        board.UndoMove(m, undo);
+        if (no_escape) return true;
+    }
+    return false;
 }
 
 // =============================================================
@@ -333,11 +341,16 @@ inline bool MateInOddPly<1, true>(ShogiBoard& board) {
 // the depth limit (which doesn't prove no mate exists — could just
 // be deeper than `depth`).
 inline bool HasMateWithin(ShogiBoard& board, int depth) {
+    bool in_check = board.InCheck();
     switch (depth) {
-        case 1: return MateInOddPly<1, false>(board);
-        case 3: return MateInOddPly<3, false>(board);
-        case 5: return MateInOddPly<5, false>(board);
-        case 7: return MateInOddPly<7, false>(board);
+        case 1: return in_check ? MateInOddPly<1, true>(board)
+                                : MateInOddPly<1, false>(board);
+        case 3: return in_check ? MateInOddPly<3, true>(board)
+                                : MateInOddPly<3, false>(board);
+        case 5: return in_check ? MateInOddPly<5, true>(board)
+                                : MateInOddPly<5, false>(board);
+        case 7: return in_check ? MateInOddPly<7, true>(board)
+                                : MateInOddPly<7, false>(board);
         default: return false;
     }
 }
