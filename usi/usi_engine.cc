@@ -128,6 +128,12 @@ void USIEngine::CmdUsi() {
   Send("option name LeafMateMode type combo default dfpn var off var dfpn var shallow");
   Send("option name LeafMateDepth type spin default 3 min 1 max 7");
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
+  Send("option name MovesLeftMaxEffect type string default 0.0345");
+  Send("option name MovesLeftThreshold type string default 0.8");
+  Send("option name MovesLeftSlope type string default 0.0027");
+  Send("option name MovesLeftConstantFactor type string default 0.0");
+  Send("option name MovesLeftScaledFactor type string default 1.6521");
+  Send("option name MovesLeftQuadraticFactor type string default -0.6521");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   // MaxGpuBatch sets the TRT engine's max profile shape (and the
   // per-slot buffer size). With per-worker submission there is no
@@ -249,6 +255,24 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     lc0_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
     // The cache is owned by the persistent Search object, so rebuild it when
     // capacity changes. Evaluators can stay loaded.
+    lc0_search_.reset();
+  } else if (name_lower == "movesleftmaxeffect") {
+    lc0_config_.moves_left_max_effect = std::stof(value);
+    lc0_search_.reset();
+  } else if (name_lower == "movesleftthreshold") {
+    lc0_config_.moves_left_threshold = std::stof(value);
+    lc0_search_.reset();
+  } else if (name_lower == "movesleftslope") {
+    lc0_config_.moves_left_slope = std::stof(value);
+    lc0_search_.reset();
+  } else if (name_lower == "movesleftconstantfactor") {
+    lc0_config_.moves_left_constant_factor = std::stof(value);
+    lc0_search_.reset();
+  } else if (name_lower == "movesleftscaledfactor") {
+    lc0_config_.moves_left_scaled_factor = std::stof(value);
+    lc0_search_.reset();
+  } else if (name_lower == "movesleftquadraticfactor") {
+    lc0_config_.moves_left_quadratic_factor = std::stof(value);
     lc0_search_.reset();
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);

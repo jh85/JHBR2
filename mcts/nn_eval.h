@@ -33,6 +33,8 @@ struct NNOutput {
   float value;    // W - L from side-to-move perspective
   float draw;     // Draw probability
   float wdl[3];   // [Win, Draw, Loss] probabilities
+  float mlh = 0.0f;      // Predicted remaining plies, if available.
+  bool has_mlh = false;
 
   // Policy: probability for each legal move.
   // Indexed by position in the legal_moves vector passed to Evaluate().

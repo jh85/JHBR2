@@ -1,6 +1,6 @@
 // Thread-safe NN inference cache for jhbr2.
 //
-// Caches (board.Hash()) → (wdl, policy, num_legal_moves) so that
+// Caches (board.Hash()) → (wdl, mlh, policy, num_legal_moves) so that
 // MCTS doesn't re-evaluate positions it has already evaluated.
 //
 // Common MCTS hit patterns:
@@ -38,6 +38,8 @@ namespace jhbr2 {
 
 struct CachedNNValue {
   float wdl[3] = {0, 0, 0};        // win, draw, loss probabilities
+  float mlh = 0.0f;                // moves-left head output
+  bool has_mlh = false;
   std::vector<float> policy;        // indexed by legal-move position
   uint16_t num_legal_moves = 0;     // collision guard
 };

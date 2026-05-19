@@ -109,7 +109,8 @@ class PSVDataset(Dataset):
 
             return (torch.from_numpy(planes.reshape(48, 9, 9)),
                     torch.tensor(policy_idx.value, dtype=torch.long),
-                    torch.from_numpy(wdl))
+                    torch.from_numpy(wdl),
+                    torch.tensor(-1.0, dtype=torch.float32))
         else:
             raise RuntimeError("C decoder not available. Build with: "
                                "gcc -O3 -shared -fPIC -o psv_decode_c.so psv_decode_c.c -lm")
@@ -179,7 +180,8 @@ if __name__ == "__main__":
     print(f"Testing PSVDataset: {path}")
     ds = PSVDataset(path, max_positions=10)
     for i in range(min(5, len(ds))):
-        planes, policy_idx, wdl = ds[i]
+        planes, policy_idx, wdl, mlh = ds[i]
         print(f"  [{i}] planes={planes.shape}, policy={policy_idx.item()}, "
-              f"wdl=[{wdl[0]:.3f},{wdl[1]:.3f},{wdl[2]:.3f}]")
+              f"wdl=[{wdl[0]:.3f},{wdl[1]:.3f},{wdl[2]:.3f}], "
+              f"mlh={mlh.item():.0f}")
     print("OK!")

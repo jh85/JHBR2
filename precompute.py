@@ -1,7 +1,7 @@
 """
 Pre-compute training data from SFEN text to binary numpy format.
 
-Converts SFEN strings → (planes, policy_idx, wdl) numpy arrays.
+Converts SFEN strings → (planes, policy_idx, wdl, mlh) numpy arrays.
 This eliminates the expensive per-sample SFEN parsing during training.
 
 Supports multiprocessing for fast conversion on multi-core CPUs.
@@ -44,7 +44,7 @@ def _init_worker():
 
 
 def _process_line(line):
-    """Parse one training line and return (planes, policy_idx, wdl) or None."""
+    """Parse one training line and return (planes, policy_idx, wdl, mlh) or None."""
     global _move_info_to_idx
     line = line.strip()
     if not line or line.startswith('#'):
@@ -57,7 +57,7 @@ def _process_line(line):
 
         sfen_parts = []
         i = 1
-        while i < len(parts) and parts[i] not in ('bestmove', 'result', 'score'):
+        while i < len(parts) and parts[i] not in ('bestmove', 'result', 'score', 'mlh'):
             sfen_parts.append(parts[i])
             i += 1
         sfen = ' '.join(sfen_parts)
@@ -65,11 +65,14 @@ def _process_line(line):
         bestmove = None
         result = None
         score = None
+        mlh = -1
         while i < len(parts):
             if parts[i] == 'bestmove' and i + 1 < len(parts):
                 bestmove = parts[i + 1]; i += 2
             elif parts[i] == 'score' and i + 1 < len(parts):
                 score = int(parts[i + 1]); i += 2
+            elif parts[i] == 'mlh' and i + 1 < len(parts):
+                mlh = int(parts[i + 1]); i += 2
             elif parts[i] == 'result' and i + 1 < len(parts):
                 result = parts[i + 1]; i += 2
             else:
@@ -107,13 +110,13 @@ def _process_line(line):
         else:
             wdl = [0.0, 0.0, 1.0]
 
-        return (planes, policy_idx, wdl)
+        return (planes, policy_idx, wdl, mlh)
 
     except Exception:
         return None
 
 
-def _save_shard(prefix, idx, planes_list, policy_list, wdl_list):
+def _save_shard(prefix, idx, planes_list, policy_list, wdl_list, mlh_list):
     """Save one shard as compressed .npz."""
     path = f"{prefix}_{idx:03d}.npz"
     n = len(planes_list)
@@ -128,6 +131,8 @@ def _save_shard(prefix, idx, planes_list, policy_list, wdl_list):
         planes=planes,
         policy=np.array(policy_list, dtype=np.int32),
         wdl=np.array(wdl_list, dtype=np.float32),
+        mlh=np.array(mlh_list, dtype=np.int16),
+        policy_encoding=np.array("dlshogi_27x81"),
     )
 
 
@@ -150,6 +155,7 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
     buf_planes = []
     buf_policy = []
     buf_wdl = []
+    buf_mlh = []
     total_written = 0
     errors = 0
     t0 = time.time()
@@ -176,15 +182,16 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
                         if sample is None:
                             errors += 1
                             continue
-                        planes, policy_idx, wdl = sample
+                        planes, policy_idx, wdl, mlh = sample
                         buf_planes.append(planes)
                         buf_policy.append(policy_idx)
                         buf_wdl.append(wdl)
+                        buf_mlh.append(mlh)
 
                         # Flush shard
                         if len(buf_planes) >= shard_size:
                             _save_shard(output_prefix, shard_idx,
-                                        buf_planes, buf_policy, buf_wdl)
+                                        buf_planes, buf_policy, buf_wdl, buf_mlh)
                             total_written += len(buf_planes)
                             elapsed = time.time() - t0
                             speed = total_written / elapsed
@@ -194,6 +201,7 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
                             buf_planes.clear()
                             buf_policy.clear()
                             buf_wdl.clear()
+                            buf_mlh.clear()
                             shard_idx += 1
 
                     chunk.clear()
@@ -213,10 +221,11 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
                     if sample is None:
                         errors += 1
                         continue
-                    planes, policy_idx, wdl = sample
+                    planes, policy_idx, wdl, mlh = sample
                     buf_planes.append(planes)
                     buf_policy.append(policy_idx)
                     buf_wdl.append(wdl)
+                    buf_mlh.append(mlh)
 
     finally:
         pool.close()
@@ -224,7 +233,7 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
 
     # Save remaining
     if buf_planes:
-        _save_shard(output_prefix, shard_idx, buf_planes, buf_policy, buf_wdl)
+        _save_shard(output_prefix, shard_idx, buf_planes, buf_policy, buf_wdl, buf_mlh)
         total_written += len(buf_planes)
         print(f"  Shard {shard_idx:03d}: {len(buf_planes):,} positions")
         shard_idx += 1

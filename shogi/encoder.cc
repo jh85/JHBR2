@@ -18,18 +18,19 @@ namespace lczero {
 namespace {
 
 // Direction vectors: (df, dr) describing movement from source to destination.
-// Must match DIRECTION_VECTORS in shogi_model_v2.py exactly.
+// Must match DIRECTION_VECTORS in shogi_model_v2.py exactly. Labels follow
+// dlshogi, which computes horizontal direction as from_file - to_file.
 constexpr int kDirVectors[10][2] = {
   { 0, -1},  // 0: UP
-  {-1, -1},  // 1: UP_LEFT
-  { 1, -1},  // 2: UP_RIGHT
-  {-1,  0},  // 3: LEFT
-  { 1,  0},  // 4: RIGHT
+  { 1, -1},  // 1: UP_LEFT
+  {-1, -1},  // 2: UP_RIGHT
+  { 1,  0},  // 3: LEFT
+  {-1,  0},  // 4: RIGHT
   { 0,  1},  // 5: DOWN
-  {-1,  1},  // 6: DOWN_LEFT
-  { 1,  1},  // 7: DOWN_RIGHT
-  {-1, -2},  // 8: UP2_LEFT (knight)
-  { 1, -2},  // 9: UP2_RIGHT (knight)
+  { 1,  1},  // 6: DOWN_LEFT
+  {-1,  1},  // 7: DOWN_RIGHT
+  { 1, -2},  // 8: UP2_LEFT (knight)
+  {-1, -2},  // 9: UP2_RIGHT (knight)
 };
 
 // Sliding directions (can move multiple squares).
@@ -275,7 +276,8 @@ void EncodeDlshogiPosition(const ShogiBoard& board, float* input1,
 
 int ShogiMoveToNNIndex(Move move) {
   if (move.is_drop()) {
-    int pt = move.drop_piece().idx - 1;  // PieceType idx 1-7 → 0-6
+    int pt = DlshogiDropPieceLabel(move.drop_piece());
+    if (pt < 0) return -1;
     int to = move.to().as_idx();
     return (kNumDirections + kNumDirections + pt) * 81 + to;  // directions 20-26
   }

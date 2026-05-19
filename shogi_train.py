@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -28,6 +29,8 @@ from torch.utils.data import Dataset, DataLoader
 from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
                             make_direction_policy_index, POLICY_SIZE,
                             NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS)
+
+POLICY_ENCODING = "dlshogi_27x81"
 
 
 # =====================================================================
@@ -212,6 +215,7 @@ class ShardedDataset(Dataset):
         self.planes = None
         self.policy = None
         self.wdl = None
+        self.mlh = None
         self.current_shard = -1
 
         # Load first shard to get the count
@@ -230,11 +234,23 @@ class ShardedDataset(Dataset):
         self.planes = None
         self.policy = None
         self.wdl = None
+        self.mlh = None
 
         data = np.load(self.shard_paths[shard_id])
+        if 'policy_encoding' not in data:
+            raise ValueError(
+                f"{self.shard_paths[shard_id]} is missing policy_encoding. "
+                f"Regenerate shards for {POLICY_ENCODING}; old shards are not compatible.")
+        policy_encoding = str(data['policy_encoding'])
+        if policy_encoding != POLICY_ENCODING:
+            raise ValueError(
+                f"{self.shard_paths[shard_id]} has policy_encoding={policy_encoding!r}; "
+                f"expected {POLICY_ENCODING!r}. Regenerate the shard.")
         self.planes = data['planes']
         self.policy = data['policy']
         self.wdl = data['wdl']
+        self.mlh = data['mlh'] if 'mlh' in data else np.full(
+            len(self.planes), -1, dtype=np.int16)
         self.current_shard = shard_id
 
     def shard_order(self, shuffle=True):
@@ -251,7 +267,8 @@ class ShardedDataset(Dataset):
     def __getitem__(self, idx):
         return (torch.from_numpy(self.planes[idx].astype(np.float32)),
                 torch.tensor(self.policy[idx], dtype=torch.long),
-                torch.tensor(self.wdl[idx], dtype=torch.float32))
+                torch.tensor(self.wdl[idx], dtype=torch.float32),
+                torch.tensor(self.mlh[idx], dtype=torch.float32))
 
 
 class ShogiDataset(Dataset):
@@ -285,7 +302,7 @@ class ShogiDataset(Dataset):
         if parts[0] == 'sfen':
             sfen_parts = []
             i = 1
-            while i < len(parts) and parts[i] not in ('bestmove', 'result', 'score'):
+            while i < len(parts) and parts[i] not in ('bestmove', 'result', 'score', 'mlh'):
                 sfen_parts.append(parts[i])
                 i += 1
             sfen = ' '.join(sfen_parts)
@@ -293,12 +310,16 @@ class ShogiDataset(Dataset):
             bestmove = None
             result = None
             score = None
+            mlh = -1
             while i < len(parts):
                 if parts[i] == 'bestmove' and i + 1 < len(parts):
                     bestmove = parts[i + 1]
                     i += 2
                 elif parts[i] == 'score' and i + 1 < len(parts):
                     score = int(parts[i + 1])
+                    i += 2
+                elif parts[i] == 'mlh' and i + 1 < len(parts):
+                    mlh = int(parts[i + 1])
                     i += 2
                 elif parts[i] == 'result' and i + 1 < len(parts):
                     result = parts[i + 1]
@@ -308,14 +329,14 @@ class ShogiDataset(Dataset):
 
             if result:
                 # Value-only record (no bestmove) or full record
-                return (sfen, bestmove, result, score)
+                return (sfen, bestmove, result, score, mlh)
         return None
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        sfen, bestmove, result, score = self.samples[idx]
+        sfen, bestmove, result, score, mlh = self.samples[idx]
         flip = sfen.split()[1] == 'w'
 
         # Input planes
@@ -352,7 +373,8 @@ class ShogiDataset(Dataset):
 
         return (torch.tensor(planes),
                 torch.tensor(policy_idx, dtype=torch.long),
-                torch.tensor(wdl))
+                torch.tensor(wdl),
+                torch.tensor(mlh, dtype=torch.float32))
 
 
 # =====================================================================
@@ -364,6 +386,30 @@ def build_move_index():
     # With v2 encoding, move_to_policy_index returns an int (0-2186) directly.
     # No separate lookup needed.
     return lambda idx: idx
+
+
+def compute_mlh_loss(mlh_pred, mlh_target, args, device):
+    if args.mlh_weight <= 0.0:
+        return torch.tensor(0.0, device=device)
+
+    mlh_target = mlh_target.float()
+    valid = torch.isfinite(mlh_target) & (mlh_target >= 0.0)
+    if not valid.any():
+        return torch.tensor(0.0, device=device)
+
+    clip = max(float(args.mlh_clip), 1.0)
+    target = torch.clamp(mlh_target[valid], 0.0, clip)
+    if args.mlh_transform == "raw":
+        pass
+    elif args.mlh_transform == "log1p":
+        target = torch.log1p(target) / math.log1p(clip)
+    elif args.mlh_transform == "sqrt":
+        target = torch.sqrt(target) / math.sqrt(clip)
+    else:
+        target = target / clip
+
+    pred = mlh_pred.squeeze(-1)[valid]
+    return F.smooth_l1_loss(pred, target)
 
 
 def train(args):
@@ -466,6 +512,7 @@ def train(args):
         total_loss = 0
         total_policy_loss = 0
         total_value_loss = 0
+        total_mlh_loss = 0
         n_batches = 0
         t0 = time.time()
 
@@ -478,10 +525,11 @@ def train(args):
                                     shuffle=True, num_workers=args.workers,
                                     pin_memory=True, drop_last=True)
 
-                for planes, policy_target, wdl_target in loader:
+                for planes, policy_target, wdl_target, mlh_target in loader:
                     planes = planes.to(device, non_blocking=True)
                     policy_target = policy_target.to(device, non_blocking=True)
                     wdl_target = wdl_target.to(device, non_blocking=True)
+                    mlh_target = mlh_target.to(device, non_blocking=True)
 
                     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                         policy_logits, wdl_logits, mlh = model(planes)
@@ -494,7 +542,9 @@ def train(args):
                             policy_loss = torch.tensor(0.0, device=device)
 
                         value_loss = F.cross_entropy(wdl_logits, wdl_target)
-                        loss = policy_loss + args.value_weight * value_loss
+                        mlh_loss = compute_mlh_loss(mlh, mlh_target, args, device)
+                        loss = (policy_loss + args.value_weight * value_loss +
+                                args.mlh_weight * mlh_loss)
 
                     optimizer.zero_grad()
                     scaler.scale(loss).backward()
@@ -510,6 +560,7 @@ def train(args):
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
                     total_value_loss += value_loss.item()
+                    total_mlh_loss += mlh_loss.item()
                     n_batches += 1
 
                 # Print after each shard
@@ -525,10 +576,11 @@ def train(args):
             loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
                                 num_workers=4, pin_memory=True, drop_last=True)
 
-            for planes, policy_target, wdl_target in loader:
+            for planes, policy_target, wdl_target, mlh_target in loader:
                 planes = planes.to(device, non_blocking=True)
                 policy_target = policy_target.to(device, non_blocking=True)
                 wdl_target = wdl_target.to(device, non_blocking=True)
+                mlh_target = mlh_target.to(device, non_blocking=True)
 
                 with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                     policy_logits, wdl_logits, mlh = model(planes)
@@ -541,7 +593,9 @@ def train(args):
                         policy_loss = torch.tensor(0.0, device=device)
 
                     value_loss = F.cross_entropy(wdl_logits, wdl_target)
-                    loss = policy_loss + args.value_weight * value_loss
+                    mlh_loss = compute_mlh_loss(mlh, mlh_target, args, device)
+                    loss = (policy_loss + args.value_weight * value_loss +
+                            args.mlh_weight * mlh_loss)
 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -553,6 +607,7 @@ def train(args):
                 total_loss += loss.item()
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
+                total_mlh_loss += mlh_loss.item()
                 n_batches += 1
 
                 if n_batches % 1000 == 0:
@@ -571,11 +626,13 @@ def train(args):
         avg_loss = total_loss / max(n_batches, 1)
         avg_policy = total_policy_loss / max(n_batches, 1)
         avg_value = total_value_loss / max(n_batches, 1)
+        avg_mlh = total_mlh_loss / max(n_batches, 1)
         lr = scheduler.get_last_lr()[0]
         print(f"Epoch {epoch+1}/{args.epochs}  "
               f"loss={avg_loss:.4f}  "
               f"policy={avg_policy:.4f}  "
               f"value={avg_value:.4f}  "
+              f"mlh={avg_mlh:.4f}  "
               f"lr={lr:.6f}  "
               f"time={elapsed:.1f}s  "
               f"speed={samples_per_sec:.0f} samples/sec")
@@ -588,10 +645,12 @@ def train(args):
                 writer = csv.writer(csvf)
                 if write_header:
                     writer.writerow(['epoch', 'loss', 'policy_loss', 'value_loss',
+                                     'mlh_loss',
                                      'lr', 'time_sec', 'samples_per_sec',
                                      'total_samples', 'batches'])
                 writer.writerow([epoch + 1, f'{avg_loss:.6f}', f'{avg_policy:.6f}',
-                                 f'{avg_value:.6f}', f'{lr:.8f}', f'{elapsed:.1f}',
+                                 f'{avg_value:.6f}', f'{avg_mlh:.6f}',
+                                 f'{lr:.8f}', f'{elapsed:.1f}',
                                  f'{samples_per_sec:.0f}',
                                  n_batches * args.batch, n_batches])
 
@@ -662,6 +721,13 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--mlh-weight", type=float, default=0.005,
+                        help="Moves-left auxiliary loss weight (0 disables)")
+    parser.add_argument("--mlh-clip", type=float, default=512.0,
+                        help="Clip raw remaining-plies target before scaling")
+    parser.add_argument("--mlh-transform", choices=["raw", "log1p", "sqrt", "linear"],
+                        default="raw",
+                        help="Transform applied to clipped moves-left target")
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--encoders", type=int, default=None)
     parser.add_argument("--heads", type=int, default=None)

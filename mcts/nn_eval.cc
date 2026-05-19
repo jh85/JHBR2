@@ -331,6 +331,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
   // --- Parse outputs ---
   float* policy_data = outputs[0].GetTensorMutableData<float>();
   float* wdl_data = outputs[1].GetTensorMutableData<float>();
+  float* mlh_data = nullptr;
+  if (outputs.size() > 2) {
+    mlh_data = outputs[2].GetTensorMutableData<float>();
+  }
 
   auto policy_shape = outputs[0].GetTensorTypeAndShapeInfo().GetShape();
   int policy_size = static_cast<int>(policy_shape.back());
@@ -352,18 +356,21 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
     result.wdl[2] = wdl[2];
     result.value = wdl[0] - wdl[2];
     result.draw = wdl[1];
+    if (mlh_data) {
+      const float m = mlh_data[b];
+      if (std::isfinite(m)) {
+        result.mlh = std::max(0.0f, m);
+        result.has_mlh = true;
+      }
+    }
 
     // Policy
     float* logits = policy_data + b * policy_size;
-    bool is_white = (board.side_to_move() == lczero::WHITE);
-
     std::vector<float> legal_logits(legal_moves.size());
     float max_logit = -1e10f;
 
     for (size_t i = 0; i < legal_moves.size(); i++) {
-      Move m = legal_moves[i];
-      if (is_white) m.Flip();
-      int idx = ShogiMoveToNNIndex(m);
+      int idx = DlshogiMoveToNNIndex(legal_moves[i], board.side_to_move());
       if (idx >= 0 && idx < policy_size) {
         legal_logits[i] = logits[idx];
       } else {
@@ -404,6 +411,7 @@ NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,
   NNOutput result;
   result.value = 0.0f; result.draw = 0.1f;
   result.wdl[0] = 0.45f; result.wdl[1] = 0.1f; result.wdl[2] = 0.45f;
+  result.has_mlh = false;
   float u = legal_moves.empty() ? 0.0f : 1.0f / legal_moves.size();
   result.policy.assign(legal_moves.size(), u);
   return result;

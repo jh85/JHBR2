@@ -49,6 +49,12 @@ struct SearchConfig {
   int max_moves_to_draw = 100000;
   int leaf_mate_depth = 0;
   size_t nn_cache_size = 0;
+  float moves_left_max_effect = 0.0345f;
+  float moves_left_threshold = 0.8f;
+  float moves_left_slope = 0.0027f;
+  float moves_left_constant_factor = 0.0f;
+  float moves_left_scaled_factor = 1.6521f;
+  float moves_left_quadratic_factor = -0.6521f;
   float info_interval = 1.0f;
   InfoCallback info_callback = nullptr;
 };

@@ -53,6 +53,52 @@ float DrawValue(const SearchConfig& cfg, lczero::Color color) {
   return color == BLACK ? cfg.draw_value_black : cfg.draw_value_white;
 }
 
+float FastSign(float x) {
+  return (x > 0.0f) - (x < 0.0f);
+}
+
+float MovesLeftUtility(const SearchConfig& cfg, const uct_node_t* parent,
+                       const uct_node_t* child, float child_q_win) {
+  if (!parent || !child) return 0.0f;
+  if (cfg.moves_left_max_effect <= 0.0f || cfg.moves_left_slope <= 0.0f) {
+    return 0.0f;
+  }
+  if (!parent->has_mlh.load(std::memory_order_acquire) ||
+      !child->has_mlh.load(std::memory_order_acquire)) {
+    return 0.0f;
+  }
+
+  const int parent_n = parent->move_count.load(std::memory_order_acquire);
+  if (parent_n <= 0) return 0.0f;
+  const float parent_q_win =
+      parent->win.load(std::memory_order_acquire) / parent_n;
+  const float parent_q = parent_q_win * 2.0f - 1.0f;
+  if (std::abs(parent_q) <= cfg.moves_left_threshold) return 0.0f;
+
+  const float parent_m = parent->mlh.load(std::memory_order_acquire);
+  const float child_m = child->mlh.load(std::memory_order_acquire);
+  float q = child_q_win * 2.0f - 1.0f;
+  float m = std::clamp(cfg.moves_left_slope * (child_m - parent_m),
+                       -cfg.moves_left_max_effect,
+                       cfg.moves_left_max_effect);
+  m *= FastSign(-q);
+
+  if (cfg.moves_left_threshold > 0.0f &&
+      cfg.moves_left_threshold < 1.0f) {
+    q = std::max(0.0f, std::abs(q) - cfg.moves_left_threshold) /
+        (1.0f - cfg.moves_left_threshold);
+  } else {
+    q = std::abs(q);
+  }
+  m *= cfg.moves_left_constant_factor +
+       cfg.moves_left_scaled_factor * q +
+       cfg.moves_left_quadratic_factor * q * q;
+
+  // Search scores here are win rates [0,1], while Lc0's M utility is in Q
+  // units [-1,1].
+  return 0.5f * m;
+}
+
 struct BatchCacheKey {
   uint64_t hash = 0;
   uint16_t num_moves = 0;
@@ -78,6 +124,8 @@ jhbr2::NNOutput FromCachedNNValue(const jhbr2::CachedNNValue& cached) {
   out.wdl[2] = cached.wdl[2];
   out.value = cached.wdl[0] - cached.wdl[2];
   out.draw = cached.wdl[1];
+  out.mlh = cached.mlh;
+  out.has_mlh = cached.has_mlh;
   out.policy = cached.policy;
   return out;
 }
@@ -88,6 +136,8 @@ jhbr2::CachedNNValue ToCachedNNValue(const jhbr2::NNOutput& out,
   cached.wdl[0] = out.wdl[0];
   cached.wdl[1] = out.wdl[1];
   cached.wdl[2] = out.wdl[2];
+  cached.mlh = out.mlh;
+  cached.has_mlh = out.has_mlh;
   cached.policy = out.policy;
   cached.num_legal_moves = num_legal_moves;
   return cached;
@@ -286,7 +336,10 @@ unsigned UCTSearcher::SelectMaxUcbChild(child_node_t* parent,
     const float q =
         n == 0 ? -fpu : child.win.load(std::memory_order_acquire) / n;
     const float u = c * sqrt_sum * child.nnrate / (1.0f + n);
-    const float score = q + u;
+    const uct_node_t* child_node =
+        (n > 0 && current->child_nodes) ? current->child_nodes[i].get() : nullptr;
+    const float m = MovesLeftUtility(cfg, current, child_node, q);
+    const float score = q + u + m;
     if (!found || score > best_score) {
       found = true;
       best_score = score;
@@ -445,6 +498,12 @@ void UCTSearcher::EvalNode() {
     elem.node->visited_nnrate.store(visited_policy, std::memory_order_release);
     if (elem.value_win) {
       *elem.value_win = (result.value + 1.0f) * 0.5f;
+    }
+    if (result.has_mlh) {
+      elem.node->mlh.store(result.mlh, std::memory_order_release);
+      elem.node->has_mlh.store(true, std::memory_order_release);
+    } else {
+      elem.node->has_mlh.store(false, std::memory_order_release);
     }
     elem.node->SetEvaled();
   }

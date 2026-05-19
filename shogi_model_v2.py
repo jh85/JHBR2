@@ -2,7 +2,7 @@
 BT4-v2 Transformer Model for Shogi.
 
 Changes from v1:
-  - Policy uses dlshogi-style (destination, direction) encoding (2187 classes)
+  - Policy uses dlshogi-compatible (destination, direction) encoding (2187 classes)
   - Promotion is encoded as separate directions (no promo_offset)
   - Policy head uses attention + 1x1 conv hybrid
   - Bilinear promotion scoring conditioned on (from, to)
@@ -33,29 +33,21 @@ from dataclasses import dataclass, field
 # Move encoding constants
 # =====================================================================
 
-# Direction vectors (df, dr) for BLACK's perspective.
-# Piece moves FROM (to_f - df*dist, to_r - dr*dist) TO (to_f, to_r).
-# NOTE on direction labels: vertical (UP/DOWN) is source-perspective, but
-# horizontal (LEFT/RIGHT) is destination-perspective — i.e. "UP_LEFT" means
-# the piece moves upward and arrives at the destination from its left side.
-# This is because we compute df = to_f - from_f and our file index increases
-# toward physical-left (file 1 is rightmost, file 9 is leftmost from sente's
-# view), so df < 0 (labelled LEFT here) is actually a physical rightward move.
-# dlshogi inverts dir_x and uses pure source-perspective labels, so its LEFT
-# is our RIGHT (and ditto for the diagonals and knight moves).
-# Do NOT try to load dlshogi policy weights directly — 8 of 27 channels are
-# mirrored, plus drops are reordered (we put Gold last; dlshogi puts it at 24).
+# Direction vectors (df, dr) for BLACK's perspective. The labels match
+# dlshogi/cshogi.dlshogi.make_move_label(), which computes horizontal movement
+# as from_file - to_file. Since this Python code uses df = to_file - from_file,
+# LEFT/RIGHT have the opposite sign from the visual board-axis delta.
 DIRECTION_VECTORS = [
     (0, -1),   # 0: UP
-    (-1, -1),  # 1: UP_LEFT
-    (1, -1),   # 2: UP_RIGHT
-    (-1, 0),   # 3: LEFT
-    (1, 0),    # 4: RIGHT
+    (1, -1),   # 1: UP_LEFT
+    (-1, -1),  # 2: UP_RIGHT
+    (1, 0),    # 3: LEFT
+    (-1, 0),   # 4: RIGHT
     (0, 1),    # 5: DOWN
-    (-1, 1),   # 6: DOWN_LEFT
-    (1, 1),    # 7: DOWN_RIGHT
-    (-1, -2),  # 8: UP2_LEFT (knight)
-    (1, -2),   # 9: UP2_RIGHT (knight)
+    (1, 1),    # 6: DOWN_LEFT
+    (-1, 1),   # 7: DOWN_RIGHT
+    (1, -2),   # 8: UP2_LEFT (knight)
+    (-1, -2),  # 9: UP2_RIGHT (knight)
 ]
 
 NUM_DIRECTIONS = 10

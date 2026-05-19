@@ -68,6 +68,8 @@ struct uct_node_t {
 
   std::atomic<int> move_count{kNotExpanded};
   std::atomic<float> win{0.0f};
+  std::atomic<float> mlh{0.0f};
+  std::atomic<bool> has_mlh{false};
   std::atomic<float> visited_nnrate{0.0f};
   short child_num = 0;
   std::unique_ptr<child_node_t[]> child;

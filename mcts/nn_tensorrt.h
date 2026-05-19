@@ -40,6 +40,8 @@ struct NNOutput {
   float value;
   float draw;
   float wdl[3];
+  float mlh = 0.0f;
+  bool has_mlh = false;
   std::vector<float> policy;
 };
 

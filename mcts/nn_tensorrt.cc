@@ -354,6 +354,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       results[b].wdl[0] = 0.45f;
       results[b].wdl[1] = 0.1f;
       results[b].wdl[2] = 0.45f;
+      results[b].has_mlh = false;
       float u = batch[b].second.empty() ? 0.0f : 1.0f / batch[b].second.size();
       results[b].policy.assign(batch[b].second.size(), u);
     }
@@ -448,6 +449,11 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
   CUDA_CHECK(cudaMemcpyAsync(slot.h_wdl, slot.d_wdl,
       static_cast<size_t>(run_batch) * value_planes * sizeof(float),
       cudaMemcpyDeviceToHost, slot.stream));
+  if (!is_dlshogi && impl_->mlh_idx >= 0) {
+    CUDA_CHECK(cudaMemcpyAsync(slot.h_mlh, slot.d_mlh,
+        static_cast<size_t>(run_batch) * sizeof(float),
+        cudaMemcpyDeviceToHost, slot.stream));
+  }
 
   CUDA_CHECK(cudaStreamSynchronize(slot.stream));
 
@@ -466,6 +472,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       result.wdl[2] = 1.0f - value_win;
       result.value = value_win * 2.0f - 1.0f;
       result.draw = 0.0f;
+      result.has_mlh = false;
     } else {
       float wdl[3];
       std::copy(slot.h_wdl + b * 3, slot.h_wdl + b * 3 + 3, wdl);
@@ -475,6 +482,13 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       result.wdl[2] = wdl[2];
       result.value = wdl[0] - wdl[2];
       result.draw = wdl[1];
+      if (impl_->mlh_idx >= 0) {
+        const float m = slot.h_mlh[b];
+        if (std::isfinite(m)) {
+          result.mlh = std::max(0.0f, m);
+          result.has_mlh = true;
+        }
+      }
     }
 
     float* logits = slot.h_policy + b * P;
@@ -484,13 +498,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
 
     for (size_t i = 0; i < legal_moves.size(); i++) {
       int idx;
-      if (is_dlshogi) {
-        idx = DlshogiMoveToNNIndex(legal_moves[i], board.side_to_move());
-      } else {
-        Move m = legal_moves[i];
-        if (board.side_to_move() == lczero::WHITE) m.Flip();
-        idx = ShogiMoveToNNIndex(m);
-      }
+      idx = DlshogiMoveToNNIndex(legal_moves[i], board.side_to_move());
       if (idx >= 0 && idx < P) {
         legal_logits[i] = logits[idx];
       } else {

@@ -32,6 +32,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from shogi_train import sfen_to_planes, move_to_policy_index
 
 
+HCPE_MLH_DTYPE = np.dtype([
+    ("hcp", cshogi.dtypeHcp),
+    ("eval", cshogi.dtypeEval),
+    ("bestMove16", cshogi.dtypeMove16),
+    ("gameResult", "u1"),
+    ("dummy", "u1"),
+    ("mlh", "<i2"),
+])
+
+
 def decode_one_record(board, sfen_data, move_raw, score, game_result,
                       is_hcpe, flip_override=None, eval_coef=600.0):
     """Decode one record (PSV or HCPE) into planes + policy + wdl."""
@@ -92,9 +102,13 @@ def decode_one_record(board, sfen_data, move_raw, score, game_result,
 
 def process_chunk(args):
     """Process a range of records from one file (PSV or HCPE)."""
-    data_path, start_offset, num_records, shard_id, output_dir, eval_coef, is_hcpe = args
+    (data_path, start_offset, num_records, shard_id, output_dir, eval_coef,
+     is_hcpe, has_mlh) = args
 
-    dtype = cshogi.HuffmanCodedPosAndEval if is_hcpe else cshogi.PackedSfenValue
+    if is_hcpe:
+        dtype = HCPE_MLH_DTYPE if has_mlh else cshogi.HuffmanCodedPosAndEval
+    else:
+        dtype = cshogi.PackedSfenValue
     records = np.fromfile(data_path, dtype=dtype,
                           offset=start_offset, count=num_records)
     actual = len(records)
@@ -106,6 +120,7 @@ def process_chunk(args):
     planes_list = []
     policy_list = []
     wdl_list = []
+    mlh_list = []
     errors = 0
 
     for i in range(actual):
@@ -117,11 +132,13 @@ def process_chunk(args):
                 move_raw = int(r['bestMove16'])
                 score = int(r['eval'])
                 game_result = int(r['gameResult'])
+                mlh_target = int(r['mlh']) if has_mlh else -1
             else:
                 sfen_data = r['sfen']
                 move_raw = int(r['move'])
                 score = int(r['score'])
                 game_result = int(r['game_result'])
+                mlh_target = -1
 
             result = decode_one_record(board, sfen_data, move_raw, score,
                                        game_result, is_hcpe, eval_coef=eval_coef)
@@ -133,6 +150,7 @@ def process_chunk(args):
             planes_list.append(planes)
             policy_list.append(policy_idx)
             wdl_list.append(wdl)
+            mlh_list.append(mlh_target)
 
         except Exception as e:
             errors += 1
@@ -147,9 +165,12 @@ def process_chunk(args):
     planes_arr = np.array(planes_list, dtype=np.float16)
     policy_arr = np.array(policy_list, dtype=np.int32)
     wdl_arr = np.array(wdl_list, dtype=np.float16)
+    mlh_arr = np.array(mlh_list, dtype=np.int16)
 
     out_path = os.path.join(output_dir, f"shard_{shard_id:06d}.npz")
-    np.savez_compressed(out_path, planes=planes_arr, policy=policy_arr, wdl=wdl_arr)
+    np.savez_compressed(out_path, planes=planes_arr, policy=policy_arr,
+                        wdl=wdl_arr, mlh=mlh_arr,
+                        policy_encoding=np.array("dlshogi_27x81"))
 
     return shard_id, len(planes_list)
 
@@ -166,6 +187,10 @@ def main():
     parser.add_argument("--workers", type=int, default=16)
     parser.add_argument("--max-positions", type=int, default=None)
     parser.add_argument("--eval-coef", type=float, default=600.0)
+    parser.add_argument("--hcpe-format", choices=("auto", "hcpe", "hcpe_mlh"),
+                        default="auto",
+                        help="HCPE record format. Use hcpe_mlh for pack-converted "
+                             "files with moves-left targets.")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -197,14 +222,46 @@ def main():
     print(f"Found {len(data_files)} {fmt} file(s)")
 
     # Build task list
-    RECORD_SIZE = 38 if is_hcpe else 40
     tasks = []
     shard_id = 0
     total_positions = 0
 
     for data_path in data_files:
         file_size = os.path.getsize(data_path)
-        file_records = file_size // RECORD_SIZE
+        has_mlh = False
+        if is_hcpe:
+            can_be_mlh = file_size % HCPE_MLH_DTYPE.itemsize == 0
+            can_be_hcpe = file_size % cshogi.HuffmanCodedPosAndEval.itemsize == 0
+            if args.hcpe_format == "hcpe_mlh":
+                if not can_be_mlh:
+                    print(f"Skipping {data_path}: size {file_size} is not valid HCPE_MLH",
+                          file=sys.stderr)
+                    continue
+                record_size = HCPE_MLH_DTYPE.itemsize
+                has_mlh = True
+            elif args.hcpe_format == "hcpe":
+                if not can_be_hcpe:
+                    print(f"Skipping {data_path}: size {file_size} is not valid HCPE",
+                          file=sys.stderr)
+                    continue
+                record_size = cshogi.HuffmanCodedPosAndEval.itemsize
+            elif can_be_mlh and can_be_hcpe:
+                print(f"Skipping {data_path}: size {file_size} is ambiguous between "
+                      "HCPE and HCPE_MLH; pass --hcpe-format hcpe or hcpe_mlh",
+                      file=sys.stderr)
+                continue
+            elif can_be_mlh:
+                record_size = HCPE_MLH_DTYPE.itemsize
+                has_mlh = True
+            elif can_be_hcpe:
+                record_size = cshogi.HuffmanCodedPosAndEval.itemsize
+            else:
+                print(f"Skipping {data_path}: size {file_size} is not a valid HCPE/HCPE_MLH file",
+                      file=sys.stderr)
+                continue
+        else:
+            record_size = cshogi.PackedSfenValue.itemsize
+        file_records = file_size // record_size
         offset = 0
         while offset < file_records:
             chunk = min(args.shard_size, file_records - offset)
@@ -212,8 +269,8 @@ def main():
                 chunk = args.max_positions - total_positions
             if chunk <= 0:
                 break
-            tasks.append((data_path, offset * RECORD_SIZE, chunk, shard_id,
-                          args.output_dir, args.eval_coef, is_hcpe))
+            tasks.append((data_path, offset * record_size, chunk, shard_id,
+                          args.output_dir, args.eval_coef, is_hcpe, has_mlh))
             offset += chunk
             total_positions += chunk
             shard_id += 1

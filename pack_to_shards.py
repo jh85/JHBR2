@@ -88,6 +88,7 @@ def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
         policy=np.asarray(policy, dtype=np.int32),
         wdl=np.asarray(wdl, dtype=np.float16),
         mlh=np.asarray(mlh, dtype=np.int16),
+        policy_encoding=np.array("dlshogi_27x81"),
     )
     return out_path
 

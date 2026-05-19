@@ -17,16 +17,11 @@
 //   Plane   46:    Our pieces in enemy camp / 10.0
 //   Plane   47:    Their pieces in enemy camp / 10.0
 //
-// POLICY OUTPUT (3849 moves):
-//   Indices    0-2223:  Board moves (from×to, non-promotion)
-//   Indices 2224-3281:  Board moves (from×to, promotion)
-//   Indices 3282-3848:  Drop moves (7 piece types × 81 squares)
-//
-// ATTENTION POLICY RAW OUTPUT (13689 values):
-//   Section 0:  81×81 = 6561 (board from×to, non-promotion)
-//   Section 1:  81×81 = 6561 (board from×to, promotion)
-//   Section 2:  7×81  = 567  (drop type×to)
-//   Mapped to 3849 policy indices via kShogiAttnPolicyMap.
+// POLICY OUTPUT (dlshogi-compatible, 2187 moves):
+//   Encoding: direction * 81 + destination square
+//   Directions  0-9:  non-promotion board moves
+//   Directions 10-19: promotion board moves
+//   Directions 20-26: drops (P,L,N,S,B,R,G)
 
 #pragma once
 
@@ -113,7 +108,7 @@ constexpr int kPolicySize = 2187;
 constexpr int kNumDirections = 10;
 constexpr int kNumDropTypes = 7;
 
-// Convert a Move to its index in the 2187-element policy vector.
+// Convert a Move to its index in the 2187-element dlshogi policy vector.
 // The move must be from BLACK's perspective (flip for WHITE before calling).
 // Returns -1 if the move direction is not recognized.
 int ShogiMoveToNNIndex(Move move);
