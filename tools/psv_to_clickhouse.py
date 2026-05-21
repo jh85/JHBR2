@@ -26,6 +26,8 @@ Example:
 from __future__ import annotations
 
 import argparse
+import base64
+import os
 import re
 import struct
 import sys
@@ -296,21 +298,41 @@ def tsv_escape(value) -> str:
     )
 
 
-def ch_post(url: str, query: str, data: bytes | None = None, timeout: int = 300):
+def clickhouse_auth(args):
+    user = args.user
+    password = args.password
+    if args.password_file:
+        password = Path(args.password_file).read_text().strip()
+    if password is not None and user is None:
+        user = "default"
+    if user is None:
+        return None
+    return user, password or ""
+
+
+def ch_post(url: str, query: str, data: bytes | None = None, timeout: int = 300,
+            auth=None):
     endpoint = url.rstrip("/") + "/?query=" + urllib.parse.quote(query)
     req = urllib.request.Request(endpoint, data=data or b"", method="POST")
+    if auth is not None:
+        user, password = auth
+        token = base64.b64encode(f"{user}:{password}".encode()).decode()
+        req.add_header("Authorization", f"Basic {token}")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"ClickHouse HTTP {exc.code}: {body}") from exc
+        hint = ""
+        if exc.code == 401:
+            hint = " Pass --user/--password or set CLICKHOUSE_USER and CLICKHOUSE_PASSWORD."
+        raise RuntimeError(f"ClickHouse HTTP {exc.code}: {body}{hint}") from exc
 
 
-def create_table(url: str, database: str, table: str):
+def create_table(url: str, database: str, table: str, auth=None):
     database = require_identifier(database)
     table = require_identifier(table)
-    ch_post(url, f"CREATE DATABASE IF NOT EXISTS {database}")
+    ch_post(url, f"CREATE DATABASE IF NOT EXISTS {database}", auth=auth)
     ch_post(url, f"""
 CREATE TABLE IF NOT EXISTS {database}.{table}
 (
@@ -333,7 +355,7 @@ ENGINE = MergeTree
 PARTITION BY dataset
 ORDER BY (pos_hash, position_key, dataset, source_file, game_index, ply)
 SETTINGS index_granularity = 8192
-""")
+""", auth=auth)
 
 
 def row_to_tsv(row) -> str:
@@ -341,13 +363,14 @@ def row_to_tsv(row) -> str:
 
 
 def flush_rows(url: str, database: str, table: str, rows: list[str],
-               dry_run: bool) -> int:
+               dry_run: bool, auth=None) -> int:
     if not rows:
         return 0
     if not dry_run:
         columns = ", ".join(INSERT_COLUMNS)
         query = f"INSERT INTO {database}.{table} ({columns}) FORMAT TabSeparated"
-        ch_post(url, query, "".join(rows).encode("utf-8"), timeout=1800)
+        ch_post(url, query, "".join(rows).encode("utf-8"), timeout=1800,
+                auth=auth)
     n = len(rows)
     rows.clear()
     return n
@@ -421,7 +444,8 @@ def load_file(path: Path, args, rows: list[str], total_inserted: int):
             file_rows += 1
             if len(rows) >= args.batch_rows:
                 total_inserted += flush_rows(
-                    args.url, args.database, args.table, rows, args.dry_run)
+                    args.url, args.database, args.table, rows, args.dry_run,
+                    auth=args.clickhouse_auth)
         game_index += 1
         game_records = []
 
@@ -459,8 +483,11 @@ def load_psv_files(args):
     if not files:
         raise SystemExit("No PSV files found")
 
+    args.clickhouse_auth = clickhouse_auth(args)
+
     if args.create_table and not args.dry_run:
-        create_table(args.url, args.database, args.table)
+        create_table(args.url, args.database, args.table,
+                     auth=args.clickhouse_auth)
 
     rows: list[str] = []
     total_inserted = 0
@@ -490,7 +517,8 @@ def load_psv_files(args):
               flush=True)
 
     total_inserted += flush_rows(
-        args.url, args.database, args.table, rows, args.dry_run)
+        args.url, args.database, args.table, rows, args.dry_run,
+        auth=args.clickhouse_auth)
     elapsed = max(time.time() - t0, 1e-6)
     action = "decoded" if args.dry_run else "inserted"
     print(f"done: {action} {total_inserted:,} rows, "
@@ -507,6 +535,12 @@ def main():
     p.add_argument("--recursive", action="store_true")
     p.add_argument("--dataset", default="psv")
     p.add_argument("--url", default="http://localhost:8123")
+    p.add_argument("--user", default=os.environ.get("CLICKHOUSE_USER"),
+                   help="ClickHouse user. Defaults to CLICKHOUSE_USER.")
+    p.add_argument("--password", default=os.environ.get("CLICKHOUSE_PASSWORD"),
+                   help="ClickHouse password. Defaults to CLICKHOUSE_PASSWORD.")
+    p.add_argument("--password-file",
+                   help="Read ClickHouse password from this file.")
     p.add_argument("--database", default="shogi")
     p.add_argument("--table", default="pack_positions")
     p.add_argument("--create-table", action="store_true")
