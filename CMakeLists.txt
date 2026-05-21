@@ -69,6 +69,12 @@ set(SHOGI_ENGINE_SRCS
 # MCTS (lc0-style port + NN backend)
 option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
 
+if(USE_TENSORRT)
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+endif()
+
 set(LC0_MCTS_SRCS
   lc0_mcts/node.cc
   lc0_mcts/search.cc
@@ -85,6 +91,7 @@ if(USE_TENSORRT)
     ${LC0_MCTS_SRCS}
     ${DLSHOGI_MCTS_SRCS}
     mcts/nn_tensorrt.cc
+    mcts/input_unpack.cu
   )
 else()
   set(MCTS_SRCS
@@ -179,6 +186,10 @@ target_link_libraries(test_movegen PRIVATE shogi_core)
 # ---- Test: game replay (DoMove chain) ----
 add_executable(test_replay test/test_replay.cc)
 target_link_libraries(test_replay PRIVATE shogi_core)
+
+# ---- Test: neural-network encoder ----
+add_executable(test_encoder test/test_encoder.cc)
+target_link_libraries(test_encoder PRIVATE shogi_core)
 
 # ---- Benchmark: move generation ----
 add_executable(bench_movegen test/bench_movegen.cc)

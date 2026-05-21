@@ -21,8 +21,8 @@ import os, sys, math, struct, tempfile, shutil, traceback
 import numpy as np
 import cshogi
 
-sys.path.insert(0, "/home/ei/Downloads/JHBR2")
-from shogi_train import sfen_to_planes, move_to_policy_index
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from shogi_train import INPUT_PLANES, sfen_to_planes, move_to_policy_index
 from psv_to_shards import (PSV_DTYPE, encode_one_psv, is_game_boundary,
                             emit_buffered_game, process_psv_file)
 
@@ -152,10 +152,10 @@ def test_synthetic():
         passed &= fail(f"policy out of range: [{d['policy'].min()}, {d['policy'].max()}]")
 
     # Check planes shape
-    if d['planes'].shape == (12, 48, 9, 9):
+    if d['planes'].shape == (12, INPUT_PLANES, 9, 9):
         passed &= ok(f"planes shape {d['planes'].shape}")
     else:
-        passed &= fail(f"planes shape {d['planes'].shape} != (12, 48, 9, 9)")
+        passed &= fail(f"planes shape {d['planes'].shape} != (12, {INPUT_PLANES}, 9, 9)")
 
     shutil.rmtree(tmp)
     return passed
@@ -283,7 +283,7 @@ def test_cross_script_consistency():
 
     tmp = tempfile.mkdtemp()
     # Make a tiny dummy shard with each script
-    planes = [np.zeros((48,9,9), dtype=np.float16)]
+    planes = [np.zeros((INPUT_PLANES, 9, 9), dtype=np.float16)]
     policy = [0]
     wdl = [[1.0, 0.0, 0.0]]
     mlh = [0]
@@ -327,7 +327,7 @@ def test_spot_check_decoding():
             continue
         planes, policy_idx, wdl = enc
         # Verify shapes
-        assert planes.shape == (48, 9, 9), planes.shape
+        assert planes.shape == (INPUT_PLANES, 9, 9), planes.shape
         assert 0 <= policy_idx < 2187, policy_idx
         s = sum(wdl)
         if abs(s - 1.0) > 0.001:

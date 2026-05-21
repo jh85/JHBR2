@@ -30,11 +30,17 @@ from multiprocessing import Pool
 
 import numpy as np
 
+from shogi_train import FEATURE_ENCODING, INPUT_PLANES, POLICY_ENCODING
+
 
 def get_c_decoder():
     so_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psv_decode_c.so")
-    if not os.path.exists(so_path):
-        c_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psv_decode_c.c")
+    c_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psv_decode_c.c")
+    needs_build = (
+        not os.path.exists(so_path) or
+        (os.path.exists(c_path) and os.path.getmtime(c_path) > os.path.getmtime(so_path))
+    )
+    if needs_build:
         import subprocess
         subprocess.run(["gcc", "-O3", "-shared", "-fPIC", "-o", so_path, c_path, "-lm"], check=True)
     lib = ctypes.CDLL(so_path)
@@ -65,7 +71,7 @@ def process_chunk(args):
     records = np.frombuffer(raw, dtype=np.uint8).reshape(actual_records, RECORD_SIZE).copy()
 
     # Allocate output arrays
-    planes = np.zeros((actual_records, 48 * 81), dtype=np.float32)
+    planes = np.zeros((actual_records, INPUT_PLANES * 81), dtype=np.float32)
     policy = np.zeros(actual_records, dtype=np.int32)
     wdl = np.zeros((actual_records, 3), dtype=np.float32)
 
@@ -79,14 +85,16 @@ def process_chunk(args):
         ctypes.c_float(600.0))
 
     # Reshape planes and convert to float16 to save disk space
-    planes = planes.reshape(actual_records, 48, 9, 9).astype(np.float16)
+    planes = planes.reshape(actual_records, INPUT_PLANES, 9, 9).astype(np.float16)
 
     # Save shard
     out_path = os.path.join(output_dir, f"shard_{shard_id:06d}.npz")
     np.savez_compressed(out_path,
                         planes=planes,
                         policy=policy,
-                        wdl=wdl.astype(np.float16))
+                        wdl=wdl.astype(np.float16),
+                        policy_encoding=np.array(POLICY_ENCODING),
+                        feature_encoding=np.array(FEATURE_ENCODING))
 
     return shard_id, actual_records
 

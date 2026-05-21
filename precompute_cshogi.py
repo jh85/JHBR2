@@ -29,7 +29,8 @@ import cshogi
 
 # Import our encoder
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shogi_train import sfen_to_planes, move_to_policy_index
+from shogi_train import (FEATURE_ENCODING, POLICY_ENCODING,
+                         sfen_to_planes, move_to_policy_index)
 
 
 HCPE_MLH_DTYPE = np.dtype([
@@ -170,7 +171,8 @@ def process_chunk(args):
     out_path = os.path.join(output_dir, f"shard_{shard_id:06d}.npz")
     np.savez_compressed(out_path, planes=planes_arr, policy=policy_arr,
                         wdl=wdl_arr, mlh=mlh_arr,
-                        policy_encoding=np.array("dlshogi_27x81"))
+                        policy_encoding=np.array(POLICY_ENCODING),
+                        feature_encoding=np.array(FEATURE_ENCODING))
 
     return shard_id, len(planes_list)
 

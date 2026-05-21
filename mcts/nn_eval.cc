@@ -72,7 +72,7 @@ struct NNEvaluator::Impl {
   std::vector<const char*> input_names;
   std::vector<const char*> output_names;
 
-  int input_channels = 44;
+  int input_channels = kShogiInputPlanes;
   bool use_tensorrt = false;
 };
 

@@ -30,7 +30,7 @@ $TENSORRT_PATH/bin/trtexec \
   --onnx="$MODEL_ONNX" \
   --saveEngine=engines/shogi_bt4_epoch23_trt_o128_m128_ws8192.engine \
   --fp16 \
-  --minShapes=input_planes:1x48x9x9 \
-  --optShapes=input_planes:128x48x9x9 \
-  --maxShapes=input_planes:128x48x9x9 \
+  --minShapes=input_planes:1x148x9x9 \
+  --optShapes=input_planes:128x148x9x9 \
+  --maxShapes=input_planes:128x148x9x9 \
   --memPoolSize=workspace:8192M

@@ -5,17 +5,22 @@
 
 // Neural network input/output encoding for Shogi.
 //
-// INPUT PLANES (48 channels, 9×9 each):
+// INPUT PLANES (148 binary channels, 9×9 each):
 //   Planes  0-13:  Our 14 piece types on board (P,L,N,S,B,R,G,K,+P,+L,+N,+S,+H,+D)
 //   Planes 14-27:  Their 14 piece types on board
 //   Plane   28:    Repetition flag (all 1s if position has occurred before)
-//   Planes 29-35:  Our hand piece counts (P,L,N,S,B,R,G), value = count
-//   Planes 36-42:  Their hand piece counts
-//   Plane   43:    All ones (board edge helper)
-//   Plane   44:    Our entering-king points / 28.0 (nyugyoku progress)
-//   Plane   45:    Their entering-king points / 28.0
-//   Plane   46:    Our pieces in enemy camp / 10.0
-//   Plane   47:    Their pieces in enemy camp / 10.0
+//   Planes 29-56:  Our unary hand pieces (P8,L4,N4,S4,G4,B2,R2)
+//   Planes 57-84:  Their unary hand pieces (P8,L4,N4,S4,G4,B2,R2)
+//   Plane   85:    All ones (board edge helper)
+//   Planes 86-116: Our dlshogi-style nyugyoku features
+//   Planes 117-147: Their dlshogi-style nyugyoku features
+//
+// NYUGYOKU FEATURES PER SIDE (31 planes):
+//   +0:       King is in opponent camp
+//   +1..+10: Remaining pieces needed in opponent camp, buckets 0..9.
+//             10+ remaining pieces is represented by all zero planes.
+//   +11..+30: Remaining points needed, buckets 0..19.
+//             20+ remaining points is represented by all zero planes.
 //
 // POLICY OUTPUT (dlshogi-compatible, 2187 moves):
 //   Encoding: direction * 81 + destination square
@@ -38,7 +43,19 @@ namespace lczero {
 
 // --- Constants ---
 
-constexpr int kShogiInputPlanes = 48;
+constexpr int kShogiPieceInputPlanes = 28;
+constexpr int kShogiRepetitionPlane = 28;
+constexpr int kShogiHandBasePlane = 29;
+constexpr int kShogiHandPlanesPerSide = 28;
+constexpr int kShogiHandInputPlanes = 2 * kShogiHandPlanesPerSide;
+constexpr int kShogiAllOnesPlane = kShogiHandBasePlane + kShogiHandInputPlanes;
+constexpr int kShogiNyugyokuBasePlane = kShogiAllOnesPlane + 1;
+constexpr int kShogiNyugyokuPlanesPerSide = 31;
+constexpr int kShogiNyugyokuOppFieldBuckets = 10;
+constexpr int kShogiNyugyokuScoreBuckets = 20;
+constexpr int kShogiInputPlanes =
+    kShogiNyugyokuBasePlane + 2 * kShogiNyugyokuPlanesPerSide;
+constexpr int kShogiPackedInputBytes = (kShogiInputPlanes * 81 + 7) / 8;
 constexpr int kShogiBoardSize = 9;
 constexpr int kDlshogiInput1Planes = 62;
 constexpr int kDlshogiInput2Planes = 57;

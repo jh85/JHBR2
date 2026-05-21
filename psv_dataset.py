@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from shogi_train import INPUT_PLANES
+
 # Constants (only used by Python fallback and test)
 RECORD_SIZE = 40
 
@@ -35,9 +37,13 @@ def _get_c_decoder():
 
     # Find and load the shared library
     so_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psv_decode_c.so")
-    if not os.path.exists(so_path):
+    c_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psv_decode_c.c")
+    needs_build = (
+        not os.path.exists(so_path) or
+        (os.path.exists(c_path) and os.path.getmtime(c_path) > os.path.getmtime(so_path))
+    )
+    if needs_build:
         # Try to build it
-        c_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "psv_decode_c.c")
         if os.path.exists(c_path):
             import subprocess
             print(f"Building {so_path}...")
@@ -96,7 +102,7 @@ class PSVDataset(Dataset):
 
         if self.c_lib is not None:
             # Fast C decoder
-            planes = np.zeros(48 * 81, dtype=np.float32)
+            planes = np.zeros(INPUT_PLANES * 81, dtype=np.float32)
             policy_idx = ctypes.c_int(-1)
             wdl = np.zeros(3, dtype=np.float32)
 
@@ -107,7 +113,7 @@ class PSVDataset(Dataset):
                 wdl.ctypes.data_as(ctypes.c_void_p),
                 ctypes.c_float(self.eval_coef))
 
-            return (torch.from_numpy(planes.reshape(48, 9, 9)),
+            return (torch.from_numpy(planes.reshape(INPUT_PLANES, 9, 9)),
                     torch.tensor(policy_idx.value, dtype=torch.long),
                     torch.from_numpy(wdl),
                     torch.tensor(-1.0, dtype=torch.float32))

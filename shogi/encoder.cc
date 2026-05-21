@@ -113,6 +113,43 @@ void SetDlshogiPlaneAll(float* planes, int plane, float value = 1.0f) {
   std::fill(planes + plane * 81, planes + (plane + 1) * 81, value);
 }
 
+void SetNyugyokuFeaturePlanes(ShogiInputPlanes& planes, int side_idx,
+                              const ShogiBoard::EnteringKingInfo& info,
+                              int point_threshold) {
+  const int base = kShogiNyugyokuBasePlane +
+                   side_idx * kShogiNyugyokuPlanesPerSide;
+  if (info.king_in_camp) {
+    planes[base].SetAll(1.0f);
+  }
+
+  const int rest_pieces = 10 - info.pieces_in_camp;
+  if (rest_pieces < kShogiNyugyokuOppFieldBuckets) {
+    const int bucket = std::max(0, rest_pieces);
+    planes[base + 1 + bucket].SetAll(1.0f);
+  }
+
+  const int rest_points = point_threshold - info.points;
+  if (rest_points < kShogiNyugyokuScoreBuckets) {
+    const int bucket = std::max(0, rest_points);
+    planes[base + 1 + kShogiNyugyokuOppFieldBuckets + bucket].SetAll(1.0f);
+  }
+}
+
+void SetUnaryHandFeaturePlanes(ShogiInputPlanes& planes, int side_idx,
+                               const Hand& hand) {
+  const PieceType hand_order[] = {
+      kPawn, kLance, kKnight, kSilver, kGold, kBishop, kRook};
+  const int hand_max[] = {8, 4, 4, 4, 4, 2, 2};
+  int plane = kShogiHandBasePlane + side_idx * kShogiHandPlanesPerSide;
+  for (int i = 0; i < 7; ++i) {
+    const int count = std::min(hand.Count(hand_order[i]), hand_max[i]);
+    for (int n = 0; n < count; ++n) {
+      planes[plane + n].SetAll(1.0f);
+    }
+    plane += hand_max[i];
+  }
+}
+
 int DlshogiPiecePlane(PieceType pt) {
   if (pt.idx >= kPawn.idx && pt.idx <= kDragon.idx) return pt.idx - 1;
   return -1;
@@ -186,36 +223,28 @@ ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
 
   // Plane 28: Repetition flag (1 if current position has occurred before).
   if (b.IsRepetition()) {
-    planes[28].SetAll(1.0f);
+    planes[kShogiRepetitionPlane].SetAll(1.0f);
   } else {
-    planes[28].Clear();
+    planes[kShogiRepetitionPlane].Clear();
   }
 
-  // Planes 29-35: Our hand piece counts.
-  const PieceType hand_types[] = {
-    kPawn, kLance, kKnight, kSilver, kBishop, kRook, kGold
-  };
-  for (int i = 0; i < 7; ++i) {
-    float count = static_cast<float>(b.hand(us).Count(hand_types[i]));
-    planes[29 + i].SetAll(count);
+  // Planes 29-84: dlshogi-style unary hand planes.
+  SetUnaryHandFeaturePlanes(planes, 0, b.hand(us));
+  SetUnaryHandFeaturePlanes(planes, 1, b.hand(them));
+
+  // Plane 85: All ones.
+  planes[kShogiAllOnesPlane].SetAll(1.0f);
+
+  // Planes 86-147: dlshogi-style entering-king declaration features.
+  // Compute on the original physical colors so BLACK keeps the 28-point
+  // threshold and WHITE keeps the 27-point threshold even when the board is
+  // flipped into side-to-move perspective.
+  for (Color c : {BLACK, WHITE}) {
+    const int side_idx = (c == board.side_to_move()) ? 0 : 1;
+    const int threshold = (c == BLACK) ? 28 : 27;
+    SetNyugyokuFeaturePlanes(planes, side_idx,
+                             board.ComputeEnteringKingInfo(c), threshold);
   }
-
-  // Planes 36-42: Their hand piece counts.
-  for (int i = 0; i < 7; ++i) {
-    float count = static_cast<float>(b.hand(them).Count(hand_types[i]));
-    planes[36 + i].SetAll(count);
-  }
-
-  // Plane 43: All ones.
-  planes[43].SetAll(1.0f);
-
-  // Planes 44-47: Entering-king (nyugyoku) progress features.
-  auto our_ek = b.ComputeEnteringKingInfo(us);
-  auto their_ek = b.ComputeEnteringKingInfo(them);
-  planes[44].SetAll(static_cast<float>(our_ek.points) / 28.0f);
-  planes[45].SetAll(static_cast<float>(their_ek.points) / 28.0f);
-  planes[46].SetAll(static_cast<float>(our_ek.pieces_in_camp) / 10.0f);
-  planes[47].SetAll(static_cast<float>(their_ek.pieces_in_camp) / 10.0f);
 
   return planes;
 }

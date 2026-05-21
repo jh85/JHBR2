@@ -31,6 +31,19 @@ from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
                             NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS)
 
 POLICY_ENCODING = "dlshogi_27x81"
+FEATURE_ENCODING = "jhbr2_148_dlshogi_hand_p8_nyugyoku"
+INPUT_PLANES = 148
+PIECE_INPUT_PLANES = 28
+REPETITION_PLANE = 28
+HAND_BASE_PLANE = 29
+HAND_PLANES_PER_SIDE = 28
+HAND_ORDER = ('P', 'L', 'N', 'S', 'G', 'B', 'R')
+HAND_MAX = (8, 4, 4, 4, 4, 2, 2)
+ALL_ONES_PLANE = HAND_BASE_PLANE + 2 * HAND_PLANES_PER_SIDE
+NYUGYOKU_BASE_PLANE = ALL_ONES_PLANE + 1
+NYUGYOKU_PLANES_PER_SIDE = 31
+NYUGYOKU_OPP_FIELD_BUCKETS = 10
+NYUGYOKU_SCORE_BUCKETS = 20
 
 
 # =====================================================================
@@ -39,7 +52,7 @@ POLICY_ENCODING = "dlshogi_27x81"
 
 def sfen_to_planes(sfen_str):
     """
-    Convert an SFEN string to a (48, 9, 9) input tensor.
+    Convert an SFEN string to a (148, 9, 9) input tensor.
     Encodes from side-to-move's perspective (flipped for WHITE).
     """
     parts = sfen_str.strip().split()
@@ -48,7 +61,7 @@ def sfen_to_planes(sfen_str):
     hand_str = parts[2]
     flip = (side == 'w')
 
-    planes = np.zeros((48, 9, 9), dtype=np.float32)
+    planes = np.zeros((INPUT_PLANES, 9, 9), dtype=np.float32)
 
     # Piece type mapping: char → (color, plane_index)
     # Our pieces = planes 0-13, their pieces = planes 14-27
@@ -59,7 +72,9 @@ def sfen_to_planes(sfen_str):
         'P': 8, 'L': 9, 'N': 10, 'S': 11, 'B': 12, 'R': 13,
     }
 
-    # Parse board
+    # Parse board. Keep physical piece records for nyugyoku thresholds, which
+    # are color-dependent (BLACK needs 28 points, WHITE needs 27).
+    pieces = []
     r, f = 0, 8  # Start top-left: rank a (idx 0), file 9 (idx 8)
     promoted = False
     for ch in board_str:
@@ -85,6 +100,8 @@ def sfen_to_planes(sfen_str):
             f -= 1
             continue
 
+        pieces.append((is_black, plane_idx, r, f))
+
         # Determine "ours" vs "theirs"
         if flip:
             is_ours = not is_black
@@ -100,8 +117,13 @@ def sfen_to_planes(sfen_str):
     # Plane 28: repetition (TODO: requires history)
     # planes[28] = 0
 
-    # Hand pieces
-    HAND_PLANE = {'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6}
+    # Hand pieces. Use dlshogi's unary/thermometer P8,L4,N4,S4,G4,B2,R2
+    # order so every feature plane is binary and bit-packable.
+    HAND_PLANE = {ch: i for i, ch in enumerate(HAND_ORDER)}
+    hand_counts = {
+        True: [0] * 7,   # BLACK
+        False: [0] * 7,  # WHITE
+    }
     if hand_str != '-':
         count = 0
         for ch in hand_str:
@@ -114,65 +136,70 @@ def sfen_to_planes(sfen_str):
             base = ch.upper()
             idx = HAND_PLANE.get(base, -1)
             if idx >= 0:
-                if flip:
-                    is_ours = not is_black
-                else:
-                    is_ours = is_black
-                plane = 29 + idx if is_ours else 36 + idx
-                planes[plane] = float(count)
+                hand_counts[is_black][idx] += count
             count = 0
 
-    # Plane 43: all ones
-    planes[43] = 1.0
+    for is_black in [True, False]:
+        side_idx = 0 if (not is_black if flip else is_black) else 1
+        plane = HAND_BASE_PLANE + side_idx * HAND_PLANES_PER_SIDE
+        for idx, max_count in enumerate(HAND_MAX):
+            count = min(hand_counts[is_black][idx], max_count)
+            for n in range(count):
+                planes[plane + n] = 1.0
+            plane += max_count
 
-    # Planes 44-47: Entering-king (nyugyoku) progress features.
-    # Compute points and piece counts for both sides.
-    # We need to parse the board to count pieces in enemy camp.
-    MAJOR_PIECES = {'B', 'R'}  # bishop, rook (and promoted forms count too)
-    for color_is_ours in [True, False]:
+    # Plane 85: all ones
+    planes[ALL_ONES_PLANE] = 1.0
+
+    # Planes 86-147: dlshogi-style entering-king declaration features.
+    # Per side: king-in-camp, remaining enemy-camp pieces buckets 0..9,
+    # then remaining points buckets 0..19. Values outside the explicit
+    # bucket ranges are represented by all-zero bucket planes, matching
+    # dlshogi's NYUGYOKU_FEATURES encoder.
+    def set_nyugyoku(side_idx, king_in_camp, pieces_in_camp, points, threshold):
+        base = NYUGYOKU_BASE_PLANE + side_idx * NYUGYOKU_PLANES_PER_SIDE
+        if king_in_camp:
+            planes[base] = 1.0
+
+        rest_pieces = 10 - pieces_in_camp
+        if rest_pieces < NYUGYOKU_OPP_FIELD_BUCKETS:
+            bucket = max(0, rest_pieces)
+            planes[base + 1 + bucket] = 1.0
+
+        rest_points = threshold - points
+        if rest_points < NYUGYOKU_SCORE_BUCKETS:
+            bucket = max(0, rest_points)
+            planes[base + 1 + NYUGYOKU_OPP_FIELD_BUCKETS + bucket] = 1.0
+
+    for is_black in [True, False]:
         points = 0
         pieces_in_camp = 0
+        king_in_camp = False
 
-        # Enemy camp: ranks 0,1,2 for "us" (after flip, us=BLACK perspective).
-        # For the opponent, enemy camp is ranks 6,7,8 (from our perspective).
-        if color_is_ours:
-            camp_ranks = {0, 1, 2}
-        else:
-            camp_ranks = {6, 7, 8}
+        # Enemy camp in physical board coordinates.
+        camp_ranks = {0, 1, 2} if is_black else {6, 7, 8}
 
         # Count board pieces in enemy camp
-        for r in range(9):
-            for f in range(9):
-                # Check the piece planes
-                for pt_idx in range(14):
-                    offset = 0 if color_is_ours else 14
-                    if planes[offset + pt_idx, r, f] > 0.5:
-                        if r in camp_ranks:
-                            if pt_idx == 7:  # King
-                                pass  # King doesn't count for points or piece count
-                            else:
-                                pieces_in_camp += 1
-                                # Major pieces: Bishop(4), Rook(5), Horse(12), Dragon(13)
-                                if pt_idx in (4, 5, 12, 13):
-                                    points += 5
-                                else:
-                                    points += 1
+        for piece_is_black, pt_idx, rank, _file in pieces:
+            if piece_is_black != is_black or rank not in camp_ranks:
+                continue
+            if pt_idx == 7:  # King
+                king_in_camp = True
+                continue
+            pieces_in_camp += 1
+            # Major pieces: Bishop(4), Rook(5), Horse(12), Dragon(13)
+            points += 5 if pt_idx in (4, 5, 12, 13) else 1
 
         # Add hand piece points
-        for i in range(7):
-            hand_plane = 29 + i if color_is_ours else 36 + i
-            count = planes[hand_plane, 0, 0]  # scalar broadcast
-            if i in (4, 5):  # Bishop, Rook
-                points += int(count) * 5
+        for piece, count in zip(HAND_ORDER, hand_counts[is_black]):
+            if piece in ('B', 'R'):
+                points += count * 5
             else:
-                points += int(count)
+                points += count
 
-        if color_is_ours:
-            planes[44] = float(points) / 28.0
-            planes[46] = float(pieces_in_camp) / 10.0
-        else:
-            planes[45] = float(points) / 28.0
-            planes[47] = float(pieces_in_camp) / 10.0
+        side_idx = 0 if ((side == 'b') == is_black) else 1
+        threshold = 28 if is_black else 27
+        set_nyugyoku(side_idx, king_in_camp, pieces_in_camp, points, threshold)
 
     return planes
 
@@ -193,7 +220,7 @@ class ShardedDataset(Dataset):
     """
     Memory-efficient dataset that loads ONE shard at a time.
 
-    Only ~4 GB in memory (one 500K-position shard) instead of ~43 GB.
+    Keeps only one shard in memory instead of loading the full dataset.
     Call load_shard(idx) to switch shards between training iterations.
 
     Usage:
@@ -224,7 +251,7 @@ class ShardedDataset(Dataset):
 
         print(f"Found {self.num_shards} shards, ~{self.shard_size:,} positions each")
         print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions "
-              f"(memory: ~{self.shard_size * 48 * 81 * 2 / 1e9:.1f} GB per shard)")
+              f"(memory: ~{self.shard_size * INPUT_PLANES * 81 * 2 / 1e9:.1f} GB per shard)")
 
     def load_shard(self, shard_id):
         """Load a specific shard into memory (frees the previous one)."""
@@ -246,7 +273,20 @@ class ShardedDataset(Dataset):
             raise ValueError(
                 f"{self.shard_paths[shard_id]} has policy_encoding={policy_encoding!r}; "
                 f"expected {POLICY_ENCODING!r}. Regenerate the shard.")
+        if 'feature_encoding' not in data:
+            raise ValueError(
+                f"{self.shard_paths[shard_id]} is missing feature_encoding. "
+                f"Regenerate shards for {FEATURE_ENCODING}; old shards are not compatible.")
+        feature_encoding = str(data['feature_encoding'])
+        if feature_encoding != FEATURE_ENCODING:
+            raise ValueError(
+                f"{self.shard_paths[shard_id]} has feature_encoding={feature_encoding!r}; "
+                f"expected {FEATURE_ENCODING!r}. Regenerate the shard.")
         self.planes = data['planes']
+        if self.planes.ndim != 4 or self.planes.shape[1:] != (INPUT_PLANES, 9, 9):
+            raise ValueError(
+                f"{self.shard_paths[shard_id]} has planes shape {self.planes.shape}; "
+                f"expected (N, {INPUT_PLANES}, 9, 9). Regenerate the shard.")
         self.policy = data['policy']
         self.wdl = data['wdl']
         self.mlh = data['mlh'] if 'mlh' in data else np.full(

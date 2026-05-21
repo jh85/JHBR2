@@ -1,7 +1,7 @@
 /*
   Fast PSV decoder in C for Python (via ctypes).
 
-  Decodes PackedSfenValue (40 bytes) → input planes (48×9×9 float)
+  Decodes PackedSfenValue (40 bytes) → input planes (148×9×9 float)
                                       + policy index (int)
                                       + WDL target (3 floats)
 
@@ -38,6 +38,15 @@
 
 #define COLOR_BLACK 0
 #define COLOR_WHITE 1
+
+#define INPUT_PLANES 148
+#define HAND_BASE_PLANE 29
+#define HAND_PLANES_PER_SIDE 28
+#define ALL_ONES_PLANE (HAND_BASE_PLANE + 2 * HAND_PLANES_PER_SIDE)
+#define NYUGYOKU_BASE_PLANE (ALL_ONES_PLANE + 1)
+#define NYUGYOKU_PLANES_PER_SIDE 31
+#define NYUGYOKU_OPP_FIELD_BUCKETS 10
+#define NYUGYOKU_SCORE_BUCKETS 20
 
 // =====================================================================
 // Huffman table for board pieces
@@ -233,12 +242,60 @@ static const int piece_to_plane[] = {
     8, 9, 10, 11, 12, 13,     // PRO_PAWN..DRAGON
 };
 
+static const int hand_max[] = {8, 4, 4, 4, 4, 2, 2};
+
+static int hand_piece_to_index(int piece) {
+    switch (piece) {
+    case PAWN: return 0;
+    case LANCE: return 1;
+    case KNIGHT: return 2;
+    case SILVER: return 3;
+    case GOLD: return 4;
+    case BISHOP: return 5;
+    case ROOK: return 6;
+    default: return -1;
+    }
+}
+
+static void set_plane_all(float* planes, int plane, float value) {
+    for (int i = 0; i < 81; i++)
+        planes[plane * 81 + i] = value;
+}
+
+static void set_nyugyoku_features(
+    float* planes,
+    int side_idx,
+    int king_in_camp,
+    int pieces_in_camp,
+    int points,
+    int threshold)
+{
+    int base = NYUGYOKU_BASE_PLANE + side_idx * NYUGYOKU_PLANES_PER_SIDE;
+    if (king_in_camp)
+        set_plane_all(planes, base, 1.0f);
+
+    int rest_pieces = 10 - pieces_in_camp;
+    if (rest_pieces < NYUGYOKU_OPP_FIELD_BUCKETS) {
+        int bucket = rest_pieces > 0 ? rest_pieces : 0;
+        set_plane_all(planes, base + 1 + bucket, 1.0f);
+    }
+
+    int rest_points = threshold - points;
+    if (rest_points < NYUGYOKU_SCORE_BUCKETS) {
+        int bucket = rest_points > 0 ? rest_points : 0;
+        set_plane_all(
+            planes,
+            base + 1 + NYUGYOKU_OPP_FIELD_BUCKETS + bucket,
+            1.0f);
+    }
+}
+
 /*
   Decode one PSV record (40 bytes) into training data.
 
   Args:
     record:     40-byte PSV record
-    planes:     output float[48*9*9] (will be zeroed and filled)
+    planes:     output float[148*9*9] (will be zeroed and filled)
     policy_idx: output int (policy index, -1 if invalid)
     wdl:        output float[3] (win, draw, loss)
     eval_coef:  sigmoid coefficient for score→WDL (default 600)
@@ -247,7 +304,7 @@ static const int piece_to_plane[] = {
 */
 int decode_psv_record(
     const uint8_t* record,
-    float* planes,       // [48 * 9 * 9]
+    float* planes,       // [148 * 9 * 9]
     int* policy_idx,
     float* wdl,          // [3]
     float eval_coef)
@@ -265,7 +322,7 @@ int decode_psv_record(
     memcpy(&game_result, record + 38, 1);
 
     // Zero planes
-    memset(planes, 0, 48 * 9 * 9 * sizeof(float));
+    memset(planes, 0, INPUT_PLANES * 9 * 9 * sizeof(float));
 
     // Decode packed sfen
     BitStream bs = {sfen_bytes, 0};
@@ -339,7 +396,7 @@ int decode_psv_record(
     }
 
     // 5. Hand pieces (different Huffman: code>>1, bits-1)
-    int hand_counts[2][7]; // [color][P,L,N,S,B,R,G]
+    int hand_counts[2][7]; // [color][P,L,N,S,G,B,R]
     memset(hand_counts, 0, sizeof(hand_counts));
 
     while (bs.cursor < 256) {
@@ -375,34 +432,77 @@ int decode_psv_record(
         // Promoted pieces from hand = piecebox (skip)
         if (promoted) continue;
 
-        if (piece >= 1 && piece <= 7) {
-            hand_counts[color][piece - 1]++;
+        int hand_idx = hand_piece_to_index(piece);
+        if (hand_idx >= 0) {
+            hand_counts[color][hand_idx]++;
         }
     }
 
     for (int color = 0; color < 2; color++) {
+        int is_ours;
+        if (flip) is_ours = (color == COLOR_WHITE);
+        else      is_ours = (color == COLOR_BLACK);
+        int plane = HAND_BASE_PLANE + (is_ours ? 0 : HAND_PLANES_PER_SIDE);
         for (int pt = 0; pt < 7; pt++) {
             int count = hand_counts[color][pt];
-            if (count > 0) {
-                int is_ours;
-                if (flip) is_ours = (color == COLOR_WHITE);
-                else      is_ours = (color == COLOR_BLACK);
-                int base = is_ours ? 29 : 36;
-                float val = count / 18.0f;
-                for (int i = 0; i < 81; i++)
-                    planes[(base + pt) * 81 + i] = val;
-            }
+            if (count > hand_max[pt]) count = hand_max[pt];
+            for (int n = 0; n < count; n++)
+                set_plane_all(planes, plane + n, 1.0f);
+            plane += hand_max[pt];
         }
     }
 
-    // Plane 43: all ones
-    for (int i = 0; i < 81; i++)
-        planes[43 * 81 + i] = 1.0f;
+    // Plane 85: all ones
+    set_plane_all(planes, ALL_ONES_PLANE, 1.0f);
 
-    // 6. Policy target
+    // 6. dlshogi-style nyugyoku features.
+    for (int color = 0; color < 2; color++) {
+        int king_in_camp = 0;
+        int pieces_in_camp = 0;
+        int big_pieces = 0;
+        int small_pieces = 0;
+
+        for (int sq = 0; sq < 81; sq++) {
+            int piece_val = board[sq];
+            if (piece_val == 0) continue;
+            int piece_color = (piece_val >= 16) ? COLOR_WHITE : COLOR_BLACK;
+            if (piece_color != color) continue;
+
+            int rank = sq % 9;
+            int in_camp = (color == COLOR_BLACK) ? (rank <= 2) : (rank >= 6);
+            if (!in_camp) continue;
+
+            int piece_type = piece_val & 15;
+            if (piece_type == KING) {
+                king_in_camp = 1;
+                continue;
+            }
+
+            pieces_in_camp++;
+            if (piece_type == BISHOP || piece_type == ROOK ||
+                piece_type == HORSE || piece_type == DRAGON) {
+                big_pieces++;
+            } else {
+                small_pieces++;
+            }
+        }
+
+        int points = small_pieces + big_pieces * 5;
+        for (int pt = 0; pt < 7; pt++) {
+            int count = hand_counts[color][pt];
+            points += (pt == 5 || pt == 6) ? count * 5 : count;
+        }
+
+        int side_idx = (color == turn) ? 0 : 1;
+        int threshold = (color == COLOR_BLACK) ? 28 : 27;
+        set_nyugyoku_features(planes, side_idx, king_in_camp,
+                              pieces_in_camp, points, threshold);
+    }
+
+    // 7. Policy target
     *policy_idx = decode_move_to_policy(move_raw, turn);
 
-    // 7. WDL target (blend score + game result)
+    // 8. WDL target (blend score + game result)
     float win_rate = 1.0f / (1.0f + expf(-(float)score / eval_coef));
 
     float hard_w, hard_d, hard_l;
@@ -423,7 +523,7 @@ int decode_psv_record(
   Args:
     records:     N×40 byte array
     n:           number of records
-    planes:      output float[N * 48 * 9 * 9]
+    planes:      output float[N * 148 * 9 * 9]
     policy_idxs: output int[N]
     wdls:        output float[N * 3]
     eval_coef:   sigmoid coefficient
@@ -443,7 +543,7 @@ int decode_psv_batch(
     for (int i = 0; i < n; i++) {
         int ret = decode_psv_record(
             records + i * 40,
-            planes + i * 48 * 81,
+            planes + i * INPUT_PLANES * 81,
             &policy_idxs[i],
             &wdls[i * 3],
             eval_coef);

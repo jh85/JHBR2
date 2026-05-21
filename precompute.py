@@ -30,7 +30,8 @@ from multiprocessing import Pool, cpu_count
 
 import numpy as np
 
-from shogi_train import sfen_to_planes, move_to_policy_index, build_move_index
+from shogi_train import (FEATURE_ENCODING, INPUT_PLANES, POLICY_ENCODING,
+                         sfen_to_planes, move_to_policy_index, build_move_index)
 
 
 # Global move index (initialized per worker)
@@ -122,7 +123,7 @@ def _save_shard(prefix, idx, planes_list, policy_list, wdl_list, mlh_list):
     n = len(planes_list)
 
     # Pre-allocate array and fill
-    planes = np.empty((n, 48, 9, 9), dtype=np.float16)
+    planes = np.empty((n, INPUT_PLANES, 9, 9), dtype=np.float16)
     for i in range(n):
         planes[i] = planes_list[i]
 
@@ -132,7 +133,8 @@ def _save_shard(prefix, idx, planes_list, policy_list, wdl_list, mlh_list):
         policy=np.array(policy_list, dtype=np.int32),
         wdl=np.array(wdl_list, dtype=np.float32),
         mlh=np.array(mlh_list, dtype=np.int16),
-        policy_encoding=np.array("dlshogi_27x81"),
+        policy_encoding=np.array(POLICY_ENCODING),
+        feature_encoding=np.array(FEATURE_ENCODING),
     )
 
 
@@ -249,7 +251,8 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
         f.write(f"total_positions={total_written}\n")
         f.write(f"num_shards={shard_idx}\n")
         f.write(f"shard_size={shard_size}\n")
-        f.write(f"planes_shape=48,9,9\n")
+        f.write(f"planes_shape={INPUT_PLANES},9,9\n")
+        f.write(f"feature_encoding={FEATURE_ENCODING}\n")
         f.write(f"source={input_path}\n")
     print(f"Metadata: {meta_path}")
 

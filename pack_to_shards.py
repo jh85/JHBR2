@@ -9,7 +9,7 @@ with:
     pack file --pack_to_shards.py--> shards (with mlh_target)
 
 Each shard is a .npz with arrays:
-    planes  (N, 48, 9, 9)  float16
+    planes  (N, 148, 9, 9) float16
     policy  (N,)           int32   in [0, 2187), or -1 if move missing
     wdl     (N, 3)         float16 (W, D, L) from side-to-move's perspective
     mlh     (N,)           int16   raw remaining plies from this position to
@@ -36,10 +36,16 @@ import numpy as np
 import cshogi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "YaneuraOu-ScriptCollection", "GenSfen"))
-from shogi_train import sfen_to_planes, move_to_policy_index
-from ShogiCommonLib import GameDataDecoder
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+for _base in (_ROOT, os.path.dirname(_ROOT)):
+    for _subdir in ("YaneuraOu-ScriptCollection/CommonLib",
+                    "YaneuraOu-ScriptCollection/GenSfen"):
+        _path = os.path.join(_base, _subdir)
+        if os.path.isdir(_path):
+            sys.path.insert(0, _path)
+from shogi_train import (FEATURE_ENCODING, POLICY_ENCODING,
+                         sfen_to_planes, move_to_policy_index)
+from YaneShogiLib import GameDataDecoder
 
 
 def encode_one_position(board, move_raw, score, game_result_abs,
@@ -88,7 +94,8 @@ def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
         policy=np.asarray(policy, dtype=np.int32),
         wdl=np.asarray(wdl, dtype=np.float16),
         mlh=np.asarray(mlh, dtype=np.int16),
-        policy_encoding=np.array("dlshogi_27x81"),
+        policy_encoding=np.array(POLICY_ENCODING),
+        feature_encoding=np.array(FEATURE_ENCODING),
     )
     return out_path
 

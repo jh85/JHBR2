@@ -18,11 +18,15 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <vector>
 
+#include "mcts/input_unpack.h"
 #include "shogi/encoder.h"
 
 namespace jhbr2 {
@@ -79,11 +83,13 @@ struct Slot {
   cudaStream_t stream = nullptr;
   void* d_input = nullptr;
   void* d_input2 = nullptr;
+  void* d_packed_input = nullptr;
   void* d_policy = nullptr;
   void* d_wdl = nullptr;
   void* d_mlh = nullptr;
   float* h_input = nullptr;
   float* h_input2 = nullptr;
+  uint8_t* h_packed_input = nullptr;
   float* h_policy = nullptr;
   float* h_wdl = nullptr;
   float* h_mlh = nullptr;
@@ -91,11 +97,13 @@ struct Slot {
   ~Slot() {
     if (d_input)  cudaFree(d_input);
     if (d_input2) cudaFree(d_input2);
+    if (d_packed_input) cudaFree(d_packed_input);
     if (d_policy) cudaFree(d_policy);
     if (d_wdl)    cudaFree(d_wdl);
     if (d_mlh)    cudaFree(d_mlh);
     if (h_input)  cudaFreeHost(h_input);
     if (h_input2) cudaFreeHost(h_input2);
+    if (h_packed_input) cudaFreeHost(h_packed_input);
     if (h_policy) cudaFreeHost(h_policy);
     if (h_wdl)    cudaFreeHost(h_wdl);
     if (h_mlh)    cudaFreeHost(h_mlh);
@@ -122,7 +130,7 @@ struct NNEvaluator::Impl {
   int wdl_idx = -1;
   int mlh_idx = -1;
 
-  int input_channels = 48;
+  int input_channels = kShogiInputPlanes;
   int input2_channels = 0;
   int max_batch_size = 32;
   int policy_size = 0;
@@ -172,6 +180,26 @@ int GetMaxBatch(nvinfer1::ICudaEngine* engine, const char* input_name,
     }
   }
   return max_batch;
+}
+
+size_t PackedInputBytes(int batch_size, int channels, int squares) {
+  return (static_cast<size_t>(batch_size) * channels * squares + 7) / 8;
+}
+
+void PackJHBR2InputPlanes(const ShogiInputPlanes& planes, int batch_index,
+                          int channels, int squares, uint8_t* packed) {
+  const int encoded_channels = std::min(channels, kShogiInputPlanes);
+  const size_t batch_bit_base =
+      static_cast<size_t>(batch_index) * channels * squares;
+  for (int c = 0; c < encoded_channels; ++c) {
+    const size_t channel_bit_base = batch_bit_base +
+                                    static_cast<size_t>(c) * squares;
+    for (int i = 0; i < squares; ++i) {
+      if (planes[c].data[i] == 0.0f) continue;
+      const size_t bit = channel_bit_base + i;
+      packed[bit >> 3] |= static_cast<uint8_t>(1u << (bit & 7));
+    }
+  }
 }
 
 }  // namespace
@@ -264,6 +292,13 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
         GetMaxBatch(impl_->engine.get(), "input_planes", &impl_->dynamic_batch);
     auto policy_dims = impl_->engine->getTensorShape("policy");
     impl_->policy_size = (policy_dims.nbDims >= 2) ? policy_dims.d[1] : 2187;
+    if (impl_->input_channels != kShogiInputPlanes) {
+      fprintf(stderr,
+              "[TRT] JHBR2 engine has %d input channels, but this build "
+              "expects %d. Regenerate the ONNX and TensorRT engine.\n",
+              impl_->input_channels, kShogiInputPlanes);
+      return;
+    }
   }
 
   if (num_slots < 1) num_slots = 1;
@@ -293,15 +328,20 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
     CUDA_CHECK(cudaMalloc(&slot->d_input,  static_cast<size_t>(B) * C * 81 * sizeof(float)));
     if (impl_->model_format == ModelFormat::kDlshogi) {
       CUDA_CHECK(cudaMalloc(&slot->d_input2, static_cast<size_t>(B) * C2 * 81 * sizeof(float)));
+    } else {
+      CUDA_CHECK(cudaMalloc(&slot->d_packed_input, PackedInputBytes(B, C, 81)));
     }
     CUDA_CHECK(cudaMalloc(&slot->d_policy, static_cast<size_t>(B) * P * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&slot->d_wdl,    static_cast<size_t>(B) * value_planes * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&slot->d_mlh,    static_cast<size_t>(B) * 1 * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
-                              static_cast<size_t>(B) * C * 81 * sizeof(float)));
     if (impl_->model_format == ModelFormat::kDlshogi) {
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
+                                static_cast<size_t>(B) * C * 81 * sizeof(float)));
       CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input2),
                                 static_cast<size_t>(B) * C2 * 81 * sizeof(float)));
+    } else {
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_packed_input),
+                                PackedInputBytes(B, C, 81)));
     }
     CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_policy),
                               static_cast<size_t>(B) * P * sizeof(float)));
@@ -407,15 +447,12 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     slot.context->setTensorAddress("output_policy", slot.d_policy);
     slot.context->setTensorAddress("output_value", slot.d_wdl);
   } else {
-    std::fill(slot.h_input,
-              slot.h_input + static_cast<size_t>(run_batch) * C * sq, 0.0f);
+    const size_t packed_bytes = PackedInputBytes(run_batch, C, sq);
+    std::memset(slot.h_packed_input, 0, packed_bytes);
 
     for (int b = 0; b < batch_size; b++) {
       auto planes = EncodeShogiPosition(batch[b].first);
-      float* dst = slot.h_input + b * C * sq;
-      for (int c = 0; c < C && c < kShogiInputPlanes; c++) {
-        std::copy(planes[c].data, planes[c].data + sq, dst + c * sq);
-      }
+      PackJHBR2InputPlanes(planes, b, C, sq, slot.h_packed_input);
     }
 
     nvinfer1::Dims4 input_dims{run_batch, C, 9, 9};
@@ -429,13 +466,20 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     }
   }
 
-  CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_input,
-      static_cast<size_t>(run_batch) * C * sq * sizeof(float),
-      cudaMemcpyHostToDevice, slot.stream));
   if (is_dlshogi) {
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_input,
+        static_cast<size_t>(run_batch) * C * sq * sizeof(float),
+        cudaMemcpyHostToDevice, slot.stream));
     CUDA_CHECK(cudaMemcpyAsync(slot.d_input2, slot.h_input2,
         static_cast<size_t>(run_batch) * C2 * sq * sizeof(float),
         cudaMemcpyHostToDevice, slot.stream));
+  } else {
+    const size_t packed_bytes = PackedInputBytes(run_batch, C, sq);
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_packed_input, slot.h_packed_input,
+        packed_bytes, cudaMemcpyHostToDevice, slot.stream));
+    CUDA_CHECK(UnpackBitsToFloatAsync(
+        static_cast<const uint8_t*>(slot.d_packed_input),
+        static_cast<float*>(slot.d_input), run_batch, C, sq, slot.stream));
   }
 
   bool ok = slot.context->enqueueV3(slot.stream);

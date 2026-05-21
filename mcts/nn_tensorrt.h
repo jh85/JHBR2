@@ -7,9 +7,9 @@
   Usage:
     1. Convert ONNX model to TensorRT engine:
        trtexec --onnx=model.onnx --saveEngine=model.engine --fp16 \
-         --minShapes=input_planes:1x48x9x9 \
-         --optShapes=input_planes:16x48x9x9 \
-         --maxShapes=input_planes:32x48x9x9
+         --minShapes=input_planes:1x148x9x9 \
+         --optShapes=input_planes:16x148x9x9 \
+         --maxShapes=input_planes:32x148x9x9
 
     2. Build jhbr2 with TensorRT:
        cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_TENSORRT=ON

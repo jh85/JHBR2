@@ -15,7 +15,7 @@ PSV format vs pack format differs in:
     where it's absolute.
 
 Output shard format (same as pack_to_shards.py):
-    planes  (N, 48, 9, 9)  float16
+    planes  (N, 148, 9, 9) float16
     policy  (N,)           int32   in [0, 2187), or -1 if move missing
     wdl     (N, 3)         float16 (W, D, L) from side-to-move's view
     mlh     (N,)           int16   raw remaining plies to (recorded)
@@ -48,7 +48,8 @@ import numpy as np
 import cshogi
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from shogi_train import sfen_to_planes, move_to_policy_index
+from shogi_train import (FEATURE_ENCODING, POLICY_ENCODING,
+                         sfen_to_planes, move_to_policy_index)
 
 
 PSV_DTYPE = cshogi.PackedSfenValue   # itemsize=40
@@ -106,7 +107,8 @@ def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
         policy=np.asarray(policy, dtype=np.int32),
         wdl=np.asarray(wdl, dtype=np.float16),
         mlh=np.asarray(mlh, dtype=np.int16),
-        policy_encoding=np.array("dlshogi_27x81"),
+        policy_encoding=np.array(POLICY_ENCODING),
+        feature_encoding=np.array(FEATURE_ENCODING),
     )
     return out_path
 

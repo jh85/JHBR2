@@ -44,7 +44,7 @@ def main():
         # Force legacy exporter (dynamo ignores dynamic_axes)
         export_kwargs["dynamo"] = False
 
-    torch.onnx.export(model, torch.randn(batch_size,48,9,9),
+    torch.onnx.export(model, torch.randn(batch_size, cfg.input_planes, 9, 9),
                       onnx_name, **export_kwargs)
 
     # Verify dynamic batch dim was set
