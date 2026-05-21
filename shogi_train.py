@@ -26,7 +26,7 @@ from torch.utils.data import Dataset, DataLoader
 
 # Add lc0 src to path for the Shogi C++ modules (via ctypes or subprocess).
 # For now we do everything in Python.
-from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
+from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config, config_from_checkpoint,
                             make_direction_policy_index, POLICY_SIZE,
                             NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS)
 
@@ -462,7 +462,19 @@ def train(args):
     move_info_to_idx = build_move_index()
 
     # --- Model ---
-    cfg = ShogiBT4v2Config()
+    resume_ckpt = None
+    if args.resume:
+        if os.path.exists(args.resume):
+            print(f"Resuming from {args.resume}")
+            resume_ckpt = torch.load(args.resume, map_location=device,
+                                     weights_only=False)
+            cfg = config_from_checkpoint(resume_ckpt)
+        else:
+            print(f"Checkpoint not found: {args.resume}, starting from scratch")
+            cfg = ShogiBT4v2Config()
+    else:
+        cfg = ShogiBT4v2Config()
+
     if args.d_model:
         cfg.embedding_size = args.d_model
         cfg.policy_d_model = args.d_model
@@ -470,30 +482,40 @@ def train(args):
         cfg.num_encoders = args.encoders
     if args.heads:
         cfg.num_heads = args.heads
+    if args.encoder_ffn_type:
+        cfg.encoder_ffn_type = args.encoder_ffn_type
+    if args.swiglu_multiplier is not None:
+        cfg.swiglu_multiplier = args.swiglu_multiplier
+    if args.use_qk_norm:
+        cfg.use_qk_norm = True
+    if args.qk_norm_type:
+        cfg.qk_norm_type = args.qk_norm_type
+    if args.use_qk_learnable_scale:
+        cfg.use_qk_learnable_scale = True
 
     model = ShogiBT4v2(cfg).to(device)
     print(f"Model parameters: {model.count_parameters():,}")
+    print(f"Encoder FFN: {cfg.encoder_ffn_type} "
+          f"(hidden={cfg.swiglu_hidden if cfg.encoder_ffn_type == 'swiglu' else cfg.ffn_hidden})")
+    print(f"QK Norm: {cfg.use_qk_norm} ({cfg.qk_norm_type}, "
+          f"learnable_scale={cfg.use_qk_learnable_scale})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.wd)
 
     # --- Resume from checkpoint ---
     start_epoch = 0
-    if args.resume:
-        if os.path.exists(args.resume):
-            print(f"Resuming from {args.resume}")
-            ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-            # Handle DataParallel state_dict keys (strip 'module.' prefix)
-            state_dict = ckpt['model']
-            if any(k.startswith('module.') for k in state_dict):
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-            model.load_state_dict(state_dict)
-            if 'optimizer' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer'])
-            start_epoch = ckpt.get('epoch', 0)
-            print(f"  Resumed at epoch {start_epoch}")
-        else:
-            print(f"Checkpoint not found: {args.resume}, starting from scratch")
+    if resume_ckpt is not None:
+        ckpt = resume_ckpt
+        # Handle DataParallel state_dict keys (strip 'module.' prefix)
+        state_dict = ckpt['model']
+        if any(k.startswith('module.') for k in state_dict):
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(state_dict)
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        start_epoch = ckpt.get('epoch', 0)
+        print(f"  Resumed at epoch {start_epoch}")
 
     # Fresh cosine schedule for the remaining epochs.
     # When resuming, the schedule runs from lr → 0 over (total_epochs - start_epoch) steps.
@@ -771,6 +793,17 @@ if __name__ == "__main__":
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--encoders", type=int, default=None)
     parser.add_argument("--heads", type=int, default=None)
+    parser.add_argument("--encoder-ffn-type", choices=["swiglu", "standard", "mlp"],
+                        default=None,
+                        help="Encoder FFN type. Default is model config (swiglu).")
+    parser.add_argument("--swiglu-multiplier", type=float, default=None,
+                        help="SwiGLU hidden multiplier. Default 1.0 means hidden=d_model.")
+    parser.add_argument("--use-qk-norm", action="store_true",
+                        help="Apply RMSNorm to Q and K per attention head")
+    parser.add_argument("--qk-norm-type", choices=["rmsnorm"], default=None,
+                        help="QK normalization type. Only rmsnorm is implemented.")
+    parser.add_argument("--use-qk-learnable-scale", action="store_true",
+                        help="Reserved for future use; currently raises if QKNorm is enabled.")
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--save-dir", default=".", help="Directory for checkpoint files")
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")

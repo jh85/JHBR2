@@ -2,7 +2,7 @@ import sys
 sys.path.insert(0, ".")
 from pathlib import Path
 import torch
-from shogi_model_v2 import ShogiBT4v2, ShogiBT4v2Config
+from shogi_model_v2 import ShogiBT4v2, config_from_checkpoint
 
 def main():
     if len(sys.argv) < 3:
@@ -17,10 +17,7 @@ def main():
         onnx_name = Path(pt_name).stem + f"_b{batch_size}.onnx"
 
     ckpt = torch.load(pt_name, map_location="cpu", weights_only=False)
-    cfg = ShogiBT4v2Config()
-    for k,v in ckpt["cfg"].items():
-        if hasattr(cfg,k):
-            setattr(cfg,k,v)
+    cfg = config_from_checkpoint(ckpt)
     model = ShogiBT4v2(cfg)
     model.load_state_dict(ckpt["model"], strict=False)
     model.eval()

@@ -158,6 +158,8 @@ class ShogiBT4v2Config:
     num_encoders: int = 6
     num_heads: int = 8
     ffn_multiplier: float = 1.5
+    encoder_ffn_type: str = "swiglu"
+    swiglu_multiplier: float = 1.0
     smolgen_hidden: int = 64
     smolgen_compress: int = 8
     smolgen_gen_size: int = 64
@@ -177,10 +179,41 @@ class ShogiBT4v2Config:
     # Normalization
     norm_type: str = "layernorm"
     no_qkv_bias: bool = True
+    use_qk_norm: bool = False
+    qk_norm_type: str = "rmsnorm"
+    use_qk_learnable_scale: bool = False
+    qk_norm_eps: float = 1e-6
 
     @property
     def ffn_hidden(self):
         return int(self.embedding_size * self.ffn_multiplier)
+
+    @property
+    def swiglu_hidden(self):
+        return int(self.embedding_size * self.swiglu_multiplier)
+
+
+def config_from_checkpoint(ckpt):
+    """Build a model config from a saved checkpoint, with old-checkpoint fallbacks."""
+    cfg = ShogiBT4v2Config()
+    saved_cfg = ckpt.get("cfg", {}) if isinstance(ckpt, dict) else {}
+    if hasattr(saved_cfg, "__dict__"):
+        saved_cfg = vars(saved_cfg)
+    for k, v in saved_cfg.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+
+    # Checkpoints saved before the SwiGLU option do not have encoder_ffn_type.
+    # Infer it from weight names so older models still resume/export correctly.
+    model_state = ckpt.get("model", {}) if isinstance(ckpt, dict) else {}
+    if "encoder_ffn_type" not in saved_cfg and model_state:
+        keys = model_state.keys()
+        if any(".ffn.gate." in k for k in keys):
+            cfg.encoder_ffn_type = "swiglu"
+        elif any(".ffn1." in k or ".ffn2." in k for k in keys):
+            cfg.encoder_ffn_type = "standard"
+
+    return cfg
 
 
 # =====================================================================
@@ -192,6 +225,28 @@ def get_activation(name):
 
 def make_norm(d, cfg):
     return nn.RMSNorm(d) if cfg.norm_type == "rmsnorm" else nn.LayerNorm(d)
+
+
+class RMSNormNoAffine(nn.Module):
+    """RMSNorm without learnable affine weights, normalized over final dim."""
+    def __init__(self, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward block: SiLU(gate) * value, then project down."""
+    def __init__(self, d_model, hidden):
+        super().__init__()
+        self.gate = nn.Linear(d_model, hidden)
+        self.up = nn.Linear(d_model, hidden)
+        self.down = nn.Linear(hidden, d_model)
+
+    def forward(self, x):
+        return self.down(F.silu(self.gate(x)) * self.up(x))
 
 
 class InputEmbedding(nn.Module):
@@ -251,7 +306,7 @@ class Smolgen(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """Transformer encoder block with smolgen (same as v1)."""
+    """Transformer encoder block with smolgen."""
     def __init__(self, cfg, global_gen):
         super().__init__()
         d = cfg.embedding_size
@@ -262,9 +317,24 @@ class EncoderBlock(nn.Module):
         self.out_proj = nn.Linear(d, d)
         self.ln1 = make_norm(d, cfg)
         self.smolgen = Smolgen(cfg, global_gen)
-        self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
-        self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
-        self.ffn_act = get_activation(cfg.activation)
+        self.use_qk_norm = bool(cfg.use_qk_norm)
+        if self.use_qk_norm:
+            qk_norm_type = cfg.qk_norm_type.lower()
+            if qk_norm_type != "rmsnorm":
+                raise ValueError(f"Unknown qk_norm_type: {cfg.qk_norm_type}")
+            if cfg.use_qk_learnable_scale:
+                raise ValueError("Learnable QK scaling is not implemented")
+            self.q_rmsnorm = RMSNormNoAffine(cfg.qk_norm_eps)
+            self.k_rmsnorm = RMSNormNoAffine(cfg.qk_norm_eps)
+        self.encoder_ffn_type = cfg.encoder_ffn_type.lower()
+        if self.encoder_ffn_type == "swiglu":
+            self.ffn = SwiGLUFFN(d, cfg.swiglu_hidden)
+        elif self.encoder_ffn_type in ("standard", "mlp"):
+            self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
+            self.ffn2 = nn.Linear(cfg.ffn_hidden, d)
+            self.ffn_act = get_activation(cfg.activation)
+        else:
+            raise ValueError(f"Unknown encoder_ffn_type: {cfg.encoder_ffn_type}")
         self.ffn_ln = make_norm(d, cfg)
         self.cfg = cfg
 
@@ -276,12 +346,18 @@ class EncoderBlock(nn.Module):
         Q = self.q_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
         K = self.k_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
         V = self.v_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
+        if self.use_qk_norm:
+            Q = self.q_rmsnorm(Q)
+            K = self.k_rmsnorm(K)
         attn = (Q @ K.transpose(-2, -1)) / math.sqrt(depth) + smol_bias
         attn = F.softmax(attn, dim=-1)
         out = (attn @ V).permute(0, 2, 1, 3).flatten(2)
         h = self.ln1(self.out_proj(out) + x)
-        f = self.ffn_act(self.ffn1(h))
-        h = self.ffn_ln(self.ffn2(f) + h)
+        if self.encoder_ffn_type == "swiglu":
+            f = self.ffn(h)
+        else:
+            f = self.ffn2(self.ffn_act(self.ffn1(h)))
+        h = self.ffn_ln(f + h)
         return h
 
 
@@ -503,6 +579,9 @@ if __name__ == "__main__":
     print(f"  d_model:      {cfg.embedding_size}")
     print(f"  encoders:     {cfg.num_encoders}")
     print(f"  heads:        {cfg.num_heads}")
+    print(f"  encoder_ffn:  {cfg.encoder_ffn_type} "
+          f"(hidden={cfg.swiglu_hidden if cfg.encoder_ffn_type == 'swiglu' else cfg.ffn_hidden})")
+    print(f"  qk_norm:      {cfg.use_qk_norm} ({cfg.qk_norm_type})")
     print(f"  policy_size:  {cfg.policy_size} (vs v1's 3849)")
     print(f"  Parameters:   {model.count_parameters():,}")
 
