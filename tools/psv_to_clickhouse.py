@@ -31,8 +31,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
+import http.client
+import multiprocessing as mp
 import os
 import re
+import socket
 import struct
 import sys
 import time
@@ -64,6 +68,17 @@ DRAGON = 14
 
 RECORD_SIZE = 40
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+TRANSIENT_HTTP_CODES = {429, 500, 502, 503, 504}
+TRANSIENT_ERRORS = (
+    urllib.error.URLError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+    TimeoutError,
+    socket.timeout,
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+)
 
 HUFFMAN_PIECES = (
     (0b0,      1, NO_PIECE),
@@ -136,6 +151,10 @@ class PsvRecord:
 class RowBinaryBatch:
     data: bytearray
     rows: int = 0
+
+
+class InsertError(RuntimeError):
+    pass
 
 
 class BitStream:
@@ -335,22 +354,41 @@ def clickhouse_auth(args):
 
 
 def ch_post(url: str, query: str, data: bytes | None = None, timeout: int = 300,
-            auth=None):
+            auth=None, retries: int = 0, retry_sleep: float = 5.0):
     endpoint = url.rstrip("/") + "/?query=" + urllib.parse.quote(query)
-    req = urllib.request.Request(endpoint, data=data or b"", method="POST")
-    if auth is not None:
-        user, password = auth
-        token = base64.b64encode(f"{user}:{password}".encode()).decode()
-        req.add_header("Authorization", f"Basic {token}")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        hint = ""
-        if exc.code == 401:
-            hint = " Pass --user/--password or set CLICKHOUSE_USER and CLICKHOUSE_PASSWORD."
-        raise RuntimeError(f"ClickHouse HTTP {exc.code}: {body}{hint}") from exc
+    payload = data or b""
+    for attempt in range(retries + 1):
+        req = urllib.request.Request(endpoint, data=payload, method="POST")
+        if auth is not None:
+            user, password = auth
+            token = base64.b64encode(f"{user}:{password}".encode()).decode()
+            req.add_header("Authorization", f"Basic {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            hint = ""
+            if exc.code == 401:
+                hint = " Pass --user/--password or set CLICKHOUSE_USER and CLICKHOUSE_PASSWORD."
+            msg = f"ClickHouse HTTP {exc.code}: {body}{hint}"
+            if exc.code in TRANSIENT_HTTP_CODES and attempt < retries:
+                sleep_s = retry_sleep * (2 ** attempt)
+                print(f"retry {attempt + 1}/{retries} after {sleep_s:.1f}s: "
+                      f"{msg}", file=sys.stderr, flush=True)
+                time.sleep(sleep_s)
+                continue
+            raise RuntimeError(msg) from exc
+        except TRANSIENT_ERRORS as exc:
+            if attempt < retries:
+                sleep_s = retry_sleep * (2 ** attempt)
+                print(f"retry {attempt + 1}/{retries} after {sleep_s:.1f}s: "
+                      f"{type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+                time.sleep(sleep_s)
+                continue
+            raise
+    raise RuntimeError("unreachable ClickHouse retry state")
 
 
 def create_table(url: str, database: str, table: str, auth=None,
@@ -446,14 +484,19 @@ def append_fast_raw_row(out: bytearray, dataset: str, source_file: str,
 
 
 def flush_rows(url: str, database: str, table: str, rows: list[str],
-               dry_run: bool, auth=None) -> int:
+               dry_run: bool, auth=None, retries: int = 0,
+               retry_sleep: float = 5.0) -> int:
     if not rows:
         return 0
     if not dry_run:
         columns = ", ".join(INSERT_COLUMNS)
         query = f"INSERT INTO {database}.{table} ({columns}) FORMAT TabSeparated"
-        ch_post(url, query, "".join(rows).encode("utf-8"), timeout=1800,
-                auth=auth)
+        try:
+            ch_post(url, query, "".join(rows).encode("utf-8"), timeout=1800,
+                    auth=auth, retries=retries, retry_sleep=retry_sleep)
+        except Exception as exc:
+            raise InsertError(f"insert failed for {len(rows):,} rows: "
+                              f"{type(exc).__name__}: {exc}") from exc
     n = len(rows)
     rows.clear()
     return n
@@ -461,13 +504,21 @@ def flush_rows(url: str, database: str, table: str, rows: list[str],
 
 def flush_fast_raw_rows(url: str, database: str, table: str,
                         batch: RowBinaryBatch, dry_run: bool,
-                        auth=None) -> int:
+                        auth=None, retries: int = 0,
+                        retry_sleep: float = 5.0) -> int:
     if batch.rows == 0:
         return 0
     if not dry_run:
         columns = ", ".join(FAST_RAW_INSERT_COLUMNS)
         query = f"INSERT INTO {database}.{table} ({columns}) FORMAT RowBinary"
-        ch_post(url, query, bytes(batch.data), timeout=1800, auth=auth)
+        try:
+            ch_post(url, query, bytes(batch.data), timeout=1800, auth=auth,
+                    retries=retries, retry_sleep=retry_sleep)
+        except Exception as exc:
+            raise InsertError(
+                f"insert failed for {batch.rows:,} rows / "
+                f"{len(batch.data):,} bytes: {type(exc).__name__}: {exc}"
+            ) from exc
     n = batch.rows
     batch.data.clear()
     batch.rows = 0
@@ -483,6 +534,33 @@ def parse_record(buf: bytes) -> PsvRecord:
 def iter_psv_files(psv_dir: Path, glob_pattern: str, recursive: bool):
     pattern = f"**/{glob_pattern}" if recursive else glob_pattern
     yield from sorted(p for p in psv_dir.glob(pattern) if p.is_file())
+
+
+def collect_psv_files(args):
+    if args.psv_file:
+        files = [Path(p) for p in args.psv_file]
+    else:
+        psv_dir = Path(args.psv_dir)
+        if not psv_dir.is_dir():
+            raise SystemExit(f"Not a directory: {psv_dir}")
+        files = list(iter_psv_files(psv_dir, args.psv_glob, args.recursive))
+    if args.limit_files:
+        files = files[:args.limit_files]
+    return files
+
+
+def apply_file_shard(files, args):
+    if args.file_shard_count < 1:
+        raise SystemExit("--file-shard-count must be >= 1")
+    if not 0 <= args.file_shard_index < args.file_shard_count:
+        raise SystemExit("--file-shard-index must satisfy "
+                         "0 <= index < count")
+    if args.file_shard_count > 1:
+        files = [
+            path for idx, path in enumerate(files)
+            if idx % args.file_shard_count == args.file_shard_index
+        ]
+    return files
 
 
 def source_file_value(path: Path, mode: str) -> str:
@@ -551,7 +629,8 @@ def load_file(path: Path, args, rows: list[str], total_inserted: int):
             if len(rows) >= args.batch_rows:
                 total_inserted += flush_rows(
                     args.url, args.database, args.table, rows, args.dry_run,
-                    auth=args.clickhouse_auth)
+                    auth=args.clickhouse_auth, retries=args.insert_retries,
+                    retry_sleep=args.retry_sleep)
         game_index += 1
         game_records = []
 
@@ -611,10 +690,12 @@ def load_file_fast_raw(path: Path, args, batch: RowBinaryBatch,
                                 game_index, ply, rec, final_ply)
             batch.rows += 1
             file_rows += 1
-            if batch.rows >= args.batch_rows:
+            if (batch.rows >= args.batch_rows or
+                    len(batch.data) >= args.max_batch_bytes):
                 total_inserted += flush_fast_raw_rows(
                     args.url, args.database, args.table, batch, args.dry_run,
-                    auth=args.clickhouse_auth)
+                    auth=args.clickhouse_auth, retries=args.insert_retries,
+                    retry_sleep=args.retry_sleep)
         game_index += 1
         game_records = []
 
@@ -650,25 +731,8 @@ def load_file_fast_raw(path: Path, args, batch: RowBinaryBatch,
 
 
 def load_psv_files(args):
-    if args.psv_file:
-        files = [Path(p) for p in args.psv_file]
-    else:
-        psv_dir = Path(args.psv_dir)
-        if not psv_dir.is_dir():
-            raise SystemExit(f"Not a directory: {psv_dir}")
-        files = list(iter_psv_files(psv_dir, args.psv_glob, args.recursive))
-    if args.limit_files:
-        files = files[:args.limit_files]
-    if args.file_shard_count < 1:
-        raise SystemExit("--file-shard-count must be >= 1")
-    if not 0 <= args.file_shard_index < args.file_shard_count:
-        raise SystemExit("--file-shard-index must satisfy "
-                         "0 <= index < count")
-    if args.file_shard_count > 1:
-        files = [
-            path for idx, path in enumerate(files)
-            if idx % args.file_shard_count == args.file_shard_index
-        ]
+    prefix = getattr(args, "worker_prefix", "")
+    files = apply_file_shard(collect_psv_files(args), args)
     if not files:
         raise SystemExit("No PSV files found")
 
@@ -697,14 +761,16 @@ def load_psv_files(args):
             total_seen += file_rows
             total_games += file_games
         except Exception as exc:
+            if isinstance(exc, InsertError):
+                raise SystemExit(str(exc)) from exc
             bad_files += 1
-            print(f"skip file {path}: {type(exc).__name__}: {exc}",
+            print(f"{prefix}skip file {path}: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
             continue
 
         elapsed = max(time.time() - t0, 1e-6)
         pending = raw_batch.rows if args.fast_raw else len(rows)
-        print(f"{file_idx}/{len(files)} {path.name}: "
+        print(f"{prefix}{file_idx}/{len(files)} {path.name}: "
               f"{file_rows:,} rows, {file_games:,} games, "
               f"total {total_seen:,} rows "
               f"({(total_inserted + pending) / elapsed:,.0f} rows/s)",
@@ -713,16 +779,70 @@ def load_psv_files(args):
     if args.fast_raw:
         total_inserted += flush_fast_raw_rows(
             args.url, args.database, args.table, raw_batch, args.dry_run,
-            auth=args.clickhouse_auth)
+            auth=args.clickhouse_auth, retries=args.insert_retries,
+            retry_sleep=args.retry_sleep)
     else:
         total_inserted += flush_rows(
             args.url, args.database, args.table, rows, args.dry_run,
-            auth=args.clickhouse_auth)
+            auth=args.clickhouse_auth, retries=args.insert_retries,
+            retry_sleep=args.retry_sleep)
     elapsed = max(time.time() - t0, 1e-6)
     action = "decoded" if args.dry_run else "inserted"
-    print(f"done: {action} {total_inserted:,} rows, "
+    print(f"{prefix}done: {action} {total_inserted:,} rows, "
           f"{total_games:,} games, {bad_files:,} bad files, "
           f"{elapsed:.1f}s, {total_inserted / elapsed:,.0f} rows/s")
+
+
+def run_threaded(args):
+    if args.file_shard_count != 1 or args.file_shard_index != 0:
+        raise SystemExit("--threads cannot be combined with manual "
+                         "--file-shard-count/--file-shard-index")
+
+    files = collect_psv_files(args)
+    if not files:
+        raise SystemExit("No PSV files found")
+
+    n_workers = min(args.threads, len(files))
+    args.clickhouse_auth = clickhouse_auth(args)
+    if args.create_table and not args.dry_run:
+        create_table(args.url, args.database, args.table,
+                     auth=args.clickhouse_auth, fast_raw=args.fast_raw)
+
+    chunks = [files[i::n_workers] for i in range(n_workers)]
+    print(f"starting {n_workers} worker processes for {len(files):,} files",
+          flush=True)
+
+    processes = []
+    for worker_idx, chunk in enumerate(chunks):
+        worker_args = copy.copy(args)
+        worker_args.psv_file = [str(path) for path in chunk]
+        worker_args.limit_files = 0
+        worker_args.file_shard_count = 1
+        worker_args.file_shard_index = 0
+        worker_args.create_table = False
+        worker_args.threads = 1
+        worker_args.worker_prefix = f"[worker {worker_idx}/{n_workers}] "
+        proc = mp.Process(target=load_psv_files, args=(worker_args,),
+                          name=f"psv-loader-{worker_idx}")
+        proc.start()
+        processes.append(proc)
+
+    failed = []
+    try:
+        for proc in processes:
+            proc.join()
+            if proc.exitcode != 0:
+                failed.append((proc.name, proc.exitcode))
+    except KeyboardInterrupt:
+        for proc in processes:
+            proc.terminate()
+        for proc in processes:
+            proc.join()
+        raise
+
+    if failed:
+        details = ", ".join(f"{name}={code}" for name, code in failed)
+        raise SystemExit(f"{len(failed)} worker process(es) failed: {details}")
 
 
 def main():
@@ -742,8 +862,19 @@ def main():
                    help="Read ClickHouse password from this file.")
     p.add_argument("--database", default="shogi")
     p.add_argument("--table", default="pack_positions")
-    p.add_argument("--create-table", action="store_true")
+    p.add_argument("--create-table", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Create database/table if missing (default: true). "
+                        "Use --no-create-table to require an existing table.")
     p.add_argument("--batch-rows", type=int, default=100_000)
+    p.add_argument("--max-batch-bytes", type=int, default=64 * 1024 * 1024,
+                   help="Flush --fast-raw batches once RowBinary payload "
+                        "reaches this many bytes")
+    p.add_argument("--insert-retries", type=int, default=5,
+                   help="Retry transient ClickHouse insert failures")
+    p.add_argument("--retry-sleep", type=float, default=5.0,
+                   help="Initial retry sleep seconds; doubles after each "
+                        "failed attempt")
     p.add_argument("--fast-raw", action="store_true",
                    help="Fast mode: store raw 32-byte packed_sfen as "
                         "position_key and insert RowBinary. Use a fresh table; "
@@ -761,6 +892,9 @@ def main():
     p.add_argument("--file-shard-index", type=int, default=0,
                    help="Load only files whose sorted index modulo shard "
                         "count equals this index")
+    p.add_argument("--threads", type=int, default=1,
+                   help="Run N parallel worker processes. This is a "
+                        "convenience wrapper around file sharding.")
     p.add_argument("--limit-files", type=int, default=0)
     p.add_argument("--limit-records", type=int, default=0,
                    help="For smoke tests: read only this many records per file")
@@ -772,7 +906,12 @@ def main():
 
     require_identifier(args.database)
     require_identifier(args.table)
-    load_psv_files(args)
+    if args.threads < 1:
+        raise SystemExit("--threads must be >= 1")
+    if args.threads > 1:
+        run_threaded(args)
+    else:
+        load_psv_files(args)
 
 
 if __name__ == "__main__":

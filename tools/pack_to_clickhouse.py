@@ -470,7 +470,10 @@ def main():
                    help="Read ClickHouse password from this file.")
     p.add_argument("--database", default="shogi")
     p.add_argument("--table", default="pack_positions")
-    p.add_argument("--create-table", action="store_true")
+    p.add_argument("--create-table", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Create database/table if missing (default: true). "
+                        "Use --no-create-table to require an existing table.")
     p.add_argument("--batch-rows", type=int, default=100_000)
     p.add_argument("--fast-raw", action="store_true",
                    help="Fast/compatible mode: store raw 32-byte PackedSfen "
