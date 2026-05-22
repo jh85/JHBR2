@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
+import multiprocessing as mp
 import os
 import re
 import sys
@@ -204,6 +206,33 @@ def iter_pack_files(pack_dir: Path, recursive: bool):
     yield from sorted(pack_dir.glob(pattern))
 
 
+def collect_pack_files(args):
+    pack_files = getattr(args, "pack_files", None)
+    if pack_files is not None:
+        files = [Path(p) for p in pack_files]
+    else:
+        pack_dir = Path(args.pack_dir)
+        if not pack_dir.is_dir():
+            raise SystemExit(f"Not a directory: {pack_dir}")
+        files = list(iter_pack_files(pack_dir, args.recursive))
+    if args.limit_files:
+        files = files[:args.limit_files]
+    return files
+
+
+def apply_file_shard(files, args):
+    if args.file_shard_count < 1:
+        raise SystemExit("--file-shard-count must be >= 1")
+    if not 0 <= args.file_shard_index < args.file_shard_count:
+        raise SystemExit("--file-shard-index must satisfy 0 <= index < count")
+    if args.file_shard_count > 1:
+        files = [
+            path for idx, path in enumerate(files)
+            if idx % args.file_shard_count == args.file_shard_index
+        ]
+    return files
+
+
 def source_file_value(path: Path, mode: str) -> str:
     if mode == "empty":
         return ""
@@ -362,24 +391,10 @@ def flush_fast_raw_rows(url: str, database: str, table: str,
 
 
 def load_pack_files(args):
-    pack_dir = Path(args.pack_dir)
-    if not pack_dir.is_dir():
-        raise SystemExit(f"Not a directory: {pack_dir}")
-
-    files = list(iter_pack_files(pack_dir, args.recursive))
-    if args.limit_files:
-        files = files[:args.limit_files]
-    if args.file_shard_count < 1:
-        raise SystemExit("--file-shard-count must be >= 1")
-    if not 0 <= args.file_shard_index < args.file_shard_count:
-        raise SystemExit("--file-shard-index must satisfy 0 <= index < count")
-    if args.file_shard_count > 1:
-        files = [
-            path for idx, path in enumerate(files)
-            if idx % args.file_shard_count == args.file_shard_index
-        ]
+    prefix = getattr(args, "worker_prefix", "")
+    files = apply_file_shard(collect_pack_files(args), args)
     if not files:
-        raise SystemExit(f"No .pack files found under {pack_dir}")
+        raise SystemExit(f"No .pack files found under {args.pack_dir}")
 
     auth = clickhouse_auth(args)
 
@@ -428,17 +443,18 @@ def load_pack_files(args):
                 except Exception as exc:
                     bad_games += 1
                     if bad_games <= 20:
-                        print(f"skip game {source_file}:{game_index}: "
+                        print(f"{prefix}skip game {source_file}:{game_index}: "
                               f"{type(exc).__name__}: {exc}",
                               file=sys.stderr)
         except Exception as exc:
-            print(f"skip file {source_file}: {type(exc).__name__}: {exc}",
+            print(f"{prefix}skip file {source_file}: "
+                  f"{type(exc).__name__}: {exc}",
                   file=sys.stderr)
             continue
 
         elapsed = max(time.time() - t0, 1e-6)
         pending = len(raw_rows) if args.fast_raw else len(rows)
-        print(f"{file_index}/{len(files)} {pack_path.name}: "
+        print(f"{prefix}{file_index}/{len(files)} {pack_path.name}: "
               f"{file_rows:,} rows, total {total_rows + pending:,}, "
               f"{(total_rows + pending) / elapsed:,.0f} rows/s",
               flush=True)
@@ -450,9 +466,61 @@ def load_pack_files(args):
         total_rows += flush_rows(args.url, args.database, args.table, rows,
                                  auth=auth)
     elapsed = max(time.time() - t0, 1e-6)
-    print(f"done: {total_games:,} games, {bad_games:,} bad games, "
+    print(f"{prefix}done: {total_games:,} games, {bad_games:,} bad games, "
           f"{total_rows:,} rows in {elapsed:.1f}s "
           f"({total_rows / elapsed:,.0f} rows/s)")
+
+
+def run_threaded(args):
+    if args.file_shard_count != 1 or args.file_shard_index != 0:
+        raise SystemExit("--threads cannot be combined with manual "
+                         "--file-shard-count/--file-shard-index")
+
+    files = collect_pack_files(args)
+    if not files:
+        raise SystemExit(f"No .pack files found under {args.pack_dir}")
+
+    n_workers = min(args.threads, len(files))
+    auth = clickhouse_auth(args)
+    if args.create_table:
+        create_table(args.url, args.database, args.table, auth=auth,
+                     fast_raw=args.fast_raw)
+
+    chunks = [files[i::n_workers] for i in range(n_workers)]
+    print(f"starting {n_workers} worker processes for {len(files):,} files",
+          flush=True)
+
+    processes = []
+    for worker_idx, chunk in enumerate(chunks):
+        worker_args = copy.copy(args)
+        worker_args.pack_files = [str(path) for path in chunk]
+        worker_args.limit_files = 0
+        worker_args.file_shard_count = 1
+        worker_args.file_shard_index = 0
+        worker_args.create_table = False
+        worker_args.threads = 1
+        worker_args.worker_prefix = f"[worker {worker_idx}/{n_workers}] "
+        proc = mp.Process(target=load_pack_files, args=(worker_args,),
+                          name=f"pack-loader-{worker_idx}")
+        proc.start()
+        processes.append(proc)
+
+    failed = []
+    try:
+        for proc in processes:
+            proc.join()
+            if proc.exitcode != 0:
+                failed.append((proc.name, proc.exitcode))
+    except KeyboardInterrupt:
+        for proc in processes:
+            proc.terminate()
+        for proc in processes:
+            proc.join()
+        raise
+
+    if failed:
+        details = ", ".join(f"{name}={code}" for name, code in failed)
+        raise SystemExit(f"{len(failed)} worker process(es) failed: {details}")
 
 
 def main():
@@ -489,13 +557,21 @@ def main():
     p.add_argument("--file-shard-index", type=int, default=0,
                    help="Load only files whose sorted index modulo shard "
                         "count equals this index")
+    p.add_argument("--threads", type=int, default=1,
+                   help="Run N parallel worker processes. This is a "
+                        "convenience wrapper around file sharding.")
     p.add_argument("--limit-files", type=int, default=0,
                    help="For smoke tests: load only the first N pack files")
     args = p.parse_args()
 
     require_identifier(args.database)
     require_identifier(args.table)
-    load_pack_files(args)
+    if args.threads < 1:
+        raise SystemExit("--threads must be >= 1")
+    if args.threads > 1:
+        run_threaded(args)
+    else:
+        load_pack_files(args)
 
 
 if __name__ == "__main__":
