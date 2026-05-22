@@ -16,6 +16,9 @@ Example:
       --dataset training_yane \
       --create-table \
       --recursive
+
+For compatibility with PSV --fast-raw tables, use --fast-raw with a fresh
+table. It stores cshogi/YaneuraOu PackedSfen bytes as position_key.
 """
 
 from __future__ import annotations
@@ -33,10 +36,11 @@ from pathlib import Path
 
 try:
     import cshogi
+    import numpy as np
 except ImportError as exc:
     raise SystemExit(
-        "Missing Python module: cshogi. Install it in the Python environment "
-        "used for this script, then rerun."
+        "Missing Python module: cshogi or numpy. Install them in the Python "
+        "environment used for this script, then rerun."
     ) from exc
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +72,20 @@ INSERT_COLUMNS = (
     "position_key",
     "side_to_move",
     "move_usi",
+    "move16",
+    "eval",
+    "result_abs",
+    "moves_left",
+)
+
+FAST_RAW_INSERT_COLUMNS = (
+    "dataset",
+    "source_file",
+    "game_index",
+    "ply",
+    "game_ply",
+    "position_key",
+    "side_to_move",
     "move16",
     "eval",
     "result_abs",
@@ -125,10 +143,37 @@ def ch_post(url: str, query: str, data: bytes | None = None, timeout: int = 300,
         raise RuntimeError(f"ClickHouse HTTP {exc.code}: {body}{hint}") from exc
 
 
-def create_table(url: str, database: str, table: str, auth=None):
+def create_table(url: str, database: str, table: str, auth=None,
+                 fast_raw: bool = False):
     database = require_identifier(database)
     table = require_identifier(table)
     ch_post(url, f"CREATE DATABASE IF NOT EXISTS {database}", auth=auth)
+    if fast_raw:
+        ch_post(url, f"""
+CREATE TABLE IF NOT EXISTS {database}.{table}
+(
+    dataset String,
+    source_file String,
+    game_index UInt32,
+    ply UInt16,
+    game_ply UInt16,
+    position_key String,
+    pos_hash UInt64 MATERIALIZED cityHash64(position_key),
+    side_to_move UInt8,
+    move_usi String DEFAULT '',
+    move16 UInt16,
+    eval Int16,
+    result_abs UInt8,
+    moves_left UInt16,
+    inserted_at DateTime DEFAULT now()
+)
+ENGINE = MergeTree
+PARTITION BY dataset
+ORDER BY (pos_hash, position_key, dataset, source_file, game_index, ply)
+SETTINGS index_granularity = 8192
+""", auth=auth)
+        return
+
     ch_post(url, f"""
 CREATE TABLE IF NOT EXISTS {database}.{table}
 (
@@ -159,6 +204,14 @@ def iter_pack_files(pack_dir: Path, recursive: bool):
     yield from sorted(pack_dir.glob(pattern))
 
 
+def source_file_value(path: Path, mode: str) -> str:
+    if mode == "empty":
+        return ""
+    if mode == "basename":
+        return path.name
+    return str(path)
+
+
 def decode_pack_games(pack_path: Path):
     data = bytearray(pack_path.read_bytes())
     decoder = GameDataDecoder(data)
@@ -182,6 +235,11 @@ def decode_pack_games(pack_path: Path):
 def position_key_from_sfen(sfen: str) -> str:
     # Drop only the move number. Keep board, side-to-move, and hands.
     return " ".join(sfen.split()[:3])
+
+
+def board_to_packed_sfen_bytes(board: cshogi.Board, psfen_buf) -> bytes:
+    board.to_psfen(psfen_buf)
+    return psfen_buf.tobytes()
 
 
 def rows_for_game(dataset: str, source_file: str, game_index: int,
@@ -217,8 +275,64 @@ def rows_for_game(dataset: str, source_file: str, game_index: int,
         board.push_move16(move16)
 
 
+def fast_raw_rows_for_game(dataset: str, source_file: str, game_index: int,
+                           start_sfen: str, moves, result_abs: int,
+                           psfen_buf):
+    board = cshogi.Board()
+    board.set_sfen(start_sfen)
+    n_moves = len(moves)
+    for ply, (move16, eval16) in enumerate(moves):
+        side_to_move = int(board.turn)
+        moves_left = n_moves - ply - 1
+        yield (
+            dataset,
+            source_file,
+            game_index,
+            ply,
+            int(getattr(board, "move_number", ply + 1)),
+            board_to_packed_sfen_bytes(board, psfen_buf),
+            side_to_move,
+            move16 & 0xffff,
+            int(eval16),
+            int(result_abs),
+            moves_left,
+        )
+
+        board.push_move16(move16)
+
+
 def row_to_tsv(row) -> str:
     return "\t".join(tsv_escape(x) for x in row) + "\n"
+
+
+def write_varuint(out: bytearray, value: int):
+    while value >= 0x80:
+        out.append((value & 0x7f) | 0x80)
+        value >>= 7
+    out.append(value)
+
+
+def write_rb_string(out: bytearray, value):
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    write_varuint(out, len(value))
+    out.extend(value)
+
+
+def row_to_rowbinary(row) -> bytes:
+    out = bytearray()
+    write_rb_string(out, row[0])
+    write_rb_string(out, row[1])
+    out.extend(int(row[2]).to_bytes(4, "little", signed=False))
+    out.extend(int(row[3]).to_bytes(2, "little", signed=False))
+    out.extend(int(row[4]).to_bytes(2, "little", signed=False))
+    write_rb_string(out, row[5])
+    out.append(int(row[6]))
+    out.extend(int(row[7]).to_bytes(2, "little", signed=False))
+    out.extend(int(row[8]).to_bytes(2, "little", signed=True))
+    out.append(int(row[9]))
+    out.extend(int(row[10]).to_bytes(2, "little", signed=False))
+    return bytes(out)
 
 
 def flush_rows(url: str, database: str, table: str, rows: list[str],
@@ -234,6 +348,19 @@ def flush_rows(url: str, database: str, table: str, rows: list[str],
     return n
 
 
+def flush_fast_raw_rows(url: str, database: str, table: str,
+                        rows: list[bytes], auth=None) -> int:
+    if not rows:
+        return 0
+    columns = ", ".join(FAST_RAW_INSERT_COLUMNS)
+    query = f"INSERT INTO {database}.{table} ({columns}) FORMAT RowBinary"
+    payload = b"".join(rows)
+    ch_post(url, query, payload, timeout=1800, auth=auth)
+    n = len(rows)
+    rows.clear()
+    return n
+
+
 def load_pack_files(args):
     pack_dir = Path(args.pack_dir)
     if not pack_dir.is_dir():
@@ -242,15 +369,27 @@ def load_pack_files(args):
     files = list(iter_pack_files(pack_dir, args.recursive))
     if args.limit_files:
         files = files[:args.limit_files]
+    if args.file_shard_count < 1:
+        raise SystemExit("--file-shard-count must be >= 1")
+    if not 0 <= args.file_shard_index < args.file_shard_count:
+        raise SystemExit("--file-shard-index must satisfy 0 <= index < count")
+    if args.file_shard_count > 1:
+        files = [
+            path for idx, path in enumerate(files)
+            if idx % args.file_shard_count == args.file_shard_index
+        ]
     if not files:
         raise SystemExit(f"No .pack files found under {pack_dir}")
 
     auth = clickhouse_auth(args)
 
     if args.create_table:
-        create_table(args.url, args.database, args.table, auth=auth)
+        create_table(args.url, args.database, args.table, auth=auth,
+                     fast_raw=args.fast_raw)
 
     rows: list[str] = []
+    raw_rows: list[bytes] = []
+    psfen_buf = np.empty(1, dtype=cshogi.PackedSfen)
     total_rows = 0
     total_games = 0
     bad_games = 0
@@ -258,21 +397,34 @@ def load_pack_files(args):
 
     for file_index, pack_path in enumerate(files, 1):
         file_rows = 0
-        source_file = str(pack_path)
+        source_file = source_file_value(pack_path, args.source_file_field)
         try:
             game_iter = decode_pack_games(pack_path)
             for game_index, (sfen, moves, result_abs) in enumerate(game_iter):
                 total_games += 1
                 try:
-                    for row in rows_for_game(args.dataset, source_file,
-                                             game_index, sfen, moves,
-                                             result_abs):
-                        rows.append(row_to_tsv(row))
-                        file_rows += 1
-                        if len(rows) >= args.batch_rows:
-                            total_rows += flush_rows(
-                                args.url, args.database, args.table, rows,
-                                auth=auth)
+                    if args.fast_raw:
+                        row_iter = fast_raw_rows_for_game(
+                            args.dataset, source_file, game_index, sfen,
+                            moves, result_abs, psfen_buf)
+                        for row in row_iter:
+                            raw_rows.append(row_to_rowbinary(row))
+                            file_rows += 1
+                            if len(raw_rows) >= args.batch_rows:
+                                total_rows += flush_fast_raw_rows(
+                                    args.url, args.database, args.table,
+                                    raw_rows, auth=auth)
+                    else:
+                        row_iter = rows_for_game(
+                            args.dataset, source_file, game_index, sfen,
+                            moves, result_abs)
+                        for row in row_iter:
+                            rows.append(row_to_tsv(row))
+                            file_rows += 1
+                            if len(rows) >= args.batch_rows:
+                                total_rows += flush_rows(
+                                    args.url, args.database, args.table, rows,
+                                    auth=auth)
                 except Exception as exc:
                     bad_games += 1
                     if bad_games <= 20:
@@ -285,13 +437,18 @@ def load_pack_files(args):
             continue
 
         elapsed = max(time.time() - t0, 1e-6)
+        pending = len(raw_rows) if args.fast_raw else len(rows)
         print(f"{file_index}/{len(files)} {pack_path.name}: "
-              f"{file_rows:,} rows, total {total_rows + len(rows):,}, "
-              f"{(total_rows + len(rows)) / elapsed:,.0f} rows/s",
+              f"{file_rows:,} rows, total {total_rows + pending:,}, "
+              f"{(total_rows + pending) / elapsed:,.0f} rows/s",
               flush=True)
 
-    total_rows += flush_rows(args.url, args.database, args.table, rows,
-                             auth=auth)
+    if args.fast_raw:
+        total_rows += flush_fast_raw_rows(args.url, args.database, args.table,
+                                          raw_rows, auth=auth)
+    else:
+        total_rows += flush_rows(args.url, args.database, args.table, rows,
+                                 auth=auth)
     elapsed = max(time.time() - t0, 1e-6)
     print(f"done: {total_games:,} games, {bad_games:,} bad games, "
           f"{total_rows:,} rows in {elapsed:.1f}s "
@@ -315,6 +472,20 @@ def main():
     p.add_argument("--table", default="pack_positions")
     p.add_argument("--create-table", action="store_true")
     p.add_argument("--batch-rows", type=int, default=100_000)
+    p.add_argument("--fast-raw", action="store_true",
+                   help="Fast/compatible mode: store raw 32-byte PackedSfen "
+                        "as position_key and insert RowBinary. Use the same "
+                        "fresh table as PSV --fast-raw.")
+    p.add_argument("--source-file-field",
+                   choices=["path", "basename", "empty"], default="path",
+                   help="Value inserted into source_file. Use empty for less "
+                        "IO when source provenance is not needed.")
+    p.add_argument("--file-shard-count", type=int, default=1,
+                   help="Split sorted file list into N shards for manual "
+                        "parallel loading")
+    p.add_argument("--file-shard-index", type=int, default=0,
+                   help="Load only files whose sorted index modulo shard "
+                        "count equals this index")
     p.add_argument("--limit-files", type=int, default=0,
                    help="For smoke tests: load only the first N pack files")
     args = p.parse_args()

@@ -21,6 +21,10 @@ Example:
       --database shogi \
       --table pack_positions \
       --create-table
+
+For large duplicate-position analysis, use --fast-raw with a fresh table. It
+stores the 32-byte packed_sfen as position_key and skips expensive SFEN/USI
+decoding.
 """
 
 from __future__ import annotations
@@ -104,6 +108,20 @@ INSERT_COLUMNS = (
     "moves_left",
 )
 
+FAST_RAW_INSERT_COLUMNS = (
+    "dataset",
+    "source_file",
+    "game_index",
+    "ply",
+    "game_ply",
+    "position_key",
+    "side_to_move",
+    "move16",
+    "eval",
+    "result_abs",
+    "moves_left",
+)
+
 
 @dataclass(frozen=True)
 class PsvRecord:
@@ -112,6 +130,12 @@ class PsvRecord:
     move16: int
     game_ply: int
     game_result: int
+
+
+@dataclass
+class RowBinaryBatch:
+    data: bytearray
+    rows: int = 0
 
 
 class BitStream:
@@ -329,10 +353,37 @@ def ch_post(url: str, query: str, data: bytes | None = None, timeout: int = 300,
         raise RuntimeError(f"ClickHouse HTTP {exc.code}: {body}{hint}") from exc
 
 
-def create_table(url: str, database: str, table: str, auth=None):
+def create_table(url: str, database: str, table: str, auth=None,
+                 fast_raw: bool = False):
     database = require_identifier(database)
     table = require_identifier(table)
     ch_post(url, f"CREATE DATABASE IF NOT EXISTS {database}", auth=auth)
+    if fast_raw:
+        ch_post(url, f"""
+CREATE TABLE IF NOT EXISTS {database}.{table}
+(
+    dataset String,
+    source_file String,
+    game_index UInt32,
+    ply UInt16,
+    game_ply UInt16,
+    position_key String,
+    pos_hash UInt64 MATERIALIZED cityHash64(position_key),
+    side_to_move UInt8,
+    move_usi String DEFAULT '',
+    move16 UInt16,
+    eval Int16,
+    result_abs UInt8,
+    moves_left UInt16,
+    inserted_at DateTime DEFAULT now()
+)
+ENGINE = MergeTree
+PARTITION BY dataset
+ORDER BY (pos_hash, position_key, dataset, source_file, game_index, ply)
+SETTINGS index_granularity = 8192
+""", auth=auth)
+        return
+
     ch_post(url, f"""
 CREATE TABLE IF NOT EXISTS {database}.{table}
 (
@@ -362,6 +413,38 @@ def row_to_tsv(row) -> str:
     return "\t".join(tsv_escape(x) for x in row) + "\n"
 
 
+def write_varuint(out: bytearray, value: int):
+    while value >= 0x80:
+        out.append((value & 0x7f) | 0x80)
+        value >>= 7
+    out.append(value)
+
+
+def write_rb_string(out: bytearray, value):
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    write_varuint(out, len(value))
+    out.extend(value)
+
+
+def append_fast_raw_row(out: bytearray, dataset: str, source_file: str,
+                        game_index: int, ply: int, rec: PsvRecord,
+                        final_ply: int):
+    # packed_sfen bit 0 is side-to-move. Store the 32 raw bytes as the
+    # canonical position key; decoding can be done later for selected rows.
+    turn = rec.packed_sfen[0] & 1
+    result_abs = result_abs_from_psv(rec.game_result, turn)
+    moves_left = max(0, final_ply - rec.game_ply)
+
+    write_rb_string(out, dataset)
+    write_rb_string(out, source_file)
+    out.extend(struct.pack("<IHH", game_index, ply, rec.game_ply))
+    write_rb_string(out, rec.packed_sfen)
+    out.append(turn)
+    out.extend(struct.pack("<HhBH", rec.move16, rec.score, result_abs,
+                           moves_left))
+
+
 def flush_rows(url: str, database: str, table: str, rows: list[str],
                dry_run: bool, auth=None) -> int:
     if not rows:
@@ -376,6 +459,21 @@ def flush_rows(url: str, database: str, table: str, rows: list[str],
     return n
 
 
+def flush_fast_raw_rows(url: str, database: str, table: str,
+                        batch: RowBinaryBatch, dry_run: bool,
+                        auth=None) -> int:
+    if batch.rows == 0:
+        return 0
+    if not dry_run:
+        columns = ", ".join(FAST_RAW_INSERT_COLUMNS)
+        query = f"INSERT INTO {database}.{table} ({columns}) FORMAT RowBinary"
+        ch_post(url, query, bytes(batch.data), timeout=1800, auth=auth)
+    n = batch.rows
+    batch.data.clear()
+    batch.rows = 0
+    return n
+
+
 def parse_record(buf: bytes) -> PsvRecord:
     score, move16, game_ply = struct.unpack_from("<hHH", buf, 32)
     game_result = struct.unpack_from("<b", buf, 38)[0]
@@ -385,6 +483,14 @@ def parse_record(buf: bytes) -> PsvRecord:
 def iter_psv_files(psv_dir: Path, glob_pattern: str, recursive: bool):
     pattern = f"**/{glob_pattern}" if recursive else glob_pattern
     yield from sorted(p for p in psv_dir.glob(pattern) if p.is_file())
+
+
+def source_file_value(path: Path, mode: str) -> str:
+    if mode == "empty":
+        return ""
+    if mode == "basename":
+        return path.name
+    return str(path)
 
 
 def is_game_boundary(prev_ply: int | None, cur_ply: int) -> bool:
@@ -422,7 +528,7 @@ def load_file(path: Path, args, rows: list[str], total_inserted: int):
     if size % RECORD_SIZE != 0:
         raise ValueError(f"file size {size} is not divisible by {RECORD_SIZE}")
 
-    source_file = str(path)
+    source_file = source_file_value(path, args.source_file_field)
     game_records: list[PsvRecord] = []
     game_index = 0
     prev_ply = None
@@ -470,6 +576,79 @@ def load_file(path: Path, args, rows: list[str], total_inserted: int):
     return file_rows, game_index, total_inserted
 
 
+def load_file_fast_raw(path: Path, args, batch: RowBinaryBatch,
+                       total_inserted: int):
+    size = path.stat().st_size
+    if size % RECORD_SIZE != 0:
+        raise ValueError(f"file size {size} is not divisible by {RECORD_SIZE}")
+
+    source_file = source_file_value(path, args.source_file_field)
+    game_records: list[PsvRecord] = []
+    game_index = 0
+    prev_ply = None
+    file_rows = 0
+    sample_rows_printed = 0
+    max_records = args.limit_records if args.limit_records > 0 else None
+
+    def emit_game():
+        nonlocal game_records, game_index, file_rows
+        nonlocal total_inserted, sample_rows_printed
+        if not game_records:
+            return
+        final_ply = game_records[-1].game_ply
+        for ply, rec in enumerate(game_records):
+            if args.dry_run and sample_rows_printed < args.print_rows:
+                turn = rec.packed_sfen[0] & 1
+                result_abs = result_abs_from_psv(rec.game_result, turn)
+                moves_left = max(0, final_ply - rec.game_ply)
+                print(
+                    f"{args.dataset}\t{source_file}\t{game_index}\t{ply}\t"
+                    f"{rec.game_ply}\t{rec.packed_sfen.hex()}\t{turn}\t"
+                    f"{rec.move16}\t{rec.score}\t{result_abs}\t{moves_left}"
+                )
+                sample_rows_printed += 1
+            append_fast_raw_row(batch.data, args.dataset, source_file,
+                                game_index, ply, rec, final_ply)
+            batch.rows += 1
+            file_rows += 1
+            if batch.rows >= args.batch_rows:
+                total_inserted += flush_fast_raw_rows(
+                    args.url, args.database, args.table, batch, args.dry_run,
+                    auth=args.clickhouse_auth)
+        game_index += 1
+        game_records = []
+
+    read_size = max(RECORD_SIZE, args.read_records * RECORD_SIZE)
+    with path.open("rb") as f:
+        rec_idx = 0
+        while True:
+            if max_records is not None:
+                remaining = max_records - rec_idx
+                if remaining <= 0:
+                    break
+                buf = f.read(min(read_size, remaining * RECORD_SIZE))
+            else:
+                buf = f.read(read_size)
+            if not buf:
+                break
+            if len(buf) % RECORD_SIZE != 0:
+                raise ValueError(f"short trailing chunk: {len(buf)} bytes")
+            for off in range(0, len(buf), RECORD_SIZE):
+                score, move16, game_ply = struct.unpack_from("<hHH", buf,
+                                                             off + 32)
+                game_result = struct.unpack_from("<b", buf, off + 38)[0]
+                if is_game_boundary(prev_ply, game_ply):
+                    emit_game()
+                game_records.append(PsvRecord(bytes(buf[off:off + 32]),
+                                              score, move16, game_ply,
+                                              game_result))
+                prev_ply = game_ply
+                rec_idx += 1
+
+    emit_game()
+    return file_rows, game_index, total_inserted
+
+
 def load_psv_files(args):
     if args.psv_file:
         files = [Path(p) for p in args.psv_file]
@@ -480,6 +659,16 @@ def load_psv_files(args):
         files = list(iter_psv_files(psv_dir, args.psv_glob, args.recursive))
     if args.limit_files:
         files = files[:args.limit_files]
+    if args.file_shard_count < 1:
+        raise SystemExit("--file-shard-count must be >= 1")
+    if not 0 <= args.file_shard_index < args.file_shard_count:
+        raise SystemExit("--file-shard-index must satisfy "
+                         "0 <= index < count")
+    if args.file_shard_count > 1:
+        files = [
+            path for idx, path in enumerate(files)
+            if idx % args.file_shard_count == args.file_shard_index
+        ]
     if not files:
         raise SystemExit("No PSV files found")
 
@@ -487,9 +676,10 @@ def load_psv_files(args):
 
     if args.create_table and not args.dry_run:
         create_table(args.url, args.database, args.table,
-                     auth=args.clickhouse_auth)
+                     auth=args.clickhouse_auth, fast_raw=args.fast_raw)
 
     rows: list[str] = []
+    raw_batch = RowBinaryBatch(bytearray())
     total_inserted = 0
     total_seen = 0
     total_games = 0
@@ -498,8 +688,12 @@ def load_psv_files(args):
 
     for file_idx, path in enumerate(files, 1):
         try:
-            file_rows, file_games, total_inserted = load_file(
-                path, args, rows, total_inserted)
+            if args.fast_raw:
+                file_rows, file_games, total_inserted = load_file_fast_raw(
+                    path, args, raw_batch, total_inserted)
+            else:
+                file_rows, file_games, total_inserted = load_file(
+                    path, args, rows, total_inserted)
             total_seen += file_rows
             total_games += file_games
         except Exception as exc:
@@ -509,16 +703,21 @@ def load_psv_files(args):
             continue
 
         elapsed = max(time.time() - t0, 1e-6)
-        pending = len(rows)
+        pending = raw_batch.rows if args.fast_raw else len(rows)
         print(f"{file_idx}/{len(files)} {path.name}: "
               f"{file_rows:,} rows, {file_games:,} games, "
               f"total {total_seen:,} rows "
               f"({(total_inserted + pending) / elapsed:,.0f} rows/s)",
               flush=True)
 
-    total_inserted += flush_rows(
-        args.url, args.database, args.table, rows, args.dry_run,
-        auth=args.clickhouse_auth)
+    if args.fast_raw:
+        total_inserted += flush_fast_raw_rows(
+            args.url, args.database, args.table, raw_batch, args.dry_run,
+            auth=args.clickhouse_auth)
+    else:
+        total_inserted += flush_rows(
+            args.url, args.database, args.table, rows, args.dry_run,
+            auth=args.clickhouse_auth)
     elapsed = max(time.time() - t0, 1e-6)
     action = "decoded" if args.dry_run else "inserted"
     print(f"done: {action} {total_inserted:,} rows, "
@@ -545,6 +744,23 @@ def main():
     p.add_argument("--table", default="pack_positions")
     p.add_argument("--create-table", action="store_true")
     p.add_argument("--batch-rows", type=int, default=100_000)
+    p.add_argument("--fast-raw", action="store_true",
+                   help="Fast mode: store raw 32-byte packed_sfen as "
+                        "position_key and insert RowBinary. Use a fresh table; "
+                        "do not mix with default text-SFEN mode.")
+    p.add_argument("--read-records", type=int, default=1_000_000,
+                   help="Records to read from each PSV file per IO chunk in "
+                        "--fast-raw mode")
+    p.add_argument("--source-file-field",
+                   choices=["path", "basename", "empty"], default="path",
+                   help="Value inserted into source_file. Use empty for less "
+                        "IO when source provenance is not needed.")
+    p.add_argument("--file-shard-count", type=int, default=1,
+                   help="Split sorted file list into N shards for manual "
+                        "parallel loading")
+    p.add_argument("--file-shard-index", type=int, default=0,
+                   help="Load only files whose sorted index modulo shard "
+                        "count equals this index")
     p.add_argument("--limit-files", type=int, default=0)
     p.add_argument("--limit-records", type=int, default=0,
                    help="For smoke tests: read only this many records per file")
