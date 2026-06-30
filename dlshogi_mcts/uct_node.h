@@ -19,6 +19,7 @@ struct child_node_t {
         nnrate(o.nnrate),
         move_count(o.move_count.load(std::memory_order_relaxed)),
         win(o.win.load(std::memory_order_relaxed)),
+        sum_m(o.sum_m.load(std::memory_order_relaxed)),
         flags(o.flags.load(std::memory_order_relaxed)) {}
 
   child_node_t& operator=(child_node_t&& o) noexcept {
@@ -27,6 +28,8 @@ struct child_node_t {
     move_count.store(o.move_count.load(std::memory_order_relaxed),
                      std::memory_order_relaxed);
     win.store(o.win.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    sum_m.store(o.sum_m.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
     flags.store(o.flags.load(std::memory_order_relaxed),
                 std::memory_order_relaxed);
     return *this;
@@ -46,6 +49,7 @@ struct child_node_t {
   float nnrate = 0.0f;
   std::atomic<int> move_count{0};
   std::atomic<float> win{0.0f};
+  std::atomic<float> sum_m{0.0f};  // sum of subtree moves-left (for MLH M-effect)
 
  private:
   enum : uint8_t { kWin = 1, kLose = 2, kDraw = 4 };
@@ -69,6 +73,7 @@ struct uct_node_t {
   std::atomic<int> move_count{kNotExpanded};
   std::atomic<float> win{0.0f};
   std::atomic<float> visited_nnrate{0.0f};
+  float eval_m = 0.0f;  // this node's own NN moves-left (set once at eval)
   short child_num = 0;
   std::unique_ptr<child_node_t[]> child;
   std::unique_ptr<std::unique_ptr<uct_node_t>[]> child_nodes;

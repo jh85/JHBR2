@@ -48,6 +48,14 @@ struct SearchConfig {
   int num_gpus = 1;
   int max_moves_to_draw = 100000;
   int leaf_mate_depth = 0;
+
+  // Moves-left (MLH) effect in selection. Disabled by default (weight 0):
+  // when > 0, nudges selection toward shorter lines when winning / longer when
+  // losing. Needs a model trained with the MLH head; tune with real games.
+  float moves_left_weight = 0.0f;     // master switch / strength
+  float moves_left_threshold = 0.0f;  // only apply when |q-0.5| exceeds this
+  float moves_left_cap = 20.0f;       // clamp |child_M - parent_M| (plies)
+
   size_t nn_cache_size = 0;
   float info_interval = 1.0f;
   InfoCallback info_callback = nullptr;

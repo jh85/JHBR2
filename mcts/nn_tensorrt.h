@@ -40,6 +40,7 @@ struct NNOutput {
   float value;
   float draw;
   float wdl[3];
+  float moves_left = 0.0f;  // MLH head: model's plies-to-end estimate (0 if none)
   std::vector<float> policy;
 };
 

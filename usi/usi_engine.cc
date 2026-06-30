@@ -135,6 +135,9 @@ void USIEngine::CmdUsi() {
   Send("option name MaxGpuBatch type spin default 1024 min 64 max 16384");
   Send("option name VirtualLossWeight type string default 1.0");
   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
+  Send("option name MovesLeftWeight type string default 0.0");
+  Send("option name MovesLeftThreshold type string default 0.0");
+  Send("option name MovesLeftCap type string default 20.0");
   Send("option name DfPnMaxTime type spin default 4000 min 100 max 60000");
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
@@ -259,6 +262,12 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     int n = std::stoi(value);
     if (n < 1) n = 1;
     lc0_config_.max_moves_to_draw = n;
+  } else if (name_lower == "movesleftweight") {
+    lc0_config_.moves_left_weight = std::max(0.0f, std::stof(value));
+  } else if (name_lower == "movesleftthreshold") {
+    lc0_config_.moves_left_threshold = std::clamp(std::stof(value), 0.0f, 0.5f);
+  } else if (name_lower == "movesleftcap") {
+    lc0_config_.moves_left_cap = std::max(0.0f, std::stof(value));
   } else if (name_lower == "virtuallossweight") {
     float w = std::stof(value);
     if (w < 0.1f) w = 0.1f;

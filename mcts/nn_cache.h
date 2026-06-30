@@ -38,6 +38,7 @@ namespace jhbr2 {
 
 struct CachedNNValue {
   float wdl[3] = {0, 0, 0};        // win, draw, loss probabilities
+  float moves_left = 0.0f;          // MLH head estimate (plies to end)
   std::vector<float> policy;        // indexed by legal-move position
   uint16_t num_legal_moves = 0;     // collision guard
 };

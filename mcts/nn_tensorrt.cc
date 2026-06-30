@@ -488,6 +488,11 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
   CUDA_CHECK(cudaMemcpyAsync(slot.h_wdl, slot.d_wdl,
       static_cast<size_t>(run_batch) * value_planes * sizeof(float),
       cudaMemcpyDeviceToHost, slot.stream));
+  if (impl_->mlh_idx >= 0) {
+    CUDA_CHECK(cudaMemcpyAsync(slot.h_mlh, slot.d_mlh,
+        static_cast<size_t>(run_batch) * 1 * sizeof(float),
+        cudaMemcpyDeviceToHost, slot.stream));
+  }
 
   CUDA_CHECK(cudaStreamSynchronize(slot.stream));
 
@@ -496,6 +501,8 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     auto& result = results[b];
     const auto& board = batch[b].first;
     const auto& legal_moves = batch[b].second;
+
+    result.moves_left = (impl_->mlh_idx >= 0) ? slot.h_mlh[b] : 0.0f;
 
     if (is_dlshogi) {
       float value_win = slot.h_wdl[b];

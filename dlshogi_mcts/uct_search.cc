@@ -38,12 +38,14 @@ void SubVirtualLoss(child_node_t* child, uct_node_t* current) {
   child->move_count.fetch_sub(kVirtualLoss, std::memory_order_acq_rel);
 }
 
-void UpdateResult(child_node_t* child, float result, uct_node_t* current) {
+void UpdateResult(child_node_t* child, float result, float m_value,
+                  uct_node_t* current) {
   AtomicFetchAdd(&current->win, result);
   if constexpr (kVirtualLoss != 1) {
     current->move_count.fetch_add(1 - kVirtualLoss, std::memory_order_acq_rel);
   }
   AtomicFetchAdd(&child->win, result);
+  AtomicFetchAdd(&child->sum_m, m_value);
   if constexpr (kVirtualLoss != 1) {
     child->move_count.fetch_add(1 - kVirtualLoss, std::memory_order_acq_rel);
   }
@@ -78,6 +80,7 @@ jhbr2::NNOutput FromCachedNNValue(const jhbr2::CachedNNValue& cached) {
   out.wdl[2] = cached.wdl[2];
   out.value = cached.wdl[0] - cached.wdl[2];
   out.draw = cached.wdl[1];
+  out.moves_left = cached.moves_left;
   out.policy = cached.policy;
   return out;
 }
@@ -88,6 +91,7 @@ jhbr2::CachedNNValue ToCachedNNValue(const jhbr2::NNOutput& out,
   cached.wdl[0] = out.wdl[0];
   cached.wdl[1] = out.wdl[1];
   cached.wdl[2] = out.wdl[2];
+  cached.moves_left = out.moves_left;
   cached.policy = out.policy;
   cached.num_legal_moves = num_legal_moves;
   return cached;
@@ -103,6 +107,7 @@ struct trajectory_t {
 struct visitor_t {
   std::vector<trajectory_t> trajectories;
   float value_win = 0.5f;
+  float value_m = 0.0f;  // leaf moves-left, filled by EvalNode
   visitor_t() { trajectories.reserve(128); }
 };
 
@@ -112,6 +117,7 @@ struct batch_element_t {
   MoveList legal_moves;
   lczero::Color color = BLACK;
   float* value_win = nullptr;
+  float* value_m = nullptr;
 };
 
 class UCTSearcher {
@@ -133,7 +139,7 @@ class UCTSearcher {
                   visitor_t& visitor);
   unsigned SelectMaxUcbChild(child_node_t* parent, uct_node_t* current);
   void QueuingNode(const ShogiBoard* board, uct_node_t* node,
-                   float* value_win);
+                   float* value_win, float* value_m);
   void EvalNode();
 
   UCTSearcherGroup* grp_;
@@ -274,6 +280,11 @@ unsigned UCTSearcher::SelectMaxUcbChild(child_node_t* parent,
   const float visited = current->visited_nnrate.load(std::memory_order_acquire);
   const float fpu = fpu_reduction * std::sqrt(std::max(visited, 0.0f));
 
+  // Moves-left (MLH) effect: prefer shorter lines when winning, longer when
+  // losing. Off unless moves_left_weight > 0 (and the net has an MLH head).
+  const bool use_m = cfg.moves_left_weight > 0.0f;
+  const float parent_m = use_m ? current->eval_m : 0.0f;
+
   float best_score = -std::numeric_limits<float>::infinity();
   unsigned best = 0;
   bool found = false;
@@ -286,7 +297,18 @@ unsigned UCTSearcher::SelectMaxUcbChild(child_node_t* parent,
     const float q =
         n == 0 ? -fpu : child.win.load(std::memory_order_acquire) / n;
     const float u = c * sqrt_sum * child.nnrate / (1.0f + n);
-    const float score = q + u;
+    float m_effect = 0.0f;
+    if (use_m && n > 0) {
+      const float q_centered = q - 0.5f;  // >0 winning, <0 losing
+      if (std::fabs(q_centered) > cfg.moves_left_threshold) {
+        const float child_m = child.sum_m.load(std::memory_order_acquire) / n;
+        float m_delta = child_m - parent_m;  // >0 = longer than parent estimate
+        m_delta = std::clamp(m_delta, -cfg.moves_left_cap, cfg.moves_left_cap);
+        const float sign = (q_centered > 0.0f) ? 1.0f : -1.0f;
+        m_effect = -cfg.moves_left_weight * sign * m_delta;
+      }
+    }
+    const float score = q + u + m_effect;
     if (!found || score > best_score) {
       found = true;
       best_score = score;
@@ -343,7 +365,7 @@ float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
         current->SetEvaled();
         return 0.0f;
       }
-      QueuingNode(board, current, &visitor.value_win);
+      QueuingNode(board, current, &visitor.value_win, &visitor.value_m);
       return kQueuing;
     }
 
@@ -363,10 +385,10 @@ float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
 }
 
 void UCTSearcher::QueuingNode(const ShogiBoard* board, uct_node_t* node,
-                              float* value_win) {
+                              float* value_win, float* value_m) {
   batch_.push_back(
       batch_element_t{node, *board, const_cast<ShogiBoard*>(board)->GenerateLegalMoves(),
-                      board->side_to_move(), value_win});
+                      board->side_to_move(), value_win, value_m});
 }
 
 void UCTSearcher::EvalNode() {
@@ -443,8 +465,12 @@ void UCTSearcher::EvalNode() {
       }
     }
     elem.node->visited_nnrate.store(visited_policy, std::memory_order_release);
+    elem.node->eval_m = result.moves_left;  // visible via the SetEvaled() release
     if (elem.value_win) {
       *elem.value_win = (result.value + 1.0f) * 0.5f;
+    }
+    if (elem.value_m) {
+      *elem.value_m = result.moves_left;
     }
     elem.node->SetEvaled();
   }
@@ -458,7 +484,8 @@ void UCTSearcher::ParallelUctSearch() {
     if (!current_root->IsEvaled()) {
       batch_.clear();
       float value_win = 0.5f;
-      QueuingNode(&grp_->owner->root_board_, current_root, &value_win);
+      float value_m = 0.0f;
+      QueuingNode(&grp_->owner->root_board_, current_root, &value_win, &value_m);
       EvalNode();
     }
   }
@@ -487,10 +514,12 @@ void UCTSearcher::ParallelUctSearch() {
         visitor_batch.push_back(&visitor_pool[i]);
       } else {
         float value = result;
+        float m = 0.0f;  // terminal leaf: game ends here (0 plies left)
         for (auto it = visitor_pool[i].trajectories.rbegin();
              it != visitor_pool[i].trajectories.rend(); ++it) {
-          UpdateResult(&it->parent->child[it->child_idx], value, it->parent);
+          UpdateResult(&it->parent->child[it->child_idx], value, m, it->parent);
           value = 1.0f - value;
+          m += 1.0f;
         }
       }
     }
@@ -505,10 +534,12 @@ void UCTSearcher::ParallelUctSearch() {
 
     for (auto* visitor : visitor_batch) {
       float value = 1.0f - visitor->value_win;
+      float m = visitor->value_m;  // leaf's NN moves-left estimate
       for (auto it = visitor->trajectories.rbegin();
            it != visitor->trajectories.rend(); ++it) {
-        UpdateResult(&it->parent->child[it->child_idx], value, it->parent);
+        UpdateResult(&it->parent->child[it->child_idx], value, m, it->parent);
         value = 1.0f - value;
+        m += 1.0f;
       }
     }
 
