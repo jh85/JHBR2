@@ -8,6 +8,51 @@ implementations must agree bit-for-bit:
 2. `shogi/encoder_unpack.cu` — GPU unpack kernels (the speedup path).
 3. `shogi_train.py` — `sfen_to_planes()` (training-side encoder).
 
+## At a glance
+
+```
+JHBR2 INPUT TENSOR  (148, 9, 9)  — encoded from side-to-move's perspective
+┌───────────────────────────────────────────────────────────────────────────┐
+│  features1  (planes 0–27)   POSITIONAL bitmaps — 1 bit / square             │
+│  features2  (planes 28–147) UNIFORM one-hot   — 1 bit / plane (broadcast)   │
+└───────────────────────────────────────────────────────────────────────────┘
+
+PLANES  COUNT  GROUP                       CONTENT
+──────  ─────  ─────────────────────────   ────────────────────────────────────
+ 0–13    14    features1: OUR pieces       P L N S B R G K +P +L +N +S +H +D
+14–27    14    features1: THEIR pieces     (same 14 piece types)
+········ ····  ································ features1 = 28 planes ···········
+28–55    28    features2: OUR hand         thermometer (unary), see below
+56–83    28    features2: THEIR hand       thermometer (unary)
+   84     1    features2: CHECK            side-to-move in check? (1 / 0)
+85–115   31    features2: OUR nyugyoku     king-in-camp + opp-field + score
+116–146  31    features2: THEIR nyugyoku   (same 31)
+  147     1    features2: REPETITION       position seen before? (0 in training)
+········ ····  ································ features2 = 120 planes ··········
+                                            TOTAL = 28 + 120 = 148
+```
+
+**Hand thermometer** — a piece's count fills the first *N* planes of its run:
+
+```
+ OUR HAND (planes 28–55, 28 wide):
+ P P P P P P P P  L L L L  N N N N  S S S S  G G G G  B B  R R
+ └──── 8 ────┘   └─ 4 ─┘  └─ 4 ─┘  └─ 4 ─┘  └─ 4 ─┘  └2┘  └2┘   = 28
+ e.g. 3 pawns in hand →  1 1 1 0 0 0 0 0 ...
+ (THEIR hand = planes 56–83, identical layout)
+```
+
+**Nyugyoku block** — 31 planes per color, one-hot "remaining count":
+
+```
+ OUR nyugyoku (planes 85–115):
+   85          king is in the enemy camp?                       (1 plane)
+   86–95       opp-field pieces: one-hot at (10 − count)        (10 planes)
+   96–115      declaration score: one-hot at (threshold − pts)  (20 planes)
+               threshold = 28 if sente, 27 if gote
+ (THEIR nyugyoku = planes 116–146, identical layout)
+```
+
 ## Why packing
 
 dlshogi avoids transferring full float planes (`148 × 81 × 4 B ≈ 48 KB/pos`)

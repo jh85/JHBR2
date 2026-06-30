@@ -5,19 +5,22 @@
 
 // Neural network input/output encoding for Shogi.
 //
-// INPUT PLANES (148 channels, 9×9 each) — dlshogi-style, see
-// docs/nyugyoku_dlshogi_features.md for the authoritative spec.
+// INPUT PLANES (148 channels, 9×9 each) — dlshogi-style. From the side-to-move's
+// perspective. See docs/nyugyoku_dlshogi_features.md for the authoritative spec.
 //
-//   features1 (positional bitmaps, 1 bit/square):
-//     Planes  0-13:  Our 14 piece types (P,L,N,S,B,R,G,K,+P,+L,+N,+S,+H,+D)
-//     Planes 14-27:  Their 14 piece types
-//   features2 (uniform one-hot planes, 1 bit/plane, broadcast to 81 squares):
-//     Planes 28-55:  Our hand, thermometer (P×8,L×4,N×4,S×4,G×4,B×2,R×2)
-//     Planes 56-83:  Their hand, thermometer
-//     Plane  84:     Check (side-to-move in check)
-//     Planes 85-115: Our nyugyoku block (king-in-camp, opp-field, score)
-//     Planes 116-146:Their nyugyoku block
-//     Plane  147:    Repetition flag (position has occurred before)
+//   features1 (planes 0–27)   POSITIONAL bitmaps — 1 bit / square
+//   features2 (planes 28–147) UNIFORM one-hot    — 1 bit / plane (broadcast)
+//
+//   PLANES   CNT  CONTENT
+//    0–13     14  features1: OUR pieces   P L N S B R G K +P +L +N +S +H +D
+//   14–27     14  features1: THEIR pieces (same 14 types)
+//   28–55     28  features2: OUR hand     thermometer P×8 L×4 N×4 S×4 G×4 B×2 R×2
+//   56–83     28  features2: THEIR hand   thermometer
+//      84      1  features2: CHECK        side-to-move in check?
+//   85–115    31  features2: OUR nyugyoku   king-in-camp(1) opp-field(10) score(20)
+//  116–146    31  features2: THEIR nyugyoku (same 31)
+//     147      1  features2: REPETITION   position seen before? (0 in training)
+//                                          TOTAL = 28 + 120 = 148
 //
 // POLICY OUTPUT (3849 moves):
 //   Indices    0-2223:  Board moves (from×to, non-promotion)
