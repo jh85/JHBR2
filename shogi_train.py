@@ -22,6 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
 
 # cshogi is only needed for the in-check feature plane during encoding. Import
 # lazily so pure shard-loading training runs don't hard-depend on it.
@@ -236,6 +238,7 @@ class ShardedDataset(Dataset):
         self.planes = None
         self.policy = None
         self.wdl = None
+        self.mlh = None
         self.current_shard = -1
 
         # Load first shard to get the count
@@ -254,28 +257,38 @@ class ShardedDataset(Dataset):
         self.planes = None
         self.policy = None
         self.wdl = None
+        self.mlh = None
 
         data = np.load(self.shard_paths[shard_id])
         self.planes = data['planes']
         self.policy = data['policy']
         self.wdl = data['wdl']
+        # mlh = remaining plies to game end (int16). Older shards may omit it.
+        self.mlh = data['mlh'] if 'mlh' in data.files else None
         self.current_shard = shard_id
 
-    def shard_order(self, shuffle=True):
-        """Return shard indices in random order."""
+    def shard_order(self, shuffle=True, seed=None):
+        """Return shard indices in (optionally seeded) random order.
+
+        Pass a seed so every DDP rank computes the SAME order (required for
+        lock-step training across ranks)."""
         import random
         order = list(range(self.num_shards))
         if shuffle:
-            random.shuffle(order)
+            (random.Random(seed) if seed is not None else random).shuffle(order)
         return order
 
     def __len__(self):
         return len(self.planes)
 
     def __getitem__(self, idx):
+        # mlh target: remaining plies, or -1 sentinel ("no MLH target") for
+        # shards without an mlh array (loss masks these out).
+        mlh = float(self.mlh[idx]) if self.mlh is not None else -1.0
         return (torch.from_numpy(self.planes[idx].astype(np.float32)),
                 torch.tensor(self.policy[idx], dtype=torch.long),
-                torch.tensor(self.wdl[idx], dtype=torch.float32))
+                torch.tensor(self.wdl[idx], dtype=torch.float32),
+                torch.tensor(mlh, dtype=torch.float32))
 
 
 class ShogiDataset(Dataset):
@@ -391,10 +404,29 @@ def build_move_index():
 
 
 def train(args):
-    # --- Device setup ---
+    # --- Distributed (DDP) setup: auto-enabled when launched via torchrun ---
+    #   single GPU / DataParallel:  python shogi_train.py ...
+    #   DDP (recommended, scales):  torchrun --nproc_per_node=<N> shogi_train.py ...
+    is_dist = int(os.environ.get("WORLD_SIZE", "1")) > 1
+    if is_dist:
+        local_rank = int(os.environ["LOCAL_RANK"])
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+    else:
+        local_rank, rank, world_size = 0, 0, 1
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    is_main = (rank == 0)
     num_gpus = torch.cuda.device_count()
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}, GPUs: {num_gpus}")
+
+    def log(*a, **k):
+        if is_main:
+            print(*a, **k)
+
+    if is_dist:
+        log(f"DDP enabled: world_size={world_size} (one process per GPU, NCCL)")
+    log(f"Device: {device}, visible GPUs: {num_gpus}")
 
     # Move index function (v2: direction-based, returns index directly)
     move_info_to_idx = build_move_index()
@@ -456,9 +488,13 @@ def train(args):
     # Mixed precision training (FP16 forward, FP32 gradients).
     scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
 
-    # --- Multi-GPU with DataParallel ---
-    if num_gpus > 1:
-        print(f"Using DataParallel across {num_gpus} GPUs")
+    # --- Multi-GPU ---
+    if is_dist:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank)
+    elif num_gpus > 1:
+        log(f"Using DataParallel across {num_gpus} GPUs "
+            f"(tip: `torchrun --nproc_per_node={num_gpus} shogi_train.py` is faster)")
         model = torch.nn.DataParallel(model)
 
     # --- Dataset ---
@@ -490,22 +526,35 @@ def train(args):
         total_loss = 0
         total_policy_loss = 0
         total_value_loss = 0
+        total_mlh_loss = 0
         n_batches = 0
         t0 = time.time()
 
         if use_psv or use_sharded:
-            # Iterate through shards in random order
-            shard_order = sharded_dataset.shard_order(shuffle=True)
-            for shard_id in shard_order:
+            # Same shard order on every rank (seeded by epoch) → DDP stays in
+            # lock-step (all ranks process the same shard at the same time).
+            shard_order = sharded_dataset.shard_order(shuffle=True, seed=1234 + epoch)
+            for si, shard_id in enumerate(shard_order):
                 sharded_dataset.load_shard(shard_id)
-                loader = DataLoader(sharded_dataset, batch_size=args.batch,
-                                    shuffle=True, num_workers=args.workers,
-                                    pin_memory=True, drop_last=True)
+                if is_dist:
+                    # Each rank trains on a disjoint 1/world_size slice of the shard.
+                    sampler = DistributedSampler(
+                        sharded_dataset, num_replicas=world_size, rank=rank,
+                        shuffle=True, drop_last=True)
+                    sampler.set_epoch(epoch * sharded_dataset.num_shards + si)
+                    loader = DataLoader(sharded_dataset, batch_size=args.batch,
+                                        sampler=sampler, num_workers=args.workers,
+                                        pin_memory=True, drop_last=True)
+                else:
+                    loader = DataLoader(sharded_dataset, batch_size=args.batch,
+                                        shuffle=True, num_workers=args.workers,
+                                        pin_memory=True, drop_last=True)
 
-                for planes, policy_target, wdl_target in loader:
+                for planes, policy_target, wdl_target, mlh_target in loader:
                     planes = planes.to(device, non_blocking=True)
                     policy_target = policy_target.to(device, non_blocking=True)
                     wdl_target = wdl_target.to(device, non_blocking=True)
+                    mlh_target = mlh_target.to(device, non_blocking=True)
 
                     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                         policy_logits, wdl_logits, mlh = model(planes)
@@ -518,7 +567,18 @@ def train(args):
                             policy_loss = torch.tensor(0.0, device=device)
 
                         value_loss = F.cross_entropy(wdl_logits, wdl_target)
-                        loss = policy_loss + args.value_weight * value_loss
+
+                        # MLH: Huber regression on clipped remaining plies.
+                        # mlh_target < 0 means "no MLH label" (masked out).
+                        mlh_mask = mlh_target >= 0
+                        if args.mlh_weight > 0 and mlh_mask.any():
+                            tgt = torch.clamp(mlh_target[mlh_mask], max=float(args.mlh_clip))
+                            mlh_loss = F.smooth_l1_loss(mlh[mlh_mask].squeeze(-1), tgt)
+                        else:
+                            mlh_loss = torch.tensor(0.0, device=device)
+
+                        loss = (policy_loss + args.value_weight * value_loss
+                                + args.mlh_weight * mlh_loss)
 
                     optimizer.zero_grad()
                     scaler.scale(loss).backward()
@@ -534,16 +594,17 @@ def train(args):
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
                     total_value_loss += value_loss.item()
+                    total_mlh_loss += mlh_loss.item()
                     n_batches += 1
 
-                # Print after each shard
+                # Print after each shard (aggregate throughput across ranks)
                 elapsed = time.time() - t0
-                samples = n_batches * args.batch
+                samples = n_batches * args.batch * world_size
                 speed = samples / max(elapsed, 1)
                 avg_loss = total_loss / max(n_batches, 1)
-                print(f"  Epoch {epoch+1} shard {shard_id:03d}: "
-                      f"loss={avg_loss:.4f} "
-                      f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
+                log(f"  Epoch {epoch+1} shard {shard_id:03d}: "
+                    f"loss={avg_loss:.4f} "
+                    f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
         else:
             # Text dataset: single loader for entire epoch
             loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
@@ -591,36 +652,38 @@ def train(args):
         scheduler.step()
 
         elapsed = time.time() - t0
-        samples_per_sec = (n_batches * args.batch) / max(elapsed, 1)
+        samples_per_sec = (n_batches * args.batch * world_size) / max(elapsed, 1)
         avg_loss = total_loss / max(n_batches, 1)
         avg_policy = total_policy_loss / max(n_batches, 1)
         avg_value = total_value_loss / max(n_batches, 1)
+        avg_mlh = total_mlh_loss / max(n_batches, 1)
         lr = scheduler.get_last_lr()[0]
-        print(f"Epoch {epoch+1}/{args.epochs}  "
-              f"loss={avg_loss:.4f}  "
-              f"policy={avg_policy:.4f}  "
-              f"value={avg_value:.4f}  "
-              f"lr={lr:.6f}  "
-              f"time={elapsed:.1f}s  "
-              f"speed={samples_per_sec:.0f} samples/sec")
+        log(f"Epoch {epoch+1}/{args.epochs}  "
+            f"loss={avg_loss:.4f}  "
+            f"policy={avg_policy:.4f}  "
+            f"value={avg_value:.4f}  "
+            f"mlh={avg_mlh:.4f}  "
+            f"lr={lr:.6f}  "
+            f"time={elapsed:.1f}s  "
+            f"speed={samples_per_sec:.0f} samples/sec")
 
-        # Log to CSV
-        if args.log_csv:
+        # Log to CSV (rank 0 only)
+        if args.log_csv and is_main:
             import csv
             write_header = not os.path.exists(args.log_csv)
             with open(args.log_csv, 'a', newline='') as csvf:
                 writer = csv.writer(csvf)
                 if write_header:
                     writer.writerow(['epoch', 'loss', 'policy_loss', 'value_loss',
-                                     'lr', 'time_sec', 'samples_per_sec',
+                                     'mlh_loss', 'lr', 'time_sec', 'samples_per_sec',
                                      'total_samples', 'batches'])
                 writer.writerow([epoch + 1, f'{avg_loss:.6f}', f'{avg_policy:.6f}',
-                                 f'{avg_value:.6f}', f'{lr:.8f}', f'{elapsed:.1f}',
-                                 f'{samples_per_sec:.0f}',
-                                 n_batches * args.batch, n_batches])
+                                 f'{avg_value:.6f}', f'{avg_mlh:.6f}', f'{lr:.8f}',
+                                 f'{elapsed:.1f}', f'{samples_per_sec:.0f}',
+                                 n_batches * args.batch * world_size, n_batches])
 
-        # Save checkpoint
-        if (epoch + 1) % args.save_every == 0:
+        # Save checkpoint (rank 0 only)
+        if (epoch + 1) % args.save_every == 0 and is_main:
             raw_model = model.module if hasattr(model, 'module') else model
             path = os.path.join(args.save_dir, f"shogi_bt4_epoch{epoch+1}.pt")
             torch.save({
@@ -629,12 +692,19 @@ def train(args):
                 'optimizer': optimizer.state_dict(),
                 'cfg': vars(cfg),
             }, path)
-            print(f"  Saved {path}")
+            log(f"  Saved {path}")
 
-    # Export to ONNX
-    if args.export_onnx:
+        # Keep all ranks aligned before the next epoch.
+        if is_dist:
+            dist.barrier()
+
+    # Export to ONNX (rank 0 only)
+    if args.export_onnx and is_main:
         raw_model = model.module if hasattr(model, 'module') else model
         export_onnx(raw_model, cfg, args.export_onnx, device)
+
+    if is_dist:
+        dist.destroy_process_group()
 
 
 def export_onnx(model, cfg, path, device):
@@ -686,6 +756,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--wd", type=float, default=0.01)
     parser.add_argument("--value-weight", type=float, default=1.0)
+    parser.add_argument("--mlh-weight", type=float, default=0.1,
+                        help="Weight of the moves-left (MLH) Huber loss "
+                             "(0 disables MLH training)")
+    parser.add_argument("--mlh-clip", type=int, default=80,
+                        help="Clip MLH target (remaining plies) to this max")
     parser.add_argument("--d-model", type=int, default=None)
     parser.add_argument("--encoders", type=int, default=None)
     parser.add_argument("--heads", type=int, default=None)
