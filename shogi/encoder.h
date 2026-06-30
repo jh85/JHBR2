@@ -5,17 +5,19 @@
 
 // Neural network input/output encoding for Shogi.
 //
-// INPUT PLANES (48 channels, 9×9 each):
-//   Planes  0-13:  Our 14 piece types on board (P,L,N,S,B,R,G,K,+P,+L,+N,+S,+H,+D)
-//   Planes 14-27:  Their 14 piece types on board
-//   Plane   28:    Repetition flag (all 1s if position has occurred before)
-//   Planes 29-35:  Our hand piece counts (P,L,N,S,B,R,G), value = count
-//   Planes 36-42:  Their hand piece counts
-//   Plane   43:    All ones (board edge helper)
-//   Plane   44:    Our entering-king points / 28.0 (nyugyoku progress)
-//   Plane   45:    Their entering-king points / 28.0
-//   Plane   46:    Our pieces in enemy camp / 10.0
-//   Plane   47:    Their pieces in enemy camp / 10.0
+// INPUT PLANES (148 channels, 9×9 each) — dlshogi-style, see
+// docs/nyugyoku_dlshogi_features.md for the authoritative spec.
+//
+//   features1 (positional bitmaps, 1 bit/square):
+//     Planes  0-13:  Our 14 piece types (P,L,N,S,B,R,G,K,+P,+L,+N,+S,+H,+D)
+//     Planes 14-27:  Their 14 piece types
+//   features2 (uniform one-hot planes, 1 bit/plane, broadcast to 81 squares):
+//     Planes 28-55:  Our hand, thermometer (P×8,L×4,N×4,S×4,G×4,B×2,R×2)
+//     Planes 56-83:  Their hand, thermometer
+//     Plane  84:     Check (side-to-move in check)
+//     Planes 85-115: Our nyugyoku block (king-in-camp, opp-field, score)
+//     Planes 116-146:Their nyugyoku block
+//     Plane  147:    Repetition flag (position has occurred before)
 //
 // POLICY OUTPUT (3849 moves):
 //   Indices    0-2223:  Board moves (from×to, non-promotion)
@@ -43,10 +45,30 @@ namespace lczero {
 
 // --- Constants ---
 
-constexpr int kShogiInputPlanes = 48;
+// Plane families (see docs/nyugyoku_dlshogi_features.md).
+constexpr int kShogiNumF1Planes = 28;   // positional bitmaps (1 bit / square)
+constexpr int kShogiNumF2Planes = 120;  // uniform one-hot (1 bit / plane)
+constexpr int kShogiInputPlanes = kShogiNumF1Planes + kShogiNumF2Planes;  // 148
 constexpr int kShogiBoardSize = 9;
+constexpr int kShogiSquares = 81;
+
+// dlshogi-model inputs (the external-net validation path; see encoder.cc).
 constexpr int kDlshogiInput1Planes = 62;
 constexpr int kDlshogiInput2Planes = 57;
+
+// Packed (bit) buffer sizes, in bytes, per position.
+constexpr int kPackedF1Bytes = (kShogiNumF1Planes * kShogiSquares + 7) / 8;  // 284
+constexpr int kPackedF2Bytes = (kShogiNumF2Planes + 7) / 8;                  // 15
+
+// features2 sub-layout (local indices within the 120-plane block).
+constexpr int kF2HandPerColor = 28;  // P8+L4+N4+S4+G4+B2+R2
+constexpr int kF2OurHand   = 0;
+constexpr int kF2TheirHand = kF2OurHand + kF2HandPerColor;        // 28
+constexpr int kF2Check     = kF2TheirHand + kF2HandPerColor;      // 56
+constexpr int kF2NyugyokuPerColor = 1 + 10 + 20;                 // 31
+constexpr int kF2OurNyugyoku   = kF2Check + 1;                    // 57
+constexpr int kF2TheirNyugyoku = kF2OurNyugyoku + kF2NyugyokuPerColor;  // 88
+constexpr int kF2Repetition    = kF2TheirNyugyoku + kF2NyugyokuPerColor;  // 119
 
 // --- Input Plane ---
 
@@ -89,9 +111,17 @@ using ShogiInputPlanes = std::array<ShogiInputPlane, kShogiInputPlanes>;
 
 // --- Encoding ---
 
-// Encode a ShogiBoard as input planes for the neural network.
-// The board is always encoded from the side-to-move's perspective:
-// if it's WHITE's turn, the board is flipped 180° before encoding.
+// Pack a ShogiBoard into the bit-packed feature buffers (the primary,
+// authoritative encoder). features1 = 1 bit/square, features2 = 1 bit/plane.
+// Caller provides zero-initialized buffers of kPackedF1Bytes / kPackedF2Bytes.
+// The board is encoded from the side-to-move's perspective (flipped 180° for
+// WHITE). This is what the GPU unpack kernel expands; see encoder_unpack.cu.
+void PackShogiPosition(const ShogiBoard& board,
+                       uint8_t* packed_f1, uint8_t* packed_f2);
+
+// Encode a ShogiBoard as full float input planes. Defined as a CPU unpack of
+// PackShogiPosition(), so it is bit-identical to the GPU path. Used by the
+// ONNX Runtime fallback and as the correctness oracle for the kernel.
 ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board);
 
 // Encode the dlshogi model inputs:

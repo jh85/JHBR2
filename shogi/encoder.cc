@@ -157,65 +157,131 @@ void Init() {
 }
 }  // namespace ShogiEncoderTables
 
-// --- Input encoding ---
+// --- Input encoding (dlshogi-style bit-packed) ---
+//
+// See docs/nyugyoku_dlshogi_features.md for the authoritative layout. The
+// packing here, the GPU kernel in encoder_unpack.cu, and sfen_to_planes() in
+// shogi_train.py must agree bit-for-bit.
 
-ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
-  ShogiInputPlanes planes{};
+namespace {
 
+inline void SetBit(uint8_t* p, int idx) {
+  p[idx >> 3] |= static_cast<uint8_t>(1u << (idx & 7));
+}
+
+// Pack one positional plane: 1 bit per occupied square. The in-plane cell order
+// is rank*9+file, matching ShogiInputPlane::SetBitsFromBitboard and Python's
+// planes[plane, rank, file].
+inline void PackBitboardPlane(uint8_t* f1, int plane, const Bitboard& bb) {
+  uint64_t lo = bb.Lo();
+  while (lo) {
+    int bit = std::countr_zero(lo);
+    lo &= lo - 1;
+    SetBit(f1, plane * 81 + (bit % 9) * 9 + bit / 9);
+  }
+  uint64_t hi = bb.Hi();
+  while (hi) {
+    int bit = std::countr_zero(hi) + kBBSplit;
+    hi &= hi - 1;
+    SetBit(f1, plane * 81 + (bit % 9) * 9 + bit / 9);
+  }
+}
+
+// Hand piece order and per-piece maxima (matches dlshogi MAX_PIECES_IN_HAND).
+constexpr PieceType kHandTypes[7] = {
+  kPawn, kLance, kKnight, kSilver, kGold, kBishop, kRook
+};
+constexpr int kHandMax[7] = {8, 4, 4, 4, 4, 2, 2};
+
+// Thermometer (unary) encoding of one color's hand into the features2 bitset.
+inline void PackHand(uint8_t* f2, int base, const Hand& hand) {
+  int off = 0;
+  for (int i = 0; i < 7; ++i) {
+    int n = std::min(hand.Count(kHandTypes[i]), kHandMax[i]);
+    for (int k = 0; k < n; ++k) SetBit(f2, base + off + k);
+    off += kHandMax[i];
+  }
+}
+
+// Nyugyoku one-hot block (31 planes) for one color, from the engine's verified
+// ComputeEnteringKingInfo (king_in_camp / pieces_in_camp / declaration points).
+inline void PackNyugyoku(uint8_t* f2, int base,
+                         const ShogiBoard::EnteringKingInfo& ek, int threshold) {
+  if (ek.king_in_camp) SetBit(f2, base + 0);
+
+  // Opp-field piece count: "remaining to 10", one-hot. Set only when at least
+  // one (non-king) piece is in the enemy camp (rest < 10).
+  int rest_field = 10 - ek.pieces_in_camp;
+  if (rest_field < 10) {
+    SetBit(f2, base + 1 + std::clamp(rest_field, 0, 9));
+  }
+
+  // Declaration score: "remaining to threshold (28 sente / 27 gote)", one-hot.
+  int rest_point = threshold - ek.points;
+  if (rest_point < 20) {
+    SetBit(f2, base + 11 + std::clamp(rest_point, 0, 19));
+  }
+}
+
+}  // namespace
+
+void PackShogiPosition(const ShogiBoard& board,
+                       uint8_t* packed_f1, uint8_t* packed_f2) {
   // Flip board if WHITE to move (always encode from mover's perspective).
   ShogiBoard b = (board.side_to_move() == WHITE) ? board.Flipped() : board;
+  const Color us = BLACK;
+  const Color them = WHITE;
 
-  Color us = BLACK;
-  Color them = WHITE;
-
-  // Planes 0-13: Our 14 piece types.
-  const PieceType piece_types[] = {
+  // --- features1: positional bitmaps (planes 0..27) ---
+  static constexpr PieceType piece_types[14] = {
     kPawn, kLance, kKnight, kSilver, kBishop, kRook, kGold, kKing,
     kProPawn, kProLance, kProKnight, kProSilver, kHorse, kDragon
   };
-
   for (int i = 0; i < 14; ++i) {
-    planes[i].SetBitsFromBitboard(b.pieces(us, piece_types[i]));
+    PackBitboardPlane(packed_f1, i, b.pieces(us, piece_types[i]));
+    PackBitboardPlane(packed_f1, 14 + i, b.pieces(them, piece_types[i]));
   }
 
-  // Planes 14-27: Their 14 piece types.
-  for (int i = 0; i < 14; ++i) {
-    planes[14 + i].SetBitsFromBitboard(b.pieces(them, piece_types[i]));
+  // --- features2: uniform one-hot planes (local indices into packed_f2) ---
+  PackHand(packed_f2, kF2OurHand, b.hand(us));
+  PackHand(packed_f2, kF2TheirHand, b.hand(them));
+
+  // Check is flip-invariant; query the original board (Flipped() leaves some
+  // derived state, e.g. king_sq_, stale).
+  if (board.InCheck()) SetBit(packed_f2, kF2Check);
+
+  // Nyugyoku for both colors. Compute on the ORIGINAL board (per-color camps
+  // are handled internally; the flipped board's king_sq_ would be stale). The
+  // score threshold is 28 for sente (the original first player), 27 for gote.
+  const Color stm = board.side_to_move();
+  const bool stm_black = (stm == BLACK);
+  PackNyugyoku(packed_f2, kF2OurNyugyoku,
+               board.ComputeEnteringKingInfo(stm), stm_black ? 28 : 27);
+  PackNyugyoku(packed_f2, kF2TheirNyugyoku,
+               board.ComputeEnteringKingInfo(~stm), stm_black ? 27 : 28);
+
+  // Repetition is a property of game history, which only the original board
+  // carries (Flipped() is built fresh with no history).
+  if (board.IsRepetition()) SetBit(packed_f2, kF2Repetition);
+}
+
+ShogiInputPlanes EncodeShogiPosition(const ShogiBoard& board) {
+  uint8_t f1[kPackedF1Bytes] = {};
+  uint8_t f2[kPackedF2Bytes] = {};
+  PackShogiPosition(board, f1, f2);
+
+  ShogiInputPlanes planes{};  // zero-initialized
+  // features1: 1 bit per square.
+  for (int p = 0; p < kShogiNumF1Planes; ++p) {
+    for (int c = 0; c < kShogiSquares; ++c) {
+      int idx = p * 81 + c;
+      if (f1[idx >> 3] & (1u << (idx & 7))) planes[p].data[c] = 1.0f;
+    }
   }
-
-  // Plane 28: Repetition flag (1 if current position has occurred before).
-  if (b.IsRepetition()) {
-    planes[28].SetAll(1.0f);
-  } else {
-    planes[28].Clear();
+  // features2: 1 bit per plane, broadcast to all 81 squares.
+  for (int j = 0; j < kShogiNumF2Planes; ++j) {
+    if (f2[j >> 3] & (1u << (j & 7))) planes[kShogiNumF1Planes + j].SetAll(1.0f);
   }
-
-  // Planes 29-35: Our hand piece counts.
-  const PieceType hand_types[] = {
-    kPawn, kLance, kKnight, kSilver, kBishop, kRook, kGold
-  };
-  for (int i = 0; i < 7; ++i) {
-    float count = static_cast<float>(b.hand(us).Count(hand_types[i]));
-    planes[29 + i].SetAll(count);
-  }
-
-  // Planes 36-42: Their hand piece counts.
-  for (int i = 0; i < 7; ++i) {
-    float count = static_cast<float>(b.hand(them).Count(hand_types[i]));
-    planes[36 + i].SetAll(count);
-  }
-
-  // Plane 43: All ones.
-  planes[43].SetAll(1.0f);
-
-  // Planes 44-47: Entering-king (nyugyoku) progress features.
-  auto our_ek = b.ComputeEnteringKingInfo(us);
-  auto their_ek = b.ComputeEnteringKingInfo(them);
-  planes[44].SetAll(static_cast<float>(our_ek.points) / 28.0f);
-  planes[45].SetAll(static_cast<float>(their_ek.points) / 28.0f);
-  planes[46].SetAll(static_cast<float>(our_ek.pieces_in_camp) / 10.0f);
-  planes[47].SetAll(static_cast<float>(their_ek.pieces_in_camp) / 10.0f);
-
   return planes;
 }
 

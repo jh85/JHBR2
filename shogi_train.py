@@ -23,6 +23,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
+# cshogi is only needed for the in-check feature plane during encoding. Import
+# lazily so pure shard-loading training runs don't hard-depend on it.
+try:
+    import cshogi as _cshogi
+except Exception:
+    _cshogi = None
+
 # Add lc0 src to path for the Shogi C++ modules (via ctypes or subprocess).
 # For now we do everything in Python.
 from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
@@ -34,10 +41,18 @@ from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
 # Shogi board encoding (pure Python, mirrors C++ encoder)
 # =====================================================================
 
-def sfen_to_planes(sfen_str):
+def sfen_to_planes(sfen_str, in_check=None):
     """
-    Convert an SFEN string to a (48, 9, 9) input tensor.
-    Encodes from side-to-move's perspective (flipped for WHITE).
+    Convert an SFEN string to a (148, 9, 9) input tensor, dlshogi-style.
+    Encodes from the side-to-move's perspective (flipped 180° for WHITE).
+
+    in_check: optional bool for "side-to-move is in check" (the check plane).
+        If None, it is computed via cshogi (a fresh Board per call). Callers that
+        already hold a live cshogi board — e.g. the pack/PSV shard generators —
+        should pass board.is_check() to avoid rebuilding the board per position.
+
+    MUST stay bit-identical to PackShogiPosition() in shogi/encoder.cc and the
+    GPU unpack kernel — see docs/nyugyoku_dlshogi_features.md for the layout.
     """
     parts = sfen_str.strip().split()
     board_str = parts[0]
@@ -45,10 +60,9 @@ def sfen_to_planes(sfen_str):
     hand_str = parts[2]
     flip = (side == 'w')
 
-    planes = np.zeros((48, 9, 9), dtype=np.float32)
+    planes = np.zeros((148, 9, 9), dtype=np.float32)
 
-    # Piece type mapping: char → (color, plane_index)
-    # Our pieces = planes 0-13, their pieces = planes 14-27
+    # Piece type mapping. Our pieces = planes 0-13, their pieces = planes 14-27.
     PIECE_PLANE = {
         'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6, 'K': 7,
     }
@@ -56,7 +70,7 @@ def sfen_to_planes(sfen_str):
         'P': 8, 'L': 9, 'N': 10, 'S': 11, 'B': 12, 'R': 13,
     }
 
-    # Parse board
+    # --- features1: piece placement (planes 0..27) ---
     r, f = 0, 8  # Start top-left: rank a (idx 0), file 9 (idx 8)
     promoted = False
     for ch in board_str:
@@ -82,7 +96,6 @@ def sfen_to_planes(sfen_str):
             f -= 1
             continue
 
-        # Determine "ours" vs "theirs"
         if flip:
             is_ours = not is_black
             sq_f, sq_r = 8 - f, 8 - r  # flip 180°
@@ -94,11 +107,21 @@ def sfen_to_planes(sfen_str):
         planes[offset + plane_idx, sq_r, sq_f] = 1.0
         f -= 1
 
-    # Plane 28: repetition (TODO: requires history)
-    # planes[28] = 0
+    # --- features2 sub-layout (local indices; global plane = F1 + local) ---
+    F1 = 28
+    F2_OUR_HAND = 0
+    F2_THEIR_HAND = 28
+    F2_CHECK = 56
+    F2_OUR_NYU = 57
+    F2_THEIR_NYU = 88
+    # F2_REPETITION = 119  # unknown from a bare SFEN; left 0 (see doc)
 
-    # Hand pieces
-    HAND_PLANE = {'P': 0, 'L': 1, 'N': 2, 'S': 3, 'B': 4, 'R': 5, 'G': 6}
+    HAND_ORDER = ['P', 'L', 'N', 'S', 'G', 'B', 'R']
+    HAND_MAX = {'P': 8, 'L': 4, 'N': 4, 'S': 4, 'G': 4, 'B': 2, 'R': 2}
+
+    # Parse hand counts into our/their dicts.
+    our_hand = {k: 0 for k in HAND_ORDER}
+    their_hand = {k: 0 for k in HAND_ORDER}
     if hand_str != '-':
         count = 0
         for ch in hand_str:
@@ -109,67 +132,68 @@ def sfen_to_planes(sfen_str):
                 count = 1
             is_black = ch.isupper()
             base = ch.upper()
-            idx = HAND_PLANE.get(base, -1)
-            if idx >= 0:
-                if flip:
-                    is_ours = not is_black
-                else:
-                    is_ours = is_black
-                plane = 29 + idx if is_ours else 36 + idx
-                planes[plane] = float(count)
+            if base in HAND_MAX:
+                is_ours = (not is_black) if flip else is_black
+                (our_hand if is_ours else their_hand)[base] += count
             count = 0
 
-    # Plane 43: all ones
-    planes[43] = 1.0
+    # Hand thermometer (unary): first min(count, max) planes of each run set.
+    def fill_hand(base, hand):
+        off = 0
+        for p in HAND_ORDER:
+            n = min(hand[p], HAND_MAX[p])
+            for k in range(n):
+                planes[F1 + base + off + k] = 1.0
+            off += HAND_MAX[p]
+    fill_hand(F2_OUR_HAND, our_hand)
+    fill_hand(F2_THEIR_HAND, their_hand)
 
-    # Planes 44-47: Entering-king (nyugyoku) progress features.
-    # Compute points and piece counts for both sides.
-    # We need to parse the board to count pieces in enemy camp.
-    MAJOR_PIECES = {'B', 'R'}  # bishop, rook (and promoted forms count too)
-    for color_is_ours in [True, False]:
-        points = 0
+    # Check (side-to-move in check). Needs real board logic. Use the caller's
+    # value if given, else fall back to building a cshogi board here.
+    if in_check is None and _cshogi is not None:
+        try:
+            in_check = _cshogi.Board(sfen_str).is_check()
+        except Exception:
+            in_check = False
+    if in_check:
+        planes[F1 + F2_CHECK] = 1.0
+
+    # Nyugyoku one-hot blocks (mirrors ComputeEnteringKingInfo + dlshogi fill).
+    MAJOR_IDX = (4, 5, 12, 13)  # B, R, +B(Horse), +R(Dragon)
+    for color_is_ours in (True, False):
+        camp_ranks = (0, 1, 2) if color_is_ours else (6, 7, 8)
+        offset = 0 if color_is_ours else 14
+        hand = our_hand if color_is_ours else their_hand
+
+        king_in_camp = False
         pieces_in_camp = 0
-
-        # Enemy camp: ranks 0,1,2 for "us" (after flip, us=BLACK perspective).
-        # For the opponent, enemy camp is ranks 6,7,8 (from our perspective).
-        if color_is_ours:
-            camp_ranks = {0, 1, 2}
-        else:
-            camp_ranks = {6, 7, 8}
-
-        # Count board pieces in enemy camp
-        for r in range(9):
-            for f in range(9):
-                # Check the piece planes
+        points = 0
+        for rr in camp_ranks:
+            for ff in range(9):
                 for pt_idx in range(14):
-                    offset = 0 if color_is_ours else 14
-                    if planes[offset + pt_idx, r, f] > 0.5:
-                        if r in camp_ranks:
-                            if pt_idx == 7:  # King
-                                pass  # King doesn't count for points or piece count
-                            else:
-                                pieces_in_camp += 1
-                                # Major pieces: Bishop(4), Rook(5), Horse(12), Dragon(13)
-                                if pt_idx in (4, 5, 12, 13):
-                                    points += 5
-                                else:
-                                    points += 1
+                    if planes[offset + pt_idx, rr, ff] > 0.5:
+                        if pt_idx == 7:           # King: excluded from counts
+                            king_in_camp = True
+                        else:
+                            pieces_in_camp += 1
+                            points += 5 if pt_idx in MAJOR_IDX else 1
+        for p in HAND_ORDER:
+            points += hand[p] * (5 if p in ('B', 'R') else 1)
 
-        # Add hand piece points
-        for i in range(7):
-            hand_plane = 29 + i if color_is_ours else 36 + i
-            count = planes[hand_plane, 0, 0]  # scalar broadcast
-            if i in (4, 5):  # Bishop, Rook
-                points += int(count) * 5
-            else:
-                points += int(count)
-
+        base = F2_OUR_NYU if color_is_ours else F2_THEIR_NYU
+        if king_in_camp:
+            planes[F1 + base + 0] = 1.0
+        rest_field = 10 - pieces_in_camp
+        if rest_field < 10:
+            planes[F1 + base + 1 + max(0, min(rest_field, 9))] = 1.0
+        # Threshold: 28 for sente (original first player), 27 for gote.
         if color_is_ours:
-            planes[44] = float(points) / 28.0
-            planes[46] = float(pieces_in_camp) / 10.0
+            threshold = 28 if side == 'b' else 27
         else:
-            planes[45] = float(points) / 28.0
-            planes[47] = float(pieces_in_camp) / 10.0
+            threshold = 27 if side == 'b' else 28
+        rest_point = threshold - points
+        if rest_point < 20:
+            planes[F1 + base + 11 + max(0, min(rest_point, 19))] = 1.0
 
     return planes
 
@@ -220,7 +244,7 @@ class ShardedDataset(Dataset):
 
         print(f"Found {self.num_shards} shards, ~{self.shard_size:,} positions each")
         print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions "
-              f"(memory: ~{self.shard_size * 48 * 81 * 2 / 1e9:.1f} GB per shard)")
+              f"(memory: ~{self.shard_size * 148 * 81 * 2 / 1e9:.1f} GB per shard)")
 
     def load_shard(self, shard_id):
         """Load a specific shard into memory (frees the previous one)."""

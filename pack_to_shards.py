@@ -9,7 +9,7 @@ with:
     pack file --pack_to_shards.py--> shards (with mlh_target)
 
 Each shard is a .npz with arrays:
-    planes  (N, 48, 9, 9)  float16
+    planes  (N, 148, 9, 9) float16
     policy  (N,)           int32   in [0, 2187), or -1 if move missing
     wdl     (N, 3)         float16 (W, D, L) from side-to-move's perspective
     mlh     (N,)           int16   raw remaining plies from this position to

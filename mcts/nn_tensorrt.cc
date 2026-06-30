@@ -24,6 +24,9 @@
 #include <vector>
 
 #include "shogi/encoder.h"
+#include "shogi/encoder_unpack.h"
+
+#include <cstring>
 
 namespace jhbr2 {
 
@@ -77,29 +80,37 @@ static void Softmax(float* data, int size) {
 struct Slot {
   std::unique_ptr<nvinfer1::IExecutionContext> context;
   cudaStream_t stream = nullptr;
-  void* d_input = nullptr;
-  void* d_input2 = nullptr;
+  void* d_input = nullptr;       // dlshogi input1 / native unpack target (float)
+  void* d_input2 = nullptr;      // dlshogi input2 (float)
+  void* d_packed_f1 = nullptr;   // native: packed features1 bits (device)
+  void* d_packed_f2 = nullptr;   // native: packed features2 bits (device)
   void* d_policy = nullptr;
   void* d_wdl = nullptr;
   void* d_mlh = nullptr;
-  float* h_input = nullptr;
-  float* h_input2 = nullptr;
+  float* h_input = nullptr;        // dlshogi input1 (pinned float)
+  float* h_input2 = nullptr;       // dlshogi input2 (pinned float)
+  uint8_t* h_packed_f1 = nullptr;  // native: packed features1 bits (pinned)
+  uint8_t* h_packed_f2 = nullptr;  // native: packed features2 bits (pinned)
   float* h_policy = nullptr;
   float* h_wdl = nullptr;
   float* h_mlh = nullptr;
 
   ~Slot() {
-    if (d_input)  cudaFree(d_input);
-    if (d_input2) cudaFree(d_input2);
-    if (d_policy) cudaFree(d_policy);
-    if (d_wdl)    cudaFree(d_wdl);
-    if (d_mlh)    cudaFree(d_mlh);
-    if (h_input)  cudaFreeHost(h_input);
-    if (h_input2) cudaFreeHost(h_input2);
-    if (h_policy) cudaFreeHost(h_policy);
-    if (h_wdl)    cudaFreeHost(h_wdl);
-    if (h_mlh)    cudaFreeHost(h_mlh);
-    if (stream)   cudaStreamDestroy(stream);
+    if (d_input)     cudaFree(d_input);
+    if (d_input2)    cudaFree(d_input2);
+    if (d_packed_f1) cudaFree(d_packed_f1);
+    if (d_packed_f2) cudaFree(d_packed_f2);
+    if (d_policy)    cudaFree(d_policy);
+    if (d_wdl)       cudaFree(d_wdl);
+    if (d_mlh)       cudaFree(d_mlh);
+    if (h_input)     cudaFreeHost(h_input);
+    if (h_input2)    cudaFreeHost(h_input2);
+    if (h_packed_f1) cudaFreeHost(h_packed_f1);
+    if (h_packed_f2) cudaFreeHost(h_packed_f2);
+    if (h_policy)    cudaFreeHost(h_policy);
+    if (h_wdl)       cudaFreeHost(h_wdl);
+    if (h_mlh)       cudaFreeHost(h_mlh);
+    if (stream)      cudaStreamDestroy(stream);
   }
 };
 
@@ -122,7 +133,7 @@ struct NNEvaluator::Impl {
   int wdl_idx = -1;
   int mlh_idx = -1;
 
-  int input_channels = 48;
+  int input_channels = 48;      // overwritten from the engine at load
   int input2_channels = 0;
   int max_batch_size = 32;
   int policy_size = 0;
@@ -260,6 +271,13 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
     if (input_dims.nbDims >= 2) {
       impl_->input_channels = input_dims.d[1];
     }
+    if (impl_->input_channels != kShogiInputPlanes) {
+      fprintf(stderr,
+              "[TRT] WARNING: engine expects %d input channels, but the encoder "
+              "produces %d (kShogiInputPlanes). Rebuild the engine from a model "
+              "trained with the current encoder, or the unpack will mismatch.\n",
+              impl_->input_channels, kShogiInputPlanes);
+    }
     impl_->max_batch_size =
         GetMaxBatch(impl_->engine.get(), "input_planes", &impl_->dynamic_batch);
     auto policy_dims = impl_->engine->getTensorShape("policy");
@@ -293,15 +311,23 @@ NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
     CUDA_CHECK(cudaMalloc(&slot->d_input,  static_cast<size_t>(B) * C * 81 * sizeof(float)));
     if (impl_->model_format == ModelFormat::kDlshogi) {
       CUDA_CHECK(cudaMalloc(&slot->d_input2, static_cast<size_t>(B) * C2 * 81 * sizeof(float)));
+    } else {
+      CUDA_CHECK(cudaMalloc(&slot->d_packed_f1, static_cast<size_t>(B) * kPackedF1Bytes));
+      CUDA_CHECK(cudaMalloc(&slot->d_packed_f2, static_cast<size_t>(B) * kPackedF2Bytes));
     }
     CUDA_CHECK(cudaMalloc(&slot->d_policy, static_cast<size_t>(B) * P * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&slot->d_wdl,    static_cast<size_t>(B) * value_planes * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&slot->d_mlh,    static_cast<size_t>(B) * 1 * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
-                              static_cast<size_t>(B) * C * 81 * sizeof(float)));
     if (impl_->model_format == ModelFormat::kDlshogi) {
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input),
+                                static_cast<size_t>(B) * C * 81 * sizeof(float)));
       CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_input2),
                                 static_cast<size_t>(B) * C2 * 81 * sizeof(float)));
+    } else {
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_packed_f1),
+                                static_cast<size_t>(B) * kPackedF1Bytes));
+      CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_packed_f2),
+                                static_cast<size_t>(B) * kPackedF2Bytes));
     }
     CUDA_CHECK(cudaMallocHost(reinterpret_cast<void**>(&slot->h_policy),
                               static_cast<size_t>(B) * P * sizeof(float)));
@@ -405,16 +431,26 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     slot.context->setTensorAddress("input2", slot.d_input2);
     slot.context->setTensorAddress("output_policy", slot.d_policy);
     slot.context->setTensorAddress("output_value", slot.d_wdl);
-  } else {
-    std::fill(slot.h_input,
-              slot.h_input + static_cast<size_t>(run_batch) * C * sq, 0.0f);
 
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_input,
+        static_cast<size_t>(run_batch) * C * sq * sizeof(float),
+        cudaMemcpyHostToDevice, slot.stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_input2, slot.h_input2,
+        static_cast<size_t>(run_batch) * C2 * sq * sizeof(float),
+        cudaMemcpyHostToDevice, slot.stream));
+  } else {
+    // Native JHBR2: pack each position into the small bit buffers (~300 B/pos
+    // vs ~48 KB of float planes), transfer, and expand on the GPU into d_input.
+    // Zero first: padding rows (run_batch > batch_size) must read as empty, and
+    // packing ORs bits in.
+    std::memset(slot.h_packed_f1, 0,
+                static_cast<size_t>(run_batch) * kPackedF1Bytes);
+    std::memset(slot.h_packed_f2, 0,
+                static_cast<size_t>(run_batch) * kPackedF2Bytes);
     for (int b = 0; b < batch_size; b++) {
-      auto planes = EncodeShogiPosition(batch[b].first);
-      float* dst = slot.h_input + b * C * sq;
-      for (int c = 0; c < C && c < kShogiInputPlanes; c++) {
-        std::copy(planes[c].data, planes[c].data + sq, dst + c * sq);
-      }
+      PackShogiPosition(batch[b].first,
+                        slot.h_packed_f1 + static_cast<size_t>(b) * kPackedF1Bytes,
+                        slot.h_packed_f2 + static_cast<size_t>(b) * kPackedF2Bytes);
     }
 
     nvinfer1::Dims4 input_dims{run_batch, C, 9, 9};
@@ -426,15 +462,19 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     if (impl_->mlh_idx >= 0) {
       slot.context->setTensorAddress("mlh", slot.d_mlh);
     }
-  }
 
-  CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_input,
-      static_cast<size_t>(run_batch) * C * sq * sizeof(float),
-      cudaMemcpyHostToDevice, slot.stream));
-  if (is_dlshogi) {
-    CUDA_CHECK(cudaMemcpyAsync(slot.d_input2, slot.h_input2,
-        static_cast<size_t>(run_batch) * C2 * sq * sizeof(float),
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_packed_f1, slot.h_packed_f1,
+        static_cast<size_t>(run_batch) * kPackedF1Bytes,
         cudaMemcpyHostToDevice, slot.stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_packed_f2, slot.h_packed_f2,
+        static_cast<size_t>(run_batch) * kPackedF2Bytes,
+        cudaMemcpyHostToDevice, slot.stream));
+    LaunchUnpackFeatures(run_batch, C,
+        kShogiNumF1Planes, kPackedF1Bytes,
+        kShogiNumF2Planes, kPackedF2Bytes,
+        static_cast<const uint8_t*>(slot.d_packed_f1),
+        static_cast<const uint8_t*>(slot.d_packed_f2),
+        static_cast<float*>(slot.d_input), slot.stream);
   }
 
   bool ok = slot.context->enqueueV3(slot.stream);

@@ -118,8 +118,8 @@ def _save_shard(prefix, idx, planes_list, policy_list, wdl_list):
     path = f"{prefix}_{idx:03d}.npz"
     n = len(planes_list)
 
-    # Pre-allocate array and fill
-    planes = np.empty((n, 48, 9, 9), dtype=np.float16)
+    # Pre-allocate array and fill (channel count derived from the encoder).
+    planes = np.empty((n,) + planes_list[0].shape, dtype=np.float16)
     for i in range(n):
         planes[i] = planes_list[i]
 
@@ -240,7 +240,7 @@ def precompute(input_path, output_prefix, shard_size=500_000, num_workers=None):
         f.write(f"total_positions={total_written}\n")
         f.write(f"num_shards={shard_idx}\n")
         f.write(f"shard_size={shard_size}\n")
-        f.write(f"planes_shape=48,9,9\n")
+        f.write(f"planes_shape=148,9,9\n")
         f.write(f"source={input_path}\n")
     print(f"Metadata: {meta_path}")
 

@@ -148,11 +148,11 @@ def make_direction_policy_index(move_str, flip):
 
 @dataclass
 class ShogiBT4v2Config:
-    # Input
-    num_piece_planes: int = 28
-    hand_planes: int = 14
-    aux_planes: int = 6
-    input_planes: int = 48
+    # Input (dlshogi-style; see docs/nyugyoku_dlshogi_features.md)
+    num_piece_planes: int = 28   # features1: piece placement (spatial)
+    hand_planes: int = 56        # features2: one-hot hand (thermometer), both colors
+    aux_planes: int = 64         # features2: check(1) + nyugyoku(62) + repetition(1)
+    input_planes: int = 148      # 28 + 56 + 64
     num_squares: int = 81
     board_size: int = 9
 
@@ -454,7 +454,7 @@ class ShogiBT4v2(nn.Module):
     """
     BT4-v2 Transformer for Shogi.
 
-    Input:  (batch, 48, 9, 9) float tensor
+    Input:  (batch, 148, 9, 9) float tensor
     Output: policy (batch, 2187), wdl (batch, 3), mlh (batch, 1)
     """
 

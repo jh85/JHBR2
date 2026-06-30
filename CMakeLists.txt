@@ -81,10 +81,23 @@ set(DLSHOGI_MCTS_SRCS
 )
 
 if(USE_TENSORRT)
+  # The native TRT backend uses a CUDA kernel to expand bit-packed input
+  # features on the GPU (dlshogi-style). Enable the CUDA language before the
+  # mcts target consumes the .cu source.
+  enable_language(CUDA)
+  set(CMAKE_CUDA_STANDARD 17)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+      set(CMAKE_CUDA_ARCHITECTURES native)
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86)
+    endif()
+  endif()
   set(MCTS_SRCS
     ${LC0_MCTS_SRCS}
     ${DLSHOGI_MCTS_SRCS}
     mcts/nn_tensorrt.cc
+    shogi/encoder_unpack.cu
   )
 else()
   set(MCTS_SRCS

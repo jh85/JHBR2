@@ -15,7 +15,7 @@ PSV format vs pack format differs in:
     where it's absolute.
 
 Output shard format (same as pack_to_shards.py):
-    planes  (N, 48, 9, 9)  float16
+    planes  (N, 148, 9, 9) float16
     policy  (N,)           int32   in [0, 2187), or -1 if move missing
     wdl     (N, 3)         float16 (W, D, L) from side-to-move's view
     mlh     (N,)           int16   raw remaining plies to (recorded)
