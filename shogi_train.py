@@ -442,7 +442,14 @@ def train(args):
         cfg.num_heads = args.heads
 
     model = ShogiBT4v2(cfg).to(device)
-    print(f"Model parameters: {model.count_parameters():,}")
+    log(f"Model parameters: {model.count_parameters():,}")
+    if args.grad_checkpoint:
+        model.gradient_checkpointing = True
+        log("Gradient (activation) checkpointing: ON")
+    accum = max(1, args.grad_accum)
+    if accum > 1:
+        log(f"Grad accumulation: {accum} micro-batches "
+            f"(effective batch = {args.batch * accum * world_size})")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.wd)
@@ -521,6 +528,7 @@ def train(args):
         use_text = True
 
     # --- Training loop ---
+    opt_steps = 0  # persistent optimizer-step count (for warmup with grad-accum)
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0
@@ -556,6 +564,9 @@ def train(args):
                     wdl_target = wdl_target.to(device, non_blocking=True)
                     mlh_target = mlh_target.to(device, non_blocking=True)
 
+                    # Optimizer step on the last micro-batch of each accum window.
+                    step_now = ((n_batches + 1) % accum == 0)
+
                     with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
                         policy_logits, wdl_logits, mlh = model(planes)
 
@@ -580,16 +591,25 @@ def train(args):
                         loss = (policy_loss + args.value_weight * value_loss
                                 + args.mlh_weight * mlh_loss)
 
-                    optimizer.zero_grad()
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    # Divide by accum so grads average over the window. Under DDP,
+                    # skip the all-reduce until the window's final micro-batch.
+                    scaled = scaler.scale(loss / accum)
+                    if is_dist and not step_now:
+                        with model.no_sync():
+                            scaled.backward()
+                    else:
+                        scaled.backward()
 
-                    # Step LR scheduler per batch during warmup
-                    if warmup_steps > 0 and n_batches < warmup_steps:
-                        scheduler.step()
+                    if step_now:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        optimizer.zero_grad(set_to_none=True)
+                        opt_steps += 1
+                        # Step LR scheduler per optimizer step during warmup.
+                        if warmup_steps > 0 and opt_steps <= warmup_steps:
+                            scheduler.step()
 
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
@@ -769,6 +789,12 @@ if __name__ == "__main__":
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
+    parser.add_argument("--grad-accum", type=int, default=1,
+                        help="Accumulate grads over N micro-batches before an "
+                             "optimizer step (effective batch = batch*N*num_gpus)")
+    parser.add_argument("--grad-checkpoint", action="store_true",
+                        help="Activation checkpointing on encoder blocks "
+                             "(much less GPU memory, ~30%% slower)")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient norm clip (1.0=default, 10.0 for from-scratch large models)")
     parser.add_argument("--warmup-steps", type=int, default=0,

@@ -26,6 +26,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from dataclasses import dataclass, field
 
 
@@ -473,6 +474,10 @@ class ShogiBT4v2(nn.Module):
         self.policy_head = DirectionPolicyHead(cfg)
         self.value_head = ValueHead(cfg)
         self.mlh_head = MovesLeftHead(cfg)
+        # Activation checkpointing on the encoder stack (set by the trainer).
+        # Trades ~30% extra compute for a large drop in activation memory,
+        # letting big models train at a usable batch size on smaller GPUs.
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
@@ -488,7 +493,10 @@ class ShogiBT4v2(nn.Module):
     def forward(self, x):
         h = self.embedding(x)
         for enc in self.encoders:
-            h = enc(h)
+            if self.gradient_checkpointing and self.training:
+                h = torch.utils.checkpoint.checkpoint(enc, h, use_reentrant=False)
+            else:
+                h = enc(h)
         policy = self.policy_head(h)
         wdl = self.value_head(h)
         mlh = self.mlh_head(h)
