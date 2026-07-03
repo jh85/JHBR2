@@ -472,28 +472,17 @@ def train(args):
         else:
             print(f"Checkpoint not found: {args.resume}, starting from scratch")
 
-    # Fresh cosine schedule for the remaining epochs.
-    # When resuming, the schedule runs from lr → 0 over (total_epochs - start_epoch) steps.
-    remaining_epochs = args.epochs - start_epoch
-    if remaining_epochs <= 0:
-        remaining_epochs = args.epochs  # safety fallback
-    # Cosine annealing with optional linear warmup.
+    # --- Mixed precision: fp16 (default) or bf16 (--bf16, better for big models) ---
+    amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
+    use_amp = (device.type == 'cuda')
+    # GradScaler is only needed for fp16; bf16 has fp32 range and needs no scaling.
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and not args.bf16))
+    if use_amp:
+        log(f"Autocast: {'bfloat16 (no GradScaler)' if args.bf16 else 'float16 (GradScaler on)'}")
+
     warmup_steps = args.warmup_steps
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=remaining_epochs, last_epoch=-1)
-
-    if warmup_steps > 0:
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer, schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[warmup_steps])
-        print(f"LR warmup: {warmup_steps} steps, then cosine annealing")
-    else:
-        scheduler = cosine_scheduler
-
-    # Mixed precision training (FP16 forward, FP32 gradients).
-    scaler = torch.amp.GradScaler('cuda', enabled=(device.type == 'cuda'))
+    # The LR scheduler (linear warmup + per-STEP cosine) is built after the
+    # dataset below, so T_max can be the true total number of optimizer steps.
 
     # --- Multi-GPU ---
     if is_dist:
@@ -527,8 +516,32 @@ def train(args):
         dataset = ShogiDataset(args.data + ".sfen", move_info_to_idx)
         use_text = True
 
+    # --- LR schedule: linear warmup then per-STEP cosine over ALL optimizer steps ---
+    # Per-step (not per-epoch) so the LR actually glides down after warmup instead
+    # of sitting pinned at the peak for a whole epoch.
+    if use_psv or use_sharded:
+        n_shards = getattr(sharded_dataset, 'num_shards', 1)
+        shard_sz = getattr(sharded_dataset, 'shard_size', None) or 500000
+        approx_positions = n_shards * shard_sz
+    else:
+        approx_positions = len(dataset)
+    steps_per_epoch = max(1, approx_positions // max(1, world_size) // args.batch // accum)
+    total_opt_steps = max(2, (args.epochs - start_epoch) * steps_per_epoch)
+    warmup_steps = min(warmup_steps, total_opt_steps - 1)
+    cosine_steps = max(1, total_opt_steps - warmup_steps)
+    _cosine = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_steps)
+    if warmup_steps > 0:
+        _warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[_warmup, _cosine], milestones=[warmup_steps])
+    else:
+        scheduler = _cosine
+    log(f"LR schedule: {warmup_steps} warmup + {cosine_steps} cosine = "
+        f"{total_opt_steps} optimizer steps (~{steps_per_epoch}/epoch), stepped per-step")
+
     # --- Training loop ---
-    opt_steps = 0  # persistent optimizer-step count (for warmup with grad-accum)
+    opt_steps = 0  # persistent optimizer-step count
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0
@@ -558,6 +571,8 @@ def train(args):
                                         shuffle=True, num_workers=args.workers,
                                         pin_memory=True, drop_last=True)
 
+                shard_loss = 0.0   # windowed: loss over just this shard
+                shard_n = 0
                 for planes, policy_target, wdl_target, mlh_target in loader:
                     planes = planes.to(device, non_blocking=True)
                     policy_target = policy_target.to(device, non_blocking=True)
@@ -567,7 +582,8 @@ def train(args):
                     # Optimizer step on the last micro-batch of each accum window.
                     step_now = ((n_batches + 1) % accum == 0)
 
-                    with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                    with torch.amp.autocast('cuda', dtype=amp_dtype,
+                                            enabled=(device.type == 'cuda')):
                         policy_logits, wdl_logits, mlh = model(planes)
 
                         has_policy = policy_target >= 0
@@ -606,25 +622,31 @@ def train(args):
                         scaler.step(optimizer)
                         scaler.update()
                         optimizer.zero_grad(set_to_none=True)
-                        opt_steps += 1
-                        # Step LR scheduler per optimizer step during warmup.
-                        if warmup_steps > 0 and opt_steps <= warmup_steps:
+                        # Per-step LR schedule (warmup + cosine). Guard against
+                        # stepping cosine past T_max (would ramp the LR back up).
+                        if opt_steps < total_opt_steps:
                             scheduler.step()
+                        opt_steps += 1
 
                     total_loss += loss.item()
                     total_policy_loss += policy_loss.item()
                     total_value_loss += value_loss.item()
                     total_mlh_loss += mlh_loss.item()
+                    shard_loss += loss.item()
+                    shard_n += 1
                     n_batches += 1
 
-                # Print after each shard (aggregate throughput across ranks)
+                # Print after each shard: current-shard loss (live signal) plus
+                # the cumulative epoch average and current LR.
                 elapsed = time.time() - t0
                 samples = n_batches * args.batch * world_size
                 speed = samples / max(elapsed, 1)
-                avg_loss = total_loss / max(n_batches, 1)
-                log(f"  Epoch {epoch+1} shard {shard_id:03d}: "
-                    f"loss={avg_loss:.4f} "
-                    f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
+                cur_loss = shard_loss / max(shard_n, 1)
+                cum_loss = total_loss / max(n_batches, 1)
+                cur_lr = scheduler.get_last_lr()[0]
+                log(f"  Epoch {epoch+1} shard {shard_id:03d}: loss={cur_loss:.4f} "
+                    f"(cum {cum_loss:.4f}, lr {cur_lr:.2e}, "
+                    f"{samples/1e6:.1f}M, {speed:.0f}/s)")
         else:
             # Text dataset: single loader for entire epoch
             loader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
@@ -635,7 +657,8 @@ def train(args):
                 policy_target = policy_target.to(device, non_blocking=True)
                 wdl_target = wdl_target.to(device, non_blocking=True)
 
-                with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                with torch.amp.autocast('cuda', dtype=amp_dtype,
+                                        enabled=(device.type == 'cuda')):
                     policy_logits, wdl_logits, mlh = model(planes)
 
                     has_policy = policy_target >= 0
@@ -654,6 +677,9 @@ def train(args):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
+                if opt_steps < total_opt_steps:
+                    scheduler.step()
+                opt_steps += 1
 
                 total_loss += loss.item()
                 total_policy_loss += policy_loss.item()
@@ -668,8 +694,6 @@ def train(args):
                     print(f"  Epoch {epoch+1} batch {n_batches}: "
                           f"loss={avg_loss:.4f} "
                           f"({samples/1e6:.1f}M samples, {speed:.0f} samples/sec)")
-
-        scheduler.step()
 
         elapsed = time.time() - t0
         samples_per_sec = (n_batches * args.batch * world_size) / max(elapsed, 1)
@@ -795,6 +819,9 @@ if __name__ == "__main__":
     parser.add_argument("--grad-checkpoint", action="store_true",
                         help="Activation checkpointing on encoder blocks "
                              "(much less GPU memory, ~30%% slower)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Use bfloat16 autocast instead of fp16 (fp32 range, "
+                             "no GradScaler; more stable for big models on Ampere+)")
     parser.add_argument("--grad-clip", type=float, default=1.0,
                         help="Gradient norm clip (1.0=default, 10.0 for from-scratch large models)")
     parser.add_argument("--warmup-steps", type=int, default=0,
