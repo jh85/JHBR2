@@ -541,7 +541,8 @@ def train(args):
         f"{total_opt_steps} optimizer steps (~{steps_per_epoch}/epoch), stepped per-step")
 
     # --- Training loop ---
-    opt_steps = 0  # persistent optimizer-step count
+    opt_steps = 0    # persistent optimizer-step count
+    n_skipped = 0    # optimizer steps skipped due to non-finite gradients
     for epoch in range(start_epoch, args.epochs):
         model.train()
         total_loss = 0
@@ -618,8 +619,15 @@ def train(args):
 
                     if step_now:
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                        scaler.step(optimizer)
+                        gnorm = torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), args.grad_clip)
+                        # Skip the update on a non-finite gradient. Essential with
+                        # --bf16 (no GradScaler to auto-skip): one NaN/Inf step can
+                        # collapse a deep model to constant output.
+                        if torch.isfinite(gnorm):
+                            scaler.step(optimizer)
+                        else:
+                            n_skipped += 1
                         scaler.update()
                         optimizer.zero_grad(set_to_none=True)
                         # Per-step LR schedule (warmup + cosine). Guard against
@@ -708,6 +716,7 @@ def train(args):
             f"value={avg_value:.4f}  "
             f"mlh={avg_mlh:.4f}  "
             f"lr={lr:.6f}  "
+            f"skipped={n_skipped}  "
             f"time={elapsed:.1f}s  "
             f"speed={samples_per_sec:.0f} samples/sec")
 
