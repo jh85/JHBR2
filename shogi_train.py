@@ -442,6 +442,8 @@ def train(args):
         cfg.num_heads = args.heads
     if args.gated_attention:
         cfg.gated_attention = True
+    if args.pre_norm:
+        cfg.pre_norm = True
 
     model = ShogiBT4v2(cfg).to(device)
     log(f"Model parameters: {model.count_parameters():,}")
@@ -822,6 +824,9 @@ if __name__ == "__main__":
     parser.add_argument("--gated-attention", action="store_true",
                         help="Sigmoid-gate the attention output (Qwen-style); "
                              "improves deep-training stability")
+    parser.add_argument("--pre-norm", action="store_true",
+                        help="Pre-norm residuals instead of post-norm; much more "
+                             "stable for deep encoder stacks")
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--save-dir", default=".", help="Directory for checkpoint files")
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")

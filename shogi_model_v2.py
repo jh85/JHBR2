@@ -173,6 +173,9 @@ class ShogiBT4v2Config:
     # attention output, conditioned on the block input. Suppresses attention
     # sinks / massive activations → more stable deep training. Off by default.
     gated_attention: bool = False
+    # Pre-norm residuals (norm the input, add the raw residual) instead of the
+    # default post-norm. Much more stable for deep stacks. Off by default.
+    pre_norm: bool = False
 
     # Policy head (direction-based, 2187 outputs)
     policy_d_model: int = 256
@@ -282,20 +285,30 @@ class EncoderBlock(nn.Module):
         self.ffn_ln = make_norm(d, cfg)
         self.cfg = cfg
 
-    def forward(self, x):
-        B, S, D = x.shape
+    def _attention(self, a):
+        """Multi-head attention (+ smolgen bias, + optional gate) on input `a`.
+        Returns the projected output, before any residual add."""
         heads = self.cfg.num_heads
-        depth = D // heads
-        smol_bias = self.smolgen(x)
-        Q = self.q_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
-        K = self.k_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
-        V = self.v_proj(x).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
+        depth = a.shape[-1] // heads
+        smol_bias = self.smolgen(a)
+        Q = self.q_proj(a).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
+        K = self.k_proj(a).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
+        V = self.v_proj(a).unflatten(2, (heads, depth)).permute(0, 2, 1, 3)
         attn = (Q @ K.transpose(-2, -1)) / math.sqrt(depth) + smol_bias
         attn = F.softmax(attn, dim=-1)
         out = (attn @ V).permute(0, 2, 1, 3).flatten(2)
         if self.gate_proj is not None:
-            out = out * torch.sigmoid(self.gate_proj(x))  # gated attention
-        h = self.ln1(self.out_proj(out) + x)
+            out = out * torch.sigmoid(self.gate_proj(a))  # gated attention
+        return self.out_proj(out)
+
+    def forward(self, x):
+        if self.cfg.pre_norm:
+            # Pre-norm: normalize the input, add the raw residual.
+            h = x + self._attention(self.ln1(x))
+            h = h + self.ffn2(self.ffn_act(self.ffn1(self.ffn_ln(h))))
+            return h
+        # Post-norm (default): normalize after the residual add.
+        h = self.ln1(self._attention(x) + x)
         f = self.ffn_act(self.ffn1(h))
         h = self.ffn_ln(self.ffn2(f) + h)
         return h
@@ -479,6 +492,9 @@ class ShogiBT4v2(nn.Module):
             EncoderBlock(cfg, self.smolgen_global)
             for _ in range(cfg.num_encoders)
         ])
+        # Pre-norm leaves the residual stream unnormalized after the last block,
+        # so normalize once before the heads.
+        self.final_norm = make_norm(cfg.embedding_size, cfg) if cfg.pre_norm else None
         self.policy_head = DirectionPolicyHead(cfg)
         self.value_head = ValueHead(cfg)
         self.mlh_head = MovesLeftHead(cfg)
@@ -510,6 +526,8 @@ class ShogiBT4v2(nn.Module):
                 h = torch.utils.checkpoint.checkpoint(enc, h, use_reentrant=False)
             else:
                 h = enc(h)
+        if self.final_norm is not None:
+            h = self.final_norm(h)
         policy = self.policy_head(h)
         wdl = self.value_head(h)
         mlh = self.mlh_head(h)
