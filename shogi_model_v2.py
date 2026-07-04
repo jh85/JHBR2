@@ -169,6 +169,10 @@ class ShogiBT4v2Config:
     smolgen_hidden: int = 64
     smolgen_compress: int = 8
     smolgen_gen_size: int = 64
+    # Gated attention (Qwen-2025 style): a per-element sigmoid gate on the
+    # attention output, conditioned on the block input. Suppresses attention
+    # sinks / massive activations → more stable deep training. Off by default.
+    gated_attention: bool = False
 
     # Policy head (direction-based, 2187 outputs)
     policy_d_model: int = 256
@@ -268,6 +272,8 @@ class EncoderBlock(nn.Module):
         self.k_proj = nn.Linear(d, d, bias=not no_qkv_bias)
         self.v_proj = nn.Linear(d, d, bias=not no_qkv_bias)
         self.out_proj = nn.Linear(d, d)
+        # Gated attention: sigmoid gate on the SDPA output, conditioned on x.
+        self.gate_proj = nn.Linear(d, d) if cfg.gated_attention else None
         self.ln1 = make_norm(d, cfg)
         self.smolgen = Smolgen(cfg, global_gen)
         self.ffn1 = nn.Linear(d, cfg.ffn_hidden)
@@ -287,6 +293,8 @@ class EncoderBlock(nn.Module):
         attn = (Q @ K.transpose(-2, -1)) / math.sqrt(depth) + smol_bias
         attn = F.softmax(attn, dim=-1)
         out = (attn @ V).permute(0, 2, 1, 3).flatten(2)
+        if self.gate_proj is not None:
+            out = out * torch.sigmoid(self.gate_proj(x))  # gated attention
         h = self.ln1(self.out_proj(out) + x)
         f = self.ffn_act(self.ffn1(h))
         h = self.ffn_ln(self.ffn2(f) + h)
@@ -479,6 +487,11 @@ class ShogiBT4v2(nn.Module):
         # letting big models train at a usable batch size on smaller GPUs.
         self.gradient_checkpointing = False
         self._init_weights()
+        # Start attention gates near "open" (sigmoid(3)≈0.95) so gated attention
+        # begins as a near-identity change and only learns to close where useful.
+        if cfg.gated_attention:
+            for enc in self.encoders:
+                nn.init.constant_(enc.gate_proj.bias, 3.0)
 
     def _init_weights(self):
         for m in self.modules():
