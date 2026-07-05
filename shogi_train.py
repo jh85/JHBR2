@@ -37,6 +37,9 @@ except Exception:
 from shogi_model_v2 import (ShogiBT4v2, ShogiBT4v2Config,
                             make_direction_policy_index, POLICY_SIZE,
                             NUM_DIRECTIONS, NUM_PROMO_DIRECTIONS)
+# unpack_planes is pure numpy (no compiled .so needed) — safe to import for
+# loading packed shards on any training machine.
+import jhbr2_encoder
 
 
 # =====================================================================
@@ -235,32 +238,43 @@ class ShardedDataset(Dataset):
             raise FileNotFoundError(f"No shard files found: {prefix}_*.npz")
 
         self.num_shards = len(self.shard_paths)
+        self.packed = False               # bit-packed format? (auto-detected)
+        self.packed1 = self.packed2 = None
         self.planes = None
         self.policy = None
         self.wdl = None
         self.mlh = None
         self.current_shard = -1
 
-        # Load first shard to get the count
+        # Load first shard to get the count + format.
         self.load_shard(0)
-        self.shard_size = len(self.planes)
+        self.shard_size = len(self.policy)
 
+        if self.packed:
+            gb = self.shard_size * 299 / 1e9
+            fmt = f"packed bit (~{gb:.2f} GB/shard in RAM)"
+        else:
+            gb = self.shard_size * 148 * 81 * 2 / 1e9
+            fmt = f"float16 planes (~{gb:.1f} GB/shard in RAM)"
         print(f"Found {self.num_shards} shards, ~{self.shard_size:,} positions each")
-        print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions "
-              f"(memory: ~{self.shard_size * 148 * 81 * 2 / 1e9:.1f} GB per shard)")
+        print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions, {fmt}")
 
     def load_shard(self, shard_id):
         """Load a specific shard into memory (frees the previous one)."""
         if shard_id == self.current_shard:
             return
         # Free previous shard
-        self.planes = None
-        self.policy = None
-        self.wdl = None
-        self.mlh = None
+        self.planes = self.packed1 = self.packed2 = None
+        self.policy = self.wdl = self.mlh = None
 
         data = np.load(self.shard_paths[shard_id])
-        self.planes = data['planes']
+        if 'packed1' in data.files:          # bit-packed shard
+            self.packed = True
+            self.packed1 = data['packed1']
+            self.packed2 = data['packed2']
+        else:                                # float16 planes shard
+            self.packed = False
+            self.planes = data['planes']
         self.policy = data['policy']
         self.wdl = data['wdl']
         # mlh = remaining plies to game end (int16). Older shards may omit it.
@@ -279,13 +293,18 @@ class ShardedDataset(Dataset):
         return order
 
     def __len__(self):
-        return len(self.planes)
+        return len(self.policy)
 
     def __getitem__(self, idx):
         # mlh target: remaining plies, or -1 sentinel ("no MLH target") for
         # shards without an mlh array (loss masks these out).
         mlh = float(self.mlh[idx]) if self.mlh is not None else -1.0
-        return (torch.from_numpy(self.planes[idx].astype(np.float32)),
+        if self.packed:
+            # Unpack this position's bits -> (148,9,9) float32 (pure numpy).
+            planes = jhbr2_encoder.unpack_planes(self.packed1[idx], self.packed2[idx])
+        else:
+            planes = self.planes[idx].astype(np.float32)
+        return (torch.from_numpy(np.ascontiguousarray(planes, dtype=np.float32)),
                 torch.tensor(self.policy[idx], dtype=torch.long),
                 torch.tensor(self.wdl[idx], dtype=torch.float32),
                 torch.tensor(mlh, dtype=torch.float32))

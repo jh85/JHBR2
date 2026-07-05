@@ -27,6 +27,26 @@ void jhbr2_init() {
 }
 
 int jhbr2_num_planes() { return kShogiInputPlanes; }
+int jhbr2_packed_f1_bytes() { return kPackedF1Bytes; }
+int jhbr2_packed_f2_bytes() { return kPackedF2Bytes; }
+
+// Pack `n` SFENs into bit buffers: out1 (n * kPackedF1Bytes), out2 (n *
+// kPackedF2Bytes). Malformed SFEN -> all-zero block. Returns count packed OK.
+int jhbr2_pack_sfens(const char** sfens, int n,
+                     unsigned char* out1, unsigned char* out2) {
+  int ok = 0;
+  for (int i = 0; i < n; ++i) {
+    unsigned char* d1 = out1 + static_cast<size_t>(i) * kPackedF1Bytes;
+    unsigned char* d2 = out2 + static_cast<size_t>(i) * kPackedF2Bytes;
+    std::memset(d1, 0, kPackedF1Bytes);
+    std::memset(d2, 0, kPackedF2Bytes);
+    ShogiBoard b;
+    if (sfens[i] == nullptr || !b.SetFromSfen(sfens[i])) continue;
+    PackShogiPosition(b, d1, d2);  // fills the two bit buffers
+    ++ok;
+  }
+  return ok;
+}
 
 // Encode `n` SFEN strings into `out` (n * kShogiInputPlanes * 81 floats).
 // A malformed SFEN yields an all-zero block. Returns the number encoded OK.

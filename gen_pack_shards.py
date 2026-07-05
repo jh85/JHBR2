@@ -107,32 +107,51 @@ def position_meta(board, move_raw, score, game_result_abs, eval_coef):
     return sfen, policy_idx, wdl
 
 
-def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
+def flush_shard(shard_id, output_dir, arrays):
+    """Write one shard. `arrays` is the dict of named arrays to store."""
     out_path = os.path.join(output_dir, f"shard_{shard_id:06d}.npz")
-    np.savez_compressed(
-        out_path,
-        planes=np.asarray(planes, dtype=np.float16),
-        policy=np.asarray(policy, dtype=np.int32),
-        wdl=np.asarray(wdl, dtype=np.float16),
-        mlh=np.asarray(mlh, dtype=np.int16),
-    )
+    np.savez_compressed(out_path, **arrays)
     return out_path
 
 
 def process_pack_file(task):
     """Process one .pack file into one or more shards."""
-    pack_path, shard_id_base, output_dir, shard_size, eval_coef, limit = task
+    (pack_path, shard_id_base, output_dir, shard_size, eval_coef, limit,
+     packed) = task
 
     with open(pack_path, "rb") as f:
         decoder = GameDataDecoder(bytearray(f.read()))
 
-    planes_buf, policy_buf, wdl_buf, mlh_buf = [], [], [], []
+    # Feature buffers: packed format stores two bit arrays; else float16 planes.
+    p1_buf, p2_buf, planes_buf = [], [], []
+    policy_buf, wdl_buf, mlh_buf = [], [], []
     shard_id = shard_id_base
     written = errors = games = skipped_games = 0
     board = cshogi.Board()
 
+    def n_buf():
+        return len(p1_buf) if packed else len(planes_buf)
+
+    def do_flush():
+        nonlocal shard_id, written, p1_buf, p2_buf, planes_buf
+        nonlocal policy_buf, wdl_buf, mlh_buf
+        common = dict(policy=np.asarray(policy_buf, dtype=np.int32),
+                      wdl=np.asarray(wdl_buf, dtype=np.float16),
+                      mlh=np.asarray(mlh_buf, dtype=np.int16))
+        if packed:
+            flush_shard(shard_id, output_dir, dict(
+                packed1=np.asarray(p1_buf, dtype=np.uint8),
+                packed2=np.asarray(p2_buf, dtype=np.uint8), **common))
+        else:
+            flush_shard(shard_id, output_dir, dict(
+                planes=np.asarray(planes_buf, dtype=np.float16), **common))
+        written += n_buf()
+        p1_buf, p2_buf, planes_buf = [], [], []
+        policy_buf, wdl_buf, mlh_buf = [], [], []
+        shard_id += 1
+
     while not decoder.eof():
-        if limit and written + len(planes_buf) >= limit:
+        if limit and written + n_buf() >= limit:
             break
 
         # PHASE 1: read one whole game. A decoder failure here is unrecoverable
@@ -183,21 +202,24 @@ def process_pack_file(task):
                     errors += 1
                     break
 
-            # Batch-encode this game's planes (fast C++ path), then buffer/flush.
+            # Batch-encode this game (fast C++ path), then buffer/flush.
             if g_sfens:
-                g_planes = encode_planes(g_sfens)
+                if packed:
+                    gp1, gp2 = jhbr2_encoder.pack_sfens(g_sfens)
+                else:
+                    g_planes = encode_planes(g_sfens)
                 for k in range(len(g_sfens)):
-                    planes_buf.append(g_planes[k])
+                    if packed:
+                        p1_buf.append(gp1[k])
+                        p2_buf.append(gp2[k])
+                    else:
+                        planes_buf.append(g_planes[k])
                     policy_buf.append(g_policy[k])
                     wdl_buf.append(g_wdl[k])
                     mlh_buf.append(g_mlh[k])
-                    if len(planes_buf) >= shard_size:
-                        flush_shard(shard_id, output_dir, planes_buf,
-                                    policy_buf, wdl_buf, mlh_buf)
-                        written += len(planes_buf)
-                        planes_buf, policy_buf, wdl_buf, mlh_buf = [], [], [], []
-                        shard_id += 1
-                if limit and written + len(planes_buf) >= limit:
+                    if n_buf() >= shard_size:
+                        do_flush()
+                if limit and written + n_buf() >= limit:
                     break
         except Exception as e:
             skipped_games += 1
@@ -205,11 +227,8 @@ def process_pack_file(task):
                 print(f"  {pack_path}: skipped game {games}: "
                       f"{type(e).__name__}: {e}", file=sys.stderr)
 
-    if planes_buf:
-        flush_shard(shard_id, output_dir, planes_buf,
-                    policy_buf, wdl_buf, mlh_buf)
-        written += len(planes_buf)
-        shard_id += 1
+    if n_buf():
+        do_flush()
 
     return pack_path, games, written, errors, skipped_games
 
@@ -226,7 +245,17 @@ def main():
                    help="Sigmoid coefficient mapping centipawns -> win rate")
     p.add_argument("--limit", type=int, default=0,
                    help="Max positions per pack file (0 = unlimited). For tests.")
+    p.add_argument("--packed", action="store_true",
+                   help="Store bit-packed planes (299 B/pos) instead of float16. "
+                        "Much faster (no heavy compression) and ~80x less RAM "
+                        "when training; the loader unpacks per-item. Needs the "
+                        "C++ encoder (bash pyext/build.sh).")
     args = p.parse_args()
+
+    if args.packed and not FAST_ENCODER:
+        print("ERROR: --packed requires the C++ encoder. Build it first:\n"
+              "  bash pyext/build.sh", file=sys.stderr)
+        return
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -245,12 +274,13 @@ def main():
         print("Encoder: C++ (pyext/libjhbr2_encoder.so) — fast")
     else:
         print("Encoder: pure Python (SLOW). Build the fast one: bash pyext/build.sh")
+    print(f"Shard format: {'packed (bit-packed, 299 B/pos)' if args.packed else 'float16 planes'}")
 
     # Each file gets its own block of shard IDs so workers never collide.
     PER_FILE_SHARD_BUDGET = 100_000
     tasks = [
         (path, idx * PER_FILE_SHARD_BUDGET, args.output_dir,
-         args.shard_size, args.eval_coef, args.limit)
+         args.shard_size, args.eval_coef, args.limit, args.packed)
         for idx, path in enumerate(pack_files)
     ]
 
