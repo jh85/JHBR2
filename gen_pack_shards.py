@@ -50,15 +50,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "YaneuraOu-ScriptCollection", "GenSfen"))
 from shogi_train import sfen_to_planes, move_to_policy_index
 from ShogiCommonLib import GameDataDecoder
+import jhbr2_encoder
 
 POLICY_SIZE = 2187
+# Fast C++ encoder (pyext/libjhbr2_encoder.so) if built, else Python fallback.
+# ~50x faster; produces bit-identical planes. Build with: bash pyext/build.sh
+FAST_ENCODER = jhbr2_encoder.available()
 
 
-def encode_position(board, move_raw, score, game_result_abs, eval_coef):
+def encode_planes(sfens):
+    """Batch-encode a list of SFENs -> (N, 148, 9, 9) float16.
+
+    Uses the compiled C++ encoder when available (bit-identical to
+    sfen_to_planes), else falls back to pure Python."""
+    if not sfens:
+        return np.empty((0, 148, 9, 9), dtype=np.float16)
+    if FAST_ENCODER:
+        return jhbr2_encoder.encode_sfens(sfens).astype(np.float16)
+    return np.stack([sfen_to_planes(s) for s in sfens]).astype(np.float16)
+
+
+def position_meta(board, move_raw, score, game_result_abs, eval_coef):
     """
-    Encode the current `board` state into (planes, policy_idx, wdl), or None if
-    the move is missing/unmappable. `board` is a live cshogi.Board, so we read
-    the check flag from it directly instead of rebuilding a board per position.
+    Compute (sfen, policy_idx, wdl) for the current `board` state, or None if
+    the move is missing/unmappable. Planes are encoded separately, in a batch
+    per game (the C++ encoder computes the check plane itself, so we no longer
+    read it from the cshogi board here).
 
     game_result_abs: 0=draw, 1=BLACK win, 2=WHITE win (absolute).
     """
@@ -72,10 +89,6 @@ def encode_position(board, move_raw, score, game_result_abs, eval_coef):
     policy_idx = move_to_policy_index(cshogi.move_to_usi(move_raw), flip)
     if policy_idx < 0 or policy_idx >= POLICY_SIZE:
         return None
-
-    # Reuse the live board's check status for the check plane (avoids a
-    # redundant cshogi.Board(sfen) construction inside sfen_to_planes).
-    planes = sfen_to_planes(sfen, in_check=board.is_check())
 
     # WDL target from the side-to-move's perspective.
     if game_result_abs == 0:
@@ -91,7 +104,7 @@ def encode_position(board, move_raw, score, game_result_abs, eval_coef):
            0.0 + 0.3 * hard[1],
            0.7 * (1.0 - win_rate) + 0.3 * hard[2])
 
-    return planes, policy_idx, wdl
+    return sfen, policy_idx, wdl
 
 
 def flush_shard(shard_id, output_dir, planes, policy, wdl, mlh):
@@ -150,33 +163,40 @@ def process_pack_file(task):
         # only loses this one game.
         try:
             board.set_sfen(sfen)
+            # Collect per-position metadata; encode planes in one batch per game.
+            g_sfens, g_policy, g_wdl, g_mlh = [], [], [], []
             for i, (move, eval16) in enumerate(game_kif):
                 mlh_target = n_moves - i - 1   # raw remaining plies (no clip)
-
-                rec = encode_position(board, move, eval16, game_result_abs,
-                                      eval_coef)
+                rec = position_meta(board, move, eval16, game_result_abs,
+                                    eval_coef)
                 if rec is None:
                     errors += 1
                 else:
-                    planes, policy_idx, wdl = rec
-                    planes_buf.append(planes)
-                    policy_buf.append(policy_idx)
-                    wdl_buf.append(wdl)
-                    mlh_buf.append(mlh_target)
-
+                    s, policy_idx, wdl = rec
+                    g_sfens.append(s)
+                    g_policy.append(policy_idx)
+                    g_wdl.append(wdl)
+                    g_mlh.append(mlh_target)
                 try:
                     board.push_move16(move)
                 except Exception:
                     errors += 1
                     break
 
-                if len(planes_buf) >= shard_size:
-                    flush_shard(shard_id, output_dir, planes_buf,
-                                policy_buf, wdl_buf, mlh_buf)
-                    written += len(planes_buf)
-                    planes_buf, policy_buf, wdl_buf, mlh_buf = [], [], [], []
-                    shard_id += 1
-
+            # Batch-encode this game's planes (fast C++ path), then buffer/flush.
+            if g_sfens:
+                g_planes = encode_planes(g_sfens)
+                for k in range(len(g_sfens)):
+                    planes_buf.append(g_planes[k])
+                    policy_buf.append(g_policy[k])
+                    wdl_buf.append(g_wdl[k])
+                    mlh_buf.append(g_mlh[k])
+                    if len(planes_buf) >= shard_size:
+                        flush_shard(shard_id, output_dir, planes_buf,
+                                    policy_buf, wdl_buf, mlh_buf)
+                        written += len(planes_buf)
+                        planes_buf, policy_buf, wdl_buf, mlh_buf = [], [], [], []
+                        shard_id += 1
                 if limit and written + len(planes_buf) >= limit:
                     break
         except Exception as e:
@@ -221,6 +241,10 @@ def main():
 
     print(f"Found {len(pack_files)} .pack files, workers={args.workers}, "
           f"shard_size={args.shard_size}, limit={args.limit or 'none'}")
+    if FAST_ENCODER:
+        print("Encoder: C++ (pyext/libjhbr2_encoder.so) — fast")
+    else:
+        print("Encoder: pure Python (SLOW). Build the fast one: bash pyext/build.sh")
 
     # Each file gets its own block of shard IDs so workers never collide.
     PER_FILE_SHARD_BUDGET = 100_000
