@@ -799,6 +799,7 @@ def train(args):
         # Save checkpoint (rank 0 only)
         if (epoch + 1) % args.save_every == 0 and is_main:
             raw_model = model.module if hasattr(model, 'module') else model
+            os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"shogi_bt4_epoch{epoch+1}.pt")
             torch.save({
                 'epoch': epoch + 1,
