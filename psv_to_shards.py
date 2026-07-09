@@ -74,7 +74,11 @@ def encode_one_psv(board, psv_record, eval_coef):
     move_raw = int(psv_record['move'])
     if move_raw == 0:
         return None
-    move_usi = cshogi.move_to_usi(move_raw)
+    # PSV stores YaneuraOu-format Move16; drops and promotions use different
+    # bit patterns than cshogi's encoding. Convert first (as the reference
+    # YaneuraOu-ScriptCollection converter does) — decoding the raw value
+    # silently corrupts ~40% of policy targets (all drops/promotions).
+    move_usi = cshogi.move_to_usi(cshogi.move16_from_psv(move_raw))
     policy_idx = move_to_policy_index(move_usi, flip)
     if policy_idx < 0 or policy_idx >= 2187:
         return None

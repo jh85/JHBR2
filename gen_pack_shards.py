@@ -45,11 +45,23 @@ from multiprocessing import Pool
 import numpy as np
 import cshogi
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "YaneuraOu-ScriptCollection", "GenSfen"))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# GameDataDecoder (the .pack reader) lives in YaneuraOu-ScriptCollection —
+# module YaneShogiLib in CommonLib; older layouts exposed it as
+# GenSfen/ShogiCommonLib. Search both, next to and above this repo.
+for _cand in (
+        os.path.join(_HERE, "YaneuraOu-ScriptCollection", "CommonLib"),
+        os.path.join(_HERE, "YaneuraOu-ScriptCollection", "GenSfen"),
+        os.path.join(os.path.dirname(_HERE), "YaneuraOu-ScriptCollection",
+                     "CommonLib")):
+    if os.path.isdir(_cand):
+        sys.path.insert(0, _cand)
 from shogi_train import sfen_to_planes, move_to_policy_index
-from ShogiCommonLib import GameDataDecoder
+try:
+    from YaneShogiLib import GameDataDecoder
+except ImportError:
+    from ShogiCommonLib import GameDataDecoder
 import jhbr2_encoder
 
 POLICY_SIZE = 2187

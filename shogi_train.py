@@ -227,6 +227,12 @@ class ShardedDataset(Dataset):
         for shard_id in dataset.shard_order():
             dataset.load_shard(shard_id)
             # train on this shard
+
+    Shards may carry either a hard policy label (`policy`, one class index per
+    sample) or an aggregated sparse policy distribution (`policy_indices` /
+    `policy_weights` / `policy_offsets`, written by gen_agg_shards.py). For
+    the latter, __getitem__ returns a dense normalized (2187,) float vector
+    and the trainer uses a soft cross-entropy.
     """
 
     def __init__(self, prefix):
@@ -244,6 +250,8 @@ class ShardedDataset(Dataset):
         self.policy = None
         self.wdl = None
         self.mlh = None
+        self.sparse_policy = False        # aggregated shards (auto-detected)
+        self.p_idx = self.p_wt = self.p_off = None
         self.current_shard = -1
 
         # Load first shard to get the count + format.
@@ -266,6 +274,7 @@ class ShardedDataset(Dataset):
         # Free previous shard
         self.planes = self.packed1 = self.packed2 = None
         self.policy = self.wdl = self.mlh = None
+        self.p_idx = self.p_wt = self.p_off = None
 
         data = np.load(self.shard_paths[shard_id])
         if 'packed1' in data.files:          # bit-packed shard
@@ -276,6 +285,12 @@ class ShardedDataset(Dataset):
             self.packed = False
             self.planes = data['planes']
         self.policy = data['policy']
+        # Aggregated shards (gen_agg_shards.py): sparse policy distribution.
+        self.sparse_policy = 'policy_indices' in data.files
+        if self.sparse_policy:
+            self.p_idx = data['policy_indices']
+            self.p_wt = data['policy_weights']
+            self.p_off = data['policy_offsets']
         self.wdl = data['wdl']
         # mlh = remaining plies to game end (int16). Older shards may omit it.
         self.mlh = data['mlh'] if 'mlh' in data.files else None
@@ -304,8 +319,17 @@ class ShardedDataset(Dataset):
             planes = jhbr2_encoder.unpack_planes(self.packed1[idx], self.packed2[idx])
         else:
             planes = self.planes[idx].astype(np.float32)
+        if self.sparse_policy:
+            # Expand the sparse distribution to a dense soft target.
+            vec = np.zeros(POLICY_SIZE, dtype=np.float32)
+            s, e = self.p_off[idx], self.p_off[idx + 1]
+            vec[self.p_idx[s:e].astype(np.int64)] = \
+                self.p_wt[s:e].astype(np.float32)
+            policy = torch.from_numpy(vec)
+        else:
+            policy = torch.tensor(self.policy[idx], dtype=torch.long)
         return (torch.from_numpy(np.ascontiguousarray(planes, dtype=np.float32)),
-                torch.tensor(self.policy[idx], dtype=torch.long),
+                policy,
                 torch.tensor(self.wdl[idx], dtype=torch.float32),
                 torch.tensor(mlh, dtype=torch.float32))
 
@@ -610,12 +634,26 @@ def train(args):
                                             enabled=(device.type == 'cuda')):
                         policy_logits, wdl_logits, mlh = model(planes)
 
-                        has_policy = policy_target >= 0
-                        if has_policy.any():
-                            policy_loss = F.cross_entropy(
-                                policy_logits[has_policy], policy_target[has_policy])
+                        if policy_target.dim() > 1:
+                            # Aggregated shards: soft cross-entropy against a
+                            # normalized move distribution. Samples with an
+                            # empty distribution (shouldn't occur) are masked.
+                            has_policy = policy_target.sum(dim=-1) > 0
+                            if has_policy.any():
+                                logp = F.log_softmax(
+                                    policy_logits[has_policy].float(), dim=-1)
+                                policy_loss = -(policy_target[has_policy]
+                                                * logp).sum(dim=-1).mean()
+                            else:
+                                policy_loss = torch.tensor(0.0, device=device)
                         else:
-                            policy_loss = torch.tensor(0.0, device=device)
+                            has_policy = policy_target >= 0
+                            if has_policy.any():
+                                policy_loss = F.cross_entropy(
+                                    policy_logits[has_policy],
+                                    policy_target[has_policy])
+                            else:
+                                policy_loss = torch.tensor(0.0, device=device)
 
                         value_loss = F.cross_entropy(wdl_logits, wdl_target)
 
