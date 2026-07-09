@@ -157,8 +157,12 @@ def extract_pack_file(task):
     (path, file_id, tmp_dir, n_partitions, limit) = task
     from YaneShogiLib import GameDataDecoder   # resolved via --script-lib path
 
-    with open(path, "rb") as f:
-        decoder = GameDataDecoder(bytearray(f.read()))
+    # mmap instead of f.read(): the decoder only slices, so this keeps
+    # per-worker RAM flat instead of one whole .pack file per worker.
+    import mmap
+    f = open(path, "rb")
+    decoder = GameDataDecoder(
+        mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ))
 
     writer = PartitionWriter(tmp_dir, n_partitions, file_id)
     board = cshogi.Board()
@@ -213,6 +217,7 @@ def extract_pack_file(task):
             stats["skipped_games"] += 1
 
     writer.close()
+    f.close()
     return path, dict(stats)
 
 
