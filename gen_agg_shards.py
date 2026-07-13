@@ -621,9 +621,11 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pack-dir", help="Directory of .pack files")
+    p.add_argument("--pack-dir",
+                   help="Directory of .pack files (searched recursively)")
     p.add_argument("--pack-glob", default="*.pack")
-    p.add_argument("--psv-dir", help="Directory of .bin (PSV) files")
+    p.add_argument("--psv-dir",
+                   help="Directory of .bin (PSV) files (searched recursively)")
     p.add_argument("--psv-glob", default="*.bin")
     p.add_argument("--output-dir", required=True)
     p.add_argument("--shard-size", type=int, default=500_000)
@@ -668,9 +670,11 @@ def main():
         return 1
 
     pack_files = sorted(globmod.glob(os.path.join(
-        args.pack_dir, args.pack_glob))) if args.pack_dir else []
+        args.pack_dir, "**", args.pack_glob),
+        recursive=True)) if args.pack_dir else []
     psv_files = sorted(globmod.glob(os.path.join(
-        args.psv_dir, args.psv_glob))) if args.psv_dir else []
+        args.psv_dir, "**", args.psv_glob),
+        recursive=True)) if args.psv_dir else []
     if not pack_files and not psv_files:
         print("No input files found.", file=sys.stderr)
         return 1
