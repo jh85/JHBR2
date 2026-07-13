@@ -66,7 +66,16 @@ def main():
                 out.type.tensor_type.shape.dim[0].ClearField("dim_value")
             onnx.save(m, onnx_name)
             print("Fixed — batch dim is now dynamic")
-    else:
-        print("done")
+
+    # TensorRT 11 removed trtexec --fp16; precision must be baked into the ONNX.
+    # AutoCast keeps numerically sensitive nodes (softmax/layernorm) in FP32
+    # and keep_io_types leaves the input/output bindings as FP32.
+    import onnx
+    from modelopt.onnx.autocast import convert_to_mixed_precision
+    fp16_name = Path(onnx_name).stem + "_fp16.onnx"
+    m = convert_to_mixed_precision(onnx_name, low_precision_type="fp16",
+                                   keep_io_types=True)
+    onnx.save(m, fp16_name)
+    print(f"done: {onnx_name} (fp32), {fp16_name} (mixed precision, for TensorRT 11)")
 
 main()
