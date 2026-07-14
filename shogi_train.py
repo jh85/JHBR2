@@ -10,6 +10,15 @@ Example:
 
 Usage:
     python shogi_train.py --data train.sfen --epochs 10 --batch 64
+
+Multi-GPU (DDP, one process per GPU; e.g. 8x RTX 5090):
+    torchrun --nproc_per_node=8 shogi_train.py \
+        --data ../shards2/aggshard --epochs 1 --lr 3e-4 --warmup-steps 4000 \
+        --grad-clip 0.5 --bf16 --pre-norm --gated-attention \
+        --d-model 1024 --encoders 20 --heads 16 \
+        --batch 128 --grad-accum 1 --workers 12 \
+        --save-dir checkpoints/ --save-every 1 \
+        --log-csv run.csv --log-file run.log
 """
 
 import argparse
@@ -235,7 +244,7 @@ class ShardedDataset(Dataset):
     and the trainer uses a soft cross-entropy.
     """
 
-    def __init__(self, prefix):
+    def __init__(self, prefix, verbose=True):
         # Discover shards by globbing (handles gaps from failed workers).
         import glob
         self.shard_paths = sorted(glob.glob(f"{prefix}_*.npz"))
@@ -264,8 +273,9 @@ class ShardedDataset(Dataset):
         else:
             gb = self.shard_size * 148 * 81 * 2 / 1e9
             fmt = f"float16 planes (~{gb:.1f} GB/shard in RAM)"
-        print(f"Found {self.num_shards} shards, ~{self.shard_size:,} positions each")
-        print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions, {fmt}")
+        if verbose:
+            print(f"Found {self.num_shards} shards, ~{self.shard_size:,} positions each")
+            print(f"Total: ~{self.num_shards * self.shard_size / 1e6:.0f}M positions, {fmt}")
 
     def load_shard(self, shard_id):
         """Load a specific shard into memory (frees the previous one)."""
@@ -446,6 +456,23 @@ def build_move_index():
     return lambda idx: idx
 
 
+class _Tee:
+    """Duplicate a stream's writes into a log file (for --log-file)."""
+
+    def __init__(self, stream, fh):
+        self.stream = stream
+        self.fh = fh
+
+    def write(self, data):
+        self.stream.write(data)
+        self.fh.write(data)
+        self.fh.flush()
+
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+
+
 def train(args):
     # --- Distributed (DDP) setup: auto-enabled when launched via torchrun ---
     #   single GPU / DataParallel:  python shogi_train.py ...
@@ -463,9 +490,28 @@ def train(args):
     is_main = (rank == 0)
     num_gpus = torch.cuda.device_count()
 
+    # Mirror everything rank 0 prints (stdout AND stderr) into --log-file, so
+    # per-shard progress lines survive the terminal. Append mode: safe across
+    # resumed runs.
+    if args.log_file and is_main:
+        log_dir = os.path.dirname(args.log_file)
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        log_fh = open(args.log_file, 'a', buffering=1)
+        sys.stdout = _Tee(sys.stdout, log_fh)
+        sys.stderr = _Tee(sys.stderr, log_fh)
+
     def log(*a, **k):
         if is_main:
             print(*a, **k)
+
+    log(f"\n=== Run started {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+    log(f"Command: {' '.join(sys.argv)}")
+
+    # TF32 for the fp32 matmuls that remain outside autocast (free speedup on
+    # Ampere+ GPUs, e.g. RTX 5090).
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
 
     if is_dist:
         log(f"DDP enabled: world_size={world_size} (one process per GPU, NCCL)")
@@ -505,7 +551,7 @@ def train(args):
     start_epoch = 0
     if args.resume:
         if os.path.exists(args.resume):
-            print(f"Resuming from {args.resume}")
+            log(f"Resuming from {args.resume}")
             ckpt = torch.load(args.resume, map_location=device, weights_only=False)
             # Handle DataParallel state_dict keys (strip 'module.' prefix)
             state_dict = ckpt['model']
@@ -515,9 +561,9 @@ def train(args):
             if 'optimizer' in ckpt:
                 optimizer.load_state_dict(ckpt['optimizer'])
             start_epoch = ckpt.get('epoch', 0)
-            print(f"  Resumed at epoch {start_epoch}")
+            log(f"  Resumed at epoch {start_epoch}")
         else:
-            print(f"Checkpoint not found: {args.resume}, starting from scratch")
+            log(f"Checkpoint not found: {args.resume}, starting from scratch")
 
     # --- Mixed precision: fp16 (default) or bf16 (--bf16, better for big models) ---
     amp_dtype = torch.bfloat16 if args.bf16 else torch.float16
@@ -548,13 +594,13 @@ def train(args):
 
     if use_psv:
         from psv_dataset import PSVShardedDataset
-        print(f"Using PSV dataset from {args.psv_dir}")
+        log(f"Using PSV dataset from {args.psv_dir}")
         sharded_dataset = PSVShardedDataset(args.psv_dir)
     elif use_sharded:
-        print("Using pre-computed binary dataset (fast, memory-efficient)")
-        sharded_dataset = ShardedDataset(args.data)
+        log("Using pre-computed binary dataset (fast, memory-efficient)")
+        sharded_dataset = ShardedDataset(args.data, verbose=is_main)
     elif use_text:
-        print("Using text dataset (slow — consider running precompute.py first)")
+        log("Using text dataset (slow — consider running precompute.py first)")
         dataset = ShogiDataset(args.data, move_info_to_idx)
     else:
         print(f"Training data not found: {args.data}")
@@ -890,6 +936,9 @@ if __name__ == "__main__":
     parser.add_argument("--export-onnx", default=None, help="Export ONNX after training")
     parser.add_argument("--resume", default=None, help="Resume from checkpoint (.pt file)")
     parser.add_argument("--log-csv", default=None, help="Log training stats to CSV file")
+    parser.add_argument("--log-file", default=None,
+                        help="Also write all console output (per-shard progress "
+                             "lines etc.) to this file, appending")
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Accumulate grads over N micro-batches before an "
                              "optimizer step (effective batch = batch*N*num_gpus)")
