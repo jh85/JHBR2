@@ -16,7 +16,7 @@ Multi-GPU (DDP, one process per GPU; e.g. 8x RTX 5090):
         --data ../shards2/aggshard --epochs 1 --lr 3e-4 --warmup-steps 4000 \
         --grad-clip 0.5 --bf16 --pre-norm --gated-attention \
         --d-model 1024 --encoders 20 --heads 16 \
-        --batch 128 --grad-accum 1 --workers 12 \
+        --batch 256 --grad-accum 1 --workers 12 --compile \
         --save-dir checkpoints/ --save-every 1 \
         --log-csv run.csv --log-file run.log
 """
@@ -535,6 +535,10 @@ def train(args):
         cfg.pre_norm = True
 
     model = ShogiBT4v2(cfg).to(device)
+    # Unwrapped reference for checkpoint save / ONNX export: shares parameters
+    # with the DDP/DataParallel/torch.compile-wrapped `model`, but its
+    # state_dict keys carry no 'module.' / '_orig_mod.' prefixes.
+    base_model = model
     log(f"Model parameters: {model.count_parameters():,}")
     if args.grad_checkpoint:
         model.gradient_checkpointing = True
@@ -585,6 +589,12 @@ def train(args):
         log(f"Using DataParallel across {num_gpus} GPUs "
             f"(tip: `torchrun --nproc_per_node={num_gpus} shogi_train.py` is faster)")
         model = torch.nn.DataParallel(model)
+
+    # torch.compile AFTER the DDP wrap: Dynamo's DDPOptimizer then splits the
+    # graph at gradient-bucket boundaries so comm/compute overlap survives.
+    if args.compile:
+        model = torch.compile(model)
+        log("torch.compile: ON (first few batches are slow while compiling)")
 
     # --- Dataset ---
     use_psv = args.psv_dir is not None
@@ -844,12 +854,11 @@ def train(args):
 
         # Save checkpoint (rank 0 only)
         if (epoch + 1) % args.save_every == 0 and is_main:
-            raw_model = model.module if hasattr(model, 'module') else model
             os.makedirs(args.save_dir, exist_ok=True)
             path = os.path.join(args.save_dir, f"shogi_bt4_epoch{epoch+1}.pt")
             torch.save({
                 'epoch': epoch + 1,
-                'model': raw_model.state_dict(),
+                'model': base_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'cfg': vars(cfg),
             }, path)
@@ -861,8 +870,7 @@ def train(args):
 
     # Export to ONNX (rank 0 only)
     if args.export_onnx and is_main:
-        raw_model = model.module if hasattr(model, 'module') else model
-        export_onnx(raw_model, cfg, args.export_onnx, device)
+        export_onnx(base_model, cfg, args.export_onnx, device)
 
     if is_dist:
         dist.destroy_process_group()
@@ -942,6 +950,9 @@ if __name__ == "__main__":
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Accumulate grads over N micro-batches before an "
                              "optimizer step (effective batch = batch*N*num_gpus)")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the model (~1.3-1.6x faster; the "
+                             "first few batches are slow while it compiles)")
     parser.add_argument("--grad-checkpoint", action="store_true",
                         help="Activation checkpointing on encoder blocks "
                              "(much less GPU memory, ~30%% slower)")
