@@ -38,6 +38,24 @@ void check(const std::string& name, bool cond, const std::string& detail = "") {
     }
 }
 
+bool IsValidMatePv(ShogiBoard board, const std::vector<Move>& pv) {
+    if (pv.empty()) return false;
+    for (size_t ply = 0; ply < pv.size(); ++ply) {
+        auto legal = board.GenerateLegalMoves();
+        bool found = false;
+        for (const Move& move : legal) {
+            if (move == pv[ply]) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) return false;
+        board.DoMove(pv[ply]);
+        if (ply % 2 == 0 && !board.InCheck()) return false;
+    }
+    return board.InCheck() && board.GenerateLegalMoves().empty();
+}
+
 // Count the number of legal moves from `board` that give check.
 int CountCheckingMoves(ShogiBoard& board) {
     auto moves = board.GenerateLegalMoves();
@@ -380,6 +398,21 @@ int main() {
         "PP2K4/7R1/LN1g4L w GNPg2n3p 5",
         /*actual_mate_depth=*/7);
 
+    {
+        ShogiBoard b;
+        b.SetFromSfen(
+            "l3S1kpl/3r1gs2/1p2p2P1/p1p2P1+Bp/3s2Ps1/2P2p+b1P/"
+            "PP2K4/7R1/LN1g4L w GNPg2n3p 5");
+        jhbr2::MateDfpnSolver solver(100000);
+        const Move result = solver.search(b, 100000);
+        const auto pv = solver.get_pv();
+        check("DFPN mate-in-7 returns a mate", !result.is_null() &&
+              !jhbr2::MateDfpnSolver::IsNoMate(result));
+        check("DFPN mate-in-7 returns complete 7-ply PV", pv.size() == 7,
+              "got " + std::to_string(pv.size()));
+        check("DFPN mate-in-7 PV is legal checkmate", IsValidMatePv(b, pv));
+    }
+
     // Mate-in-3 fixture: classic 3-ply puzzle.
     // I'll use a known 3-ply position.
     // Position: black has rook giving check from far, defender's only
@@ -569,6 +602,25 @@ int main() {
                   !HasMateWithin(b, 3));
             check("In-check root: HasMateWithin(b, 5) terminates and returns false",
                   !HasMateWithin(b, 5));
+        }
+    }
+
+    // Black starts in check by the white rook on 5h. Capturing it with
+    // 5g5h both evades the check and checkmates White. This exercises the
+    // DFPN OR-node countercheck path.
+    {
+        ShogiBoard b;
+        bool ok = b.SetFromSfen(
+            "3pkp3/3p1p3/9/9/9/9/4R4/4r4/4K4 b - 1");
+        if (!ok) {
+            check("DFPN countercheck setup", false, "SetFromSfen failed");
+        } else {
+            jhbr2::MateDfpnSolver solver(10000);
+            const Move result = solver.search(b, 10000);
+            const auto pv = solver.get_pv();
+            check("DFPN finds mating countercheck", result.ToString() == "5g5h");
+            check("DFPN countercheck PV is legal checkmate",
+                  pv.size() == 1 && IsValidMatePv(b, pv));
         }
     }
 

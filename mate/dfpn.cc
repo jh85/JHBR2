@@ -40,16 +40,21 @@ MateDfpnSolver::MateDfpnSolver(size_t default_nodes_limit)
 // =====================================================================
 
 Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
-  stop_ = false;
+  stop_.store(false, std::memory_order_relaxed);
   nodes_searched_ = 0;
   nodes_limit_ = nodes_limit;
   mate_ply_ = 0;
   pv_.clear();
   path_hashes_.clear();
 
-  // Allocate node pool. Each expansion creates children (up to ~600 for AND nodes).
-  // Cap pool at 2M nodes to avoid excessive memory allocation time.
-  size_t pool_size = std::min(std::max(nodes_limit * 4, (size_t)1024), (size_t)2000000);
+  // An expansion can allocate many move children. Small root budgets need
+  // more than four child slots per expanded node on tactical positions.
+  // Cap the pool at 2M nodes to bound allocation time and memory use.
+  constexpr size_t kMaxPoolNodes = 2000000;
+  const size_t scaled_pool =
+      nodes_limit >= kMaxPoolNodes / 8 ? kMaxPoolNodes : nodes_limit * 8;
+  const size_t pool_size =
+      std::clamp(scaled_pool, size_t{1024}, kMaxPoolNodes);
   pool_.Alloc(pool_size);
 
   // Create root node (OR node — attacker).
@@ -64,7 +69,8 @@ Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
 
   // Search iteratively until solved or out of resources.
   while (root.pn != 0 && root.dn != 0 &&
-         !pool_.OutOfMemory() && !stop_ &&
+         !pool_.OutOfMemory() &&
+         !stop_.load(std::memory_order_relaxed) &&
          nodes_searched_ < nodes_limit) {
     Search<true>(pos, root, DfpnNode::INF, DfpnNode::INF, 0);
   }
@@ -98,7 +104,7 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
                              uint32_t second_pn, uint32_t second_dn,
                              int ply) {
   // Early exit if stopped.
-  if (stop_) return;
+  if (stop_.load(std::memory_order_relaxed)) return;
 
   // Expand if not yet expanded.
   if (!node.is_expanded()) {
@@ -113,7 +119,7 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
          node.dn < second_dn &&
          node.pn != 0 && node.dn != 0 &&
          !pool_.OutOfMemory() &&
-         !stop_ &&
+         !stop_.load(std::memory_order_relaxed) &&
          nodes_searched_ < nodes_limit_) {
 
     // Find best child and 2nd-best thresholds.
@@ -159,23 +165,22 @@ template<bool or_node>
 void MateDfpnSolver::ExpandNode(ShogiBoard& board, DfpnNode& node, int ply) {
   // Quick 1-ply mate check for OR nodes.
   if constexpr (or_node) {
-    if (!board.InCheck()) {
-      Move mate1 = Mate1Ply(board);
-      if (!mate1.is_null()) {
-        // Found a 1-ply mate.
-        node.pn = 0;
-        node.dn = DfpnNode::INF - ply;
-        node.child_num = 1;
+    Move mate1 = Mate1Ply(board);
+    if (!mate1.is_null()) {
+      // Found a 1-ply mate, including a mating countercheck when the
+      // attacker starts in check.
+      node.set_mate(ply);
+      node.mate_distance = 1;
+      node.child_num = 1;
 
-        DfpnNode* children = pool_.NewNodes(1);
-        if (children) {
-          node.children = children;
-          children[0].last_move = mate1;
-          children[0].set_mate<true>(1);
-          children[0].child_num = 0;
-        }
-        return;
+      DfpnNode* children = pool_.NewNodes(1);
+      if (children) {
+        node.children = children;
+        children[0].last_move = mate1;
+        children[0].set_mate(ply + 1);
+        children[0].child_num = 0;
       }
+      return;
     }
   }
 
@@ -195,7 +200,7 @@ void MateDfpnSolver::ExpandNode(ShogiBoard& board, DfpnNode& node, int ply) {
       node.set_nomate(ply);
     } else {
       // No evasion moves = checkmate! (Defender has no moves while in check.)
-      node.set_mate<false>(ply);
+      node.set_mate(ply);
     }
     node.child_num = 0;
     return;
@@ -218,6 +223,7 @@ void MateDfpnSolver::ExpandNode(ShogiBoard& board, DfpnNode& node, int ply) {
     children[i].children = nullptr;
     children[i].child_num = DfpnNode::NOT_EXPANDED;
     children[i].repeated = false;
+    children[i].mate_distance = 0;
   }
 
   // Summarize from children.
@@ -262,6 +268,20 @@ void MateDfpnSolver::SummarizeNode(DfpnNode& node) {
   }
 
   node.repeated = any_repeated;
+  if (node.pn == 0) {
+    uint16_t distance = or_node ? UINT16_MAX : 0;
+    for (int i = 0; i < node.child_num; ++i) {
+      const DfpnNode& child = node.children[i];
+      if (child.pn != 0) continue;
+      if constexpr (or_node) {
+        distance = std::min(distance, child.mate_distance);
+      } else {
+        distance = std::max(distance, child.mate_distance);
+      }
+    }
+    node.mate_distance =
+        distance == UINT16_MAX ? 0 : static_cast<uint16_t>(distance + 1);
+  }
 }
 
 // =====================================================================
@@ -372,46 +392,20 @@ void MateDfpnSolver::ExtractPV(DfpnNode& root) {
   bool or_node = true;
 
   while (node->child_num > 0 && node->children) {
-    // Find the "proof" child:
-    // OR node: child with pn == 0 (proven mate path)
-    // AND node: child with dn == 0 is NOT the mate path;
-    //           we need the child the defender would play (any child, since all lead to mate).
-    //           Actually for AND node (all children have mate proven), pick the one
-    //           that maximizes the defender's resistance (max pn among children with dn==0?).
-    //           Simplest correct approach: for AND node, pick child with max dn
-    //           (which is the one that leads to the longest mate line, i.e., best defense).
-
+    // The attacker chooses the shortest proven line; the defender chooses
+    // the longest. mate_distance is maintained when proof numbers are
+    // summarized, so this produces the principal mate line without walking
+    // the full solved tree again.
     DfpnNode* best = nullptr;
-
-    if (or_node) {
-      // Pick child with pn == 0 (mate proven).
-      for (int i = 0; i < node->child_num; i++) {
-        if (node->children[i].pn == 0) {
-          best = &node->children[i];
-          break;
-        }
-      }
-    } else {
-      // AND node: all children should have dn == 0 (mate proven from defender's view).
-      // Pick the child that the defender would choose = child with highest pn
-      // (longest line to mate, best defense).
-      uint32_t max_pn = 0;
-      for (int i = 0; i < node->child_num; i++) {
-        if (node->children[i].dn == 0 && node->children[i].pn >= max_pn) {
-          max_pn = node->children[i].pn;
-          best = &node->children[i];
-        }
-      }
-      // If no child has dn==0, just pick the one with min dn.
-      if (!best) {
-        uint32_t min_dn = DfpnNode::INF;
-        for (int i = 0; i < node->child_num; i++) {
-          if (node->children[i].dn < min_dn) {
-            min_dn = node->children[i].dn;
-            best = &node->children[i];
-          }
-        }
-      }
+    uint16_t best_distance = or_node ? UINT16_MAX : 0;
+    for (int i = 0; i < node->child_num; i++) {
+      DfpnNode& child = node->children[i];
+      if (child.pn != 0) continue;
+      const bool better = or_node ? child.mate_distance < best_distance
+                                  : !best || child.mate_distance > best_distance;
+      if (!better) continue;
+      best = &child;
+      best_distance = child.mate_distance;
     }
 
     if (!best) break;

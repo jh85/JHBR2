@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -52,39 +53,26 @@ struct DfpnNode {
   Move last_move;
   uint8_t child_num = NOT_EXPANDED;
   bool repeated = false;
+  uint16_t mate_distance = 0;
 
   bool is_expanded() const { return child_num != NOT_EXPANDED; }
 
-  // OR node: pn=0 means mate proven. dn=0 means no mate.
-  // AND node: pn=0 means no mate. dn=0 means mate proven.
+  // Proof-number meaning is independent of node type. OR/AND nodes differ
+  // only in how their children are summarized.
+  // pn=0 means mate proven; dn=0 means no mate proven.
   bool is_mate_or() const { return pn == 0 && dn >= MATE; }
   bool is_nomate_or() const { return dn == 0 && pn >= MATE; }
 
-  template<bool or_node>
   void set_mate(int ply = 0) {
-    if constexpr (or_node) {
-      pn = 0;
-      dn = INF - ply;
-    } else {
-      pn = INF - ply;
-      dn = 0;
-    }
-  }
-
-  template<bool or_node>
-  void set_mated(int ply = 0) {
-    if constexpr (or_node) {
-      pn = INF - ply;
-      dn = 0;
-    } else {
-      pn = 0;
-      dn = INF - ply;
-    }
+    pn = 0;
+    dn = INF - ply;
+    mate_distance = 0;
   }
 
   void set_nomate(int ply = 0) {
     pn = INF - ply;
     dn = 0;
+    mate_distance = 0;
   }
 };
 
@@ -100,17 +88,24 @@ class DfpnNodePool {
     pool_ = std::make_unique<DfpnNode[]>(num_nodes);
     capacity_ = num_nodes;
     used_ = 0;
+    exhausted_ = false;
   }
 
   DfpnNode* NewNodes(size_t count) {
-    if (used_ + count > capacity_) return nullptr;
+    if (used_ + count > capacity_) {
+      exhausted_ = true;
+      return nullptr;
+    }
     DfpnNode* ptr = &pool_[used_];
     used_ += count;
     return ptr;
   }
 
-  void Reset() { used_ = 0; }
-  bool OutOfMemory() const { return used_ >= capacity_; }
+  void Reset() {
+    used_ = 0;
+    exhausted_ = false;
+  }
+  bool OutOfMemory() const { return exhausted_ || used_ >= capacity_; }
   size_t Used() const { return used_; }
   size_t Capacity() const { return capacity_; }
 
@@ -118,6 +113,7 @@ class DfpnNodePool {
   std::unique_ptr<DfpnNode[]> pool_;
   size_t capacity_ = 0;
   size_t used_ = 0;
+  bool exhausted_ = false;
 };
 
 // =====================================================================
@@ -158,7 +154,7 @@ class MateDfpnSolver {
   std::vector<Move> get_pv() const { return pv_; }
   size_t get_nodes_searched() const { return nodes_searched_; }
 
-  void stop() { stop_ = true; }
+  void stop() { stop_.store(true, std::memory_order_relaxed); }
 
  private:
   // Core recursive search.
@@ -197,7 +193,7 @@ class MateDfpnSolver {
   size_t nodes_searched_ = 0;
   int mate_ply_ = 0;
   std::vector<Move> pv_;
-  bool stop_ = false;
+  std::atomic<bool> stop_{false};
 
   // Repetition detection: track hashes on the current search path.
   std::vector<uint64_t> path_hashes_;

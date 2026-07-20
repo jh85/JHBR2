@@ -26,6 +26,31 @@ using namespace lczero;
 using namespace jhbr2;
 using Clock = std::chrono::steady_clock;
 
+namespace {
+
+bool ContainsMove(const MoveList& moves, Move target) {
+  for (const Move& move : moves) {
+    if (move == target) return true;
+  }
+  return false;
+}
+
+bool IsValidMatePv(ShogiBoard board, Move result,
+                   const std::vector<Move>& pv) {
+  if (pv.empty() || pv.front() != result) return false;
+
+  for (size_t ply = 0; ply < pv.size(); ++ply) {
+    const MoveList legal = board.GenerateLegalMoves();
+    if (!ContainsMove(legal, pv[ply])) return false;
+    board.DoMove(pv[ply]);
+    if (ply % 2 == 0 && !board.InCheck()) return false;
+  }
+
+  return board.InCheck() && board.GenerateLegalMoves().empty();
+}
+
+}  // namespace
+
 int main(int argc, char* argv[]) {
   if (argc < 2) {
     fprintf(stderr, "Usage: %s <problems.sfen> [max_problems] [nodes_budget]\n", argv[0]);
@@ -61,6 +86,7 @@ int main(int argc, char* argv[]) {
   int solved = 0;
   int unsolved = 0;
   int nomate = 0;
+  int invalid_pv = 0;
   int parse_errors = 0;
   uint64_t total_nodes = 0;
   double total_time_ms = 0;
@@ -89,6 +115,13 @@ int main(int argc, char* argv[]) {
     if (!result.is_null() && !MateDfpnSolver::IsNoMate(result)) {
       solved++;
       if (nodes > max_nodes_used) max_nodes_used = nodes;
+      if (!IsValidMatePv(board, result, solver.get_pv())) {
+        ++invalid_pv;
+        if (invalid_pv <= 5) {
+          fprintf(stderr, "  [%d] INVALID PV: %s\n", i,
+                  problems[i].c_str());
+        }
+      }
     } else if (MateDfpnSolver::IsNoMate(result)) {
       nomate++;
       if (i < 5) {
@@ -96,6 +129,10 @@ int main(int argc, char* argv[]) {
       }
     } else {
       unsolved++;
+      if (unsolved <= 5) {
+        fprintf(stderr, "  [%d] UNSOLVED: %s\n", i,
+                problems[i].c_str());
+      }
     }
 
     // Progress report every 10%
@@ -113,6 +150,7 @@ int main(int argc, char* argv[]) {
   printf("Solved:        %d (%.1f%%)\n", solved, 100.0 * solved / problems.size());
   printf("Unsolved:      %d (%.1f%%)\n", unsolved, 100.0 * unsolved / problems.size());
   printf("No mate:       %d (%.1f%%)\n", nomate, 100.0 * nomate / problems.size());
+  printf("Invalid PV:    %d\n", invalid_pv);
   if (parse_errors > 0)
     printf("Parse errors:  %d\n", parse_errors);
   printf("Total time:    %.1f sec\n", elapsed_all);
@@ -121,5 +159,5 @@ int main(int argc, char* argv[]) {
   printf("Avg time:      %.2f ms/problem\n", total_time_ms / problems.size());
   printf("Speed:         %.0f problems/sec\n", problems.size() / elapsed_all);
 
-  return 0;
+  return invalid_pv == 0 ? 0 : 1;
 }

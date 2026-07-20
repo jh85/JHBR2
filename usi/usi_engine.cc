@@ -463,7 +463,16 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     hard_deadline_ms = static_cast<int>(max_time * 1000) + 2000;
   }
 
-  // Use shared_ptr so detached thread doesn't access destroyed locals.
+  // DfPnMaxTime is an upper bound on the concurrent root mate search.
+  // Leave a small margin when the move itself has a tighter deadline.
+  int root_dfpn_time_ms = dfpn_max_time_ms_;
+  if (hard_deadline_ms > 0) {
+    root_dfpn_time_ms =
+        std::min(root_dfpn_time_ms, std::max(hard_deadline_ms - 50, 1));
+  }
+
+  // Keep the solver and its result in one state shared by the worker and
+  // deadline timer.
   struct DfpnState {
     MateDfpnSolver solver;
     std::atomic<bool> done{false};
@@ -475,8 +484,26 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 
   auto dfpn_thread = std::thread([dfpn, root_dfpn_nodes]() {
     dfpn->mate_move = dfpn->solver.search(dfpn->board, root_dfpn_nodes);
-    dfpn->done = true;
+    dfpn->done.store(true, std::memory_order_release);
   });
+
+  // Enforce DfPnMaxTime independently of MCTS duration. Cancellation is
+  // atomic and checked throughout df-pn, so the worker can always be joined
+  // safely instead of being detached while its result is still shared.
+  auto dfpn_timer = std::thread(
+      [dfpn, root_dfpn_time_ms, move_start_time]() {
+        while (!dfpn->done.load(std::memory_order_acquire)) {
+          const auto elapsed_ms =
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - move_start_time)
+                  .count();
+          if (elapsed_ms >= root_dfpn_time_ms) {
+            dfpn->solver.stop();
+            return;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      });
 
   // --- Run dlshogi-style MCTS ---
   // Set info callback for periodic GUI output during search.
@@ -530,33 +557,31 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   search_done.store(true, std::memory_order_release);
   if (watchdog.joinable()) watchdog.join();
 
-  // --- Stop df-pn and wait ---
-  dfpn->solver.stop();
-
-  if (hard_deadline_ms <= 0) {
-    if (dfpn_thread.joinable()) dfpn_thread.join();
-  } else {
-    // Wait for df-pn with hard deadline — never exceed MaxMoveTime.
-    auto wait_start = std::chrono::steady_clock::now();
-    int max_wait_ms = std::max(hard_deadline_ms - (int)std::chrono::duration_cast<
-        std::chrono::milliseconds>(wait_start - move_start_time).count(), 100);
-    while (!dfpn->done) {
-      auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - wait_start).count();
-      if (elapsed_ms >= max_wait_ms) {
-        // df-pn still running past deadline — detach and abandon.
-        // shared_ptr keeps DfpnState alive until the thread finishes.
-        dfpn_thread.detach();
-        dfpn->done = true;  // Pretend it's done — don't use its result.
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    if (dfpn_thread.joinable()) dfpn_thread.join();
+  // If MCTS finishes first, preserve the original clock-scaled grace period
+  // for root df-pn. The grace period is capped by DfPnMaxTime and by the move
+  // deadline, so it cannot recreate the old tournament time overruns.
+  auto dfpn_wait_deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::milliseconds(dfpn_min_wait_ms);
+  const auto dfpn_time_deadline =
+      move_start_time + std::chrono::milliseconds(root_dfpn_time_ms);
+  dfpn_wait_deadline = std::min(dfpn_wait_deadline, dfpn_time_deadline);
+  if (hard_deadline_ms > 0) {
+    const auto move_deadline =
+        move_start_time + std::chrono::milliseconds(hard_deadline_ms);
+    dfpn_wait_deadline = std::min(dfpn_wait_deadline, move_deadline);
   }
 
+  while (!dfpn->done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < dfpn_wait_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!dfpn->done.load(std::memory_order_acquire)) dfpn->solver.stop();
+  if (dfpn_thread.joinable()) dfpn_thread.join();
+  if (dfpn_timer.joinable()) dfpn_timer.join();
+
   // --- Choose result ---
-  bool use_mate = dfpn->done &&
+  bool use_mate = dfpn->done.load(std::memory_order_acquire) &&
                   !dfpn->mate_move.is_null() &&
                   !MateDfpnSolver::IsNoMate(dfpn->mate_move);
 
