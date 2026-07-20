@@ -36,11 +36,11 @@ int main() {
     // For "non-mate" positions, use the starting position repeatedly —
     // not the most realistic but quick.
 
-    std::printf("=== Microbenchmark: shallow mate (depth=5) vs df-pn ===\n");
+    std::printf("=== Microbenchmark: shallow mate (depth=3/5/7) vs df-pn ===\n");
     std::printf("Test set: %zu mate-in-3 puzzles\n\n", mate3.size());
 
     // Shallow benchmark at multiple depths
-    for (int d : {3, 5}) {
+    for (int d : {3, 5, 7}) {
         auto t0 = Clock::now();
         int found = 0;
         for (const auto& sfen : mate3) {
@@ -77,7 +77,7 @@ int main() {
         }
     }
 
-    for (int d : {3, 5}) {
+    for (int d : {3, 5, 7}) {
         auto t0 = Clock::now();
         int found = 0;
         for (const auto& sfen : non_mate) {

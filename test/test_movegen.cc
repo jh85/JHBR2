@@ -98,6 +98,23 @@ int main(int argc, char* argv[]) {
       got_moves.insert(m.ToString());
     }
 
+    if (board.InCheck()) {
+      MoveList evasions = board.GenerateEvasionMoves();
+      std::set<std::string> got_evasions;
+      for (const Move& m : evasions) {
+        got_evasions.insert(m.ToString());
+      }
+      bool has_evasion = board.HasLegalEvasion();
+      if (got_evasions != got_moves ||
+          has_evasion != !got_moves.empty()) {
+        std::cerr << "FAIL [" << i + 1
+                  << "] specialized evasion mismatch: " << tc.sfen
+                  << std::endl;
+        failed++;
+        continue;
+      }
+    }
+
     if (got_moves == tc.expected_moves) {
       passed++;
       continue;

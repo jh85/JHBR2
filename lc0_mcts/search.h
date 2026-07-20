@@ -134,11 +134,9 @@ struct SearchConfig {
 
   // Search depth (plies) when leaf_mate_mode == kShallow.
   // Must be odd; supported values: 1, 3, 5, 7.
-  // Default 3: provides best NPS-vs-coverage tradeoff. Depth 5 explores
-  // a much wider tree without catching meaningfully more mates than
-  // df-pn finds at LeafDfpnNodes=10. Mate-in-5+ detection is better
-  // handled by a background PV mate thread (future work).
-  int leaf_mate_depth = 3;
+  // Depth 5 is the per-leaf default. Deeper defensive coverage is better
+  // applied to selected root candidates than paid at every leaf.
+  int leaf_mate_depth = 5;
 
   // NN inference cache size (number of entries). 0 disables.
   // Each entry is ~32 bytes overhead + 4 bytes per legal-move policy

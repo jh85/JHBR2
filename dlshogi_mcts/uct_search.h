@@ -47,7 +47,12 @@ struct SearchConfig {
   int minibatch_size = 128;
   int num_gpus = 1;
   int max_moves_to_draw = 100000;
-  int leaf_mate_depth = 0;
+  int leaf_mate_depth = 5;
+
+  // Before returning a move, reject root candidates that let the opponent
+  // force mate within this many plies. This makes deeper defensive coverage
+  // affordable without paying for it at every MCTS leaf.
+  int root_mate_depth = 7;
 
   // Moves-left (MLH) effect in selection. Disabled by default (weight 0):
   // when > 0, nudges selection toward shorter lines when winning / longer when
@@ -115,6 +120,7 @@ class Search {
 
   bool IsSearchActive() const;
   void ExpandRoot();
+  void RejectRootMates();
   unsigned SelectBestChild(const uct_node_t* node) const;
   SearchResult BuildResult() const;
   std::vector<lczero::Move> GetPV() const;

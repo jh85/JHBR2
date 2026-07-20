@@ -5,18 +5,16 @@
 // to jhbr2's ShogiBoard API.
 //
 // Cost vs. df-pn at the leaf:
-//   - Per-call cost: ~100 ns – 5 μs (vs df-pn at 5–20 ms)
-//   - Coverage: mate-in-1, -3, -5 (vs df-pn which can find longer
+//   - Per-call cost ranges from microseconds in quiet positions to a
+//     few milliseconds for depth 7 in tactical positions.
+//   - Coverage: mate-in-1, -3, -5, -7 (vs df-pn which can find longer
 //     mates given enough budget)
 //   - Trade-off: doesn't prove "no mate" (only finds mate or times out
 //     by depth)
 //
 // Implementation notes vs. dlshogi:
-//   - dlshogi has specialized generators (`generateMoves<CheckAll>()`,
-//     `generateMoves<Evasion>()`); jhbr2 doesn't, so we use
-//     `GenerateLegalMoves()` + filter for OR nodes. AND nodes (which
-//     are always reached when in check) get evasions automatically
-//     because all legal moves under check are evasions.
+//   - Checking OR nodes use `GenerateCheckingMoves`; checked AND nodes
+//     call the specialized `GenerateEvasionMoves` path directly.
 //   - dlshogi has a 6-state RepetitionResult; jhbr2 has 4. The
 //     superior/inferior material variants don't apply here.
 //   - dlshogi's `mateMoveIn1Ply()` optimization is replaced by an
@@ -106,7 +104,7 @@ inline bool MateIn3Ply(ShogiBoard& board) {
     for (size_t i = 0; i < checking_moves.size(); ++i) {
         Move m1 = checking_moves[i];
 
-        UndoInfo undo1 = board.DoMove(m1);
+        UndoInfo undo1 = board.DoMove(m1, true);
 
         // Repetition check from defender's perspective:
         // kWin/kDraw → defender survives → skip this attacker move.
@@ -123,7 +121,7 @@ inline bool MateIn3Ply(ShogiBoard& board) {
         }
 
         // AND node (depth 2): defender tries to escape.
-        auto evasions = board.GenerateLegalMoves();
+        auto evasions = board.GenerateEvasionMoves();
         if (evasions.empty()) {
             // Mate-in-1 — defender has no legal evasion.
             board.UndoMove(m1, undo1);
@@ -135,16 +133,17 @@ inline bool MateIn3Ply(ShogiBoard& board) {
         for (size_t j = 0; j < evasions.size(); ++j) {
             Move m2 = evasions[j];
 
+            UndoInfo undo2 = board.DoMove(m2);
+
             // dlshogi simplification: if defender's evasion is itself
             // a counter-check, treat as defender escape (we don't
             // try to find mate-in-1 against an in-check attacker
             // here — would require INCHECK-aware mate-in-1).
-            if (MoveGivesCheck(board, m2)) {
+            if (undo2.gave_check) {
+                board.UndoMove(m2, undo2);
                 all_evasions_lose = false;
                 break;
             }
-
-            UndoInfo undo2 = board.DoMove(m2);
 
             auto rep2 = board.CheckRepetition();
             // After defender's evasion, side-to-move = attacker.
@@ -167,8 +166,8 @@ inline bool MateIn3Ply(ShogiBoard& board) {
             bool found_mate1 = false;
             for (size_t k = 0; k < attacker_moves.size(); ++k) {
                 Move m3 = attacker_moves[k];
-                UndoInfo undo3 = board.DoMove(m3);
-                if (board.GenerateLegalMoves().empty()) {
+                UndoInfo undo3 = board.DoMove(m3, true);
+                if (!board.HasLegalEvasion()) {
                     found_mate1 = true;
                 }
                 board.UndoMove(m3, undo3);
@@ -207,7 +206,7 @@ inline bool MateInOddPly(ShogiBoard& board) {
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
 
-        UndoInfo undo = board.DoMove(m);
+        UndoInfo undo = board.DoMove(m, true);
 
         auto rep = board.CheckRepetition();
         if (rep == ShogiBoard::RepetitionResult::kLoss) {
@@ -245,14 +244,14 @@ inline bool MateInEvenPly(ShogiBoard& board) {
     static_assert(depth >= 0 && (depth % 2) == 0,
                   "MateInEvenPly: depth must be non-negative even");
 
-    auto moves = board.GenerateLegalMoves();
+    if constexpr (depth == 0) {
+        return !board.HasLegalEvasion();
+    }
+
+    auto moves = board.GenerateEvasionMoves();
     if (moves.empty()) {
         // No legal moves — defender is mated.
         return true;
-    }
-    if (depth == 0) {
-        // Out of depth and defender has at least one move → no mate.
-        return false;
     }
 
     for (size_t i = 0; i < moves.size(); ++i) {
@@ -274,7 +273,7 @@ inline bool MateInEvenPly(ShogiBoard& board) {
         }
 
         // Recurse into OR node at depth-1.
-        bool attacker_in_check = board.InCheck();
+        bool attacker_in_check = undo.gave_check;
         bool sub;
         if (attacker_in_check) {
             sub = MateInOddPly<depth - 1, true>(board);
@@ -311,8 +310,8 @@ inline bool MateInOddPly<1, false>(ShogiBoard& board) {
     auto moves = board.GenerateCheckingMovesNonCheck();
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
-        UndoInfo undo = board.DoMove(m);
-        bool no_escape = board.GenerateLegalMoves().empty();
+        UndoInfo undo = board.DoMove(m, true);
+        bool no_escape = !board.HasLegalEvasion();
         board.UndoMove(m, undo);
         if (no_escape) return true;
     }
@@ -323,8 +322,8 @@ inline bool MateInOddPly<1, true>(ShogiBoard& board) {
     auto moves = board.GenerateCheckingMoves();
     for (size_t i = 0; i < moves.size(); ++i) {
         Move m = moves[i];
-        UndoInfo undo = board.DoMove(m);
-        bool no_escape = board.GenerateLegalMoves().empty();
+        UndoInfo undo = board.DoMove(m, true);
+        bool no_escape = !board.HasLegalEvasion();
         board.UndoMove(m, undo);
         if (no_escape) return true;
     }

@@ -215,6 +215,29 @@ void Search::ExpandRoot() {
   if (root_->child_num == 0) root_->ExpandNode(&root_board_);
 }
 
+void Search::RejectRootMates() {
+  if (config_.root_mate_depth <= 0 || !root_ || root_->child_num == 0) {
+    return;
+  }
+
+  // Usually this checks only the selected move. If it permits a forced
+  // mate, mark it as winning for the opponent and try the next-best root
+  // candidate using the visits already gathered by MCTS.
+  for (int attempt = 0; attempt < root_->child_num; ++attempt) {
+    const unsigned idx = SelectBestChild(root_);
+    auto& child = root_->child[idx];
+    if (child.IsLose() || child.IsWin()) return;
+
+    ShogiBoard reply = root_board_;
+    reply.DoMove(child.move);
+    if (!jhbr2::shallow_mate::HasMateWithin(
+            reply, config_.root_mate_depth)) {
+      return;
+    }
+    child.SetWin();
+  }
+}
+
 unsigned Search::SelectBestChild(const uct_node_t* node) const {
   unsigned best = 0;
   int best_visits = std::numeric_limits<int>::min();
@@ -261,6 +284,7 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
   ExpandRoot();
   for (auto& group : groups_) group.Run();
   for (auto& group : groups_) group.Join();
+  RejectRootMates();
   MaybeOutputInfo();
   return BuildResult();
 }

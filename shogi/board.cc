@@ -287,10 +287,15 @@ void ShogiBoard::MovePiece(Square from, Square to) {
 // =====================================================================
 
 UndoInfo ShogiBoard::DoMove(Move m) {
-  return DoMoveInternal(m, true);
+  return DoMoveInternal(m, true, -1);
 }
 
-UndoInfo ShogiBoard::DoMoveInternal(Move m, bool update_auxiliary) {
+UndoInfo ShogiBoard::DoMove(Move m, bool gives_check) {
+  return DoMoveInternal(m, true, gives_check ? 1 : 0);
+}
+
+UndoInfo ShogiBoard::DoMoveInternal(Move m, bool update_auxiliary,
+                                    int gives_check) {
   UndoInfo undo;
   Color us = side_to_move_;
   undo.prev_hand = hand_[us];
@@ -364,7 +369,13 @@ UndoInfo ShogiBoard::DoMoveInternal(Move m, bool update_auxiliary) {
   // can be compared directly against the ply distance to the prior
   // occurrence in CheckRepetition().
   if (update_auxiliary) {
-    if (InCheck(~us)) {
+#ifndef NDEBUG
+    if (gives_check >= 0) {
+      assert((gives_check != 0) == InCheck(~us));
+    }
+#endif
+    undo.gave_check = gives_check >= 0 ? gives_check != 0 : InCheck(~us);
+    if (undo.gave_check) {
       continuous_check_[us] += 2;
     } else {
       continuous_check_[us] = 0;
@@ -643,7 +654,7 @@ MoveList ShogiBoard::GenerateLegalMoves() {
       if (m.drop_piece() == kPawn &&
           ShogiTables::PawnEffectBB[m.to().as_idx()][us].Test(king_sq_[~us])) {
         UndoInfo undo = DoMoveForMovegen(m);
-        bool is_mate = GenerateLegalMoves().empty();
+        bool is_mate = !HasLegalEvasion();
         UndoMove(m, undo);
         if (is_mate) continue;
       }
@@ -653,27 +664,127 @@ MoveList ShogiBoard::GenerateLegalMoves() {
     return legal;
   }
 
-  MoveList pseudo;
-  pseudo.reserve(128);
+  return GenerateEvasionMoves();
+}
 
-  GenerateBoardMoves(pseudo);
-  GenerateDropMoves(pseudo);
+MoveList ShogiBoard::GenerateEvasionMoves() {
+  return GenerateEvasionMovesImpl(false);
+}
 
+bool ShogiBoard::HasLegalEvasion() {
+  return !GenerateEvasionMovesImpl(true).empty();
+}
+
+MoveList ShogiBoard::GenerateEvasionMovesImpl(bool stop_after_one) {
+  Color us = side_to_move_;
+  Color them = ~us;
+  Square ksq = king_sq_[us];
+  Bitboard occ = occupied();
+  Bitboard our = pieces(us);
+  Bitboard checkers = AttackersTo(ksq, occ) & pieces(them);
   MoveList legal;
-  legal.reserve(pseudo.size());
 
-  for (const Move& m : pseudo) {
-    UndoInfo undo = DoMoveForMovegen(m);
-    bool ok = !InCheck(us);
-    // Pawn drop mate check: if this pawn drop gives check, verify it's not mate.
-    if (ok && m.is_drop() && m.drop_piece() == kPawn && InCheck(~us)) {
-      if (GenerateLegalMoves().empty()) {
-        ok = false;
+  // A double check can only be evaded by moving the king.
+  Bitboard king_targets =
+      ShogiTables::KingEffectBB[ksq.as_idx()] & ~our;
+  Bitboard occ_without_king = occ;
+  occ_without_king.Clear(ksq);
+  while (king_targets.Any()) {
+    Square to = king_targets.Pop();
+    if (!IsSquareAttacked(to, occ_without_king, them)) {
+      legal.push_back(Move::Normal(ksq, to));
+      if (stop_after_one) return legal;
+    }
+  }
+
+  if (checkers.MoreThanOne()) return legal;
+  assert(checkers.Any());
+
+  Square checker = checkers.Pop();
+  Bitboard between =
+      ShogiTables::BetweenBB[ksq.as_idx()][checker.as_idx()];
+  Bitboard evasion_targets = between;
+  evasion_targets.Set(checker);
+  Bitboard pinned = ComputeBlockersForKing(us) & our;
+
+  // A non-king evasion must capture the checker or interpose between
+  // a sliding checker and the king.
+  Bitboard candidates = our;
+  candidates.Clear(ksq);
+  while (candidates.Any()) {
+    Square from = candidates.Pop();
+    PieceType pt = piece_on(from).GetType();
+    Bitboard targets =
+        PieceAttacks(pt, us, from, occ) & ~our & evasion_targets;
+    if (pinned.Test(from)) {
+      targets &= ShogiTables::LineBB[from.as_idx()][ksq.as_idx()];
+    }
+
+    while (targets.Any()) {
+      Square to = targets.Pop();
+      bool can_promote =
+          pt.CanPromote() &&
+          (from.InPromotionZone(us) || to.InPromotionZone(us));
+      bool must_promote = false;
+      if (pt == kPawn || pt == kLance || pt == kKnight) {
+        Rank dest_rank = to.rank();
+        Rank rel_rank = us == BLACK ? dest_rank
+                                    : Rank::FromIdx(8 - dest_rank.idx);
+        must_promote = (pt == kKnight) ? rel_rank.idx <= 1
+                                       : rel_rank.idx == 0;
+      }
+
+      if (can_promote) {
+        legal.push_back(Move::Promotion(from, to));
+        if (stop_after_one) return legal;
+      }
+      if (!must_promote) {
+        legal.push_back(Move::Normal(from, to));
+        if (stop_after_one) return legal;
       }
     }
-    UndoMove(m, undo);
-    if (!ok) continue;
-    legal.push_back(m);
+  }
+
+  // Drops can only block a single sliding check. Generate directly on
+  // the usually small set of between-squares instead of enumerating
+  // every possible drop on the board.
+  Bitboard empty_between = between & ~occ;
+  Bitboard our_pawns = pieces(us, kPawn);
+  for (int pt_idx = kPawn.idx; pt_idx <= kGold.idx; ++pt_idx) {
+    PieceType pt = PieceType::FromIdx(pt_idx);
+    if (!hand_[us].Has(pt)) continue;
+
+    Bitboard targets = empty_between;
+    if (pt == kPawn || pt == kLance) {
+      Rank forbidden = us == BLACK ? kRank1 : kRank9;
+      targets &= ~ShogiTables::RankBB[forbidden.idx];
+    }
+    if (pt == kKnight) {
+      if (us == BLACK) {
+        targets &= ~ShogiTables::RankBB[0];
+        targets &= ~ShogiTables::RankBB[1];
+      } else {
+        targets &= ~ShogiTables::RankBB[7];
+        targets &= ~ShogiTables::RankBB[8];
+      }
+    }
+    if (pt == kPawn) {
+      for (int f = 0; f < 9; ++f) {
+        if ((our_pawns & ShogiTables::FileBB[f]).Any()) {
+          targets &= ~ShogiTables::FileBB[f];
+        }
+      }
+    }
+
+    while (targets.Any()) {
+      Move move = Move::Drop(pt, targets.Pop());
+      // A blocking pawn can exceptionally counter-check. Preserve the
+      // pawn-drop-mate rule in that case.
+      if (pt != kPawn || IsLegal(move, pinned)) {
+        legal.push_back(move);
+        if (stop_after_one) return legal;
+      }
+    }
   }
 
   return legal;
@@ -991,7 +1102,7 @@ bool ShogiBoard::IsLegal(Move m, const Bitboard& pinned) {
       if (ShogiTables::PawnEffectBB[to.as_idx()][us].Test(king_sq_[~us])) {
         // The pawn drop gives check. Use DoMove to check if it's checkmate.
         UndoInfo undo = DoMoveForMovegen(m);
-        bool is_mate = GenerateLegalMoves().empty();
+        bool is_mate = !HasLegalEvasion();
         UndoMove(m, undo);
         if (is_mate) return false;  // Pawn drop checkmate is illegal.
       }

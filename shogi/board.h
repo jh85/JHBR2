@@ -60,6 +60,7 @@ struct UndoInfo {
   Hand prev_hand;           // Hand of the side that moved, before the move
   uint64_t prev_hash;       // Position hash before the move
   int prev_continuous_check; // Continuous check counter for the moving side
+  bool gave_check = false;  // Whether the move checked the new side to move
   bool updated_auxiliary = true; // Hash/history/check counters were updated
 };
 
@@ -129,6 +130,15 @@ class ShogiBoard {
   // Generate all legal moves for the side to move.
   MoveList GenerateLegalMoves();
 
+  // Generate legal evasions when the side to move is in check.
+  // The caller must guarantee InCheck(). This avoids generating and
+  // testing unrelated moves at shallow-mate AND nodes.
+  MoveList GenerateEvasionMoves();
+
+  // Return as soon as one legal evasion is found. The caller must
+  // guarantee InCheck().
+  bool HasLegalEvasion();
+
   // Generate the subset of legal moves that give check to the
   // opponent. Equivalent to filter(GenerateLegalMoves, MoveGivesCheck).
   //
@@ -152,6 +162,9 @@ class ShogiBoard {
 
   // Apply a move. Returns undo information for undo_move().
   UndoInfo DoMove(Move m);
+
+  // Apply a move whose check status is already known.
+  UndoInfo DoMove(Move m, bool gives_check);
 
   // Undo the last move using saved undo information.
   void UndoMove(Move m, const UndoInfo& undo);
@@ -246,8 +259,12 @@ class ShogiBoard {
 
   // Internal move application. Move generation uses the lightweight mode
   // because temporary legality checks do not need hash/history/check counters.
-  UndoInfo DoMoveInternal(Move m, bool update_auxiliary);
-  UndoInfo DoMoveForMovegen(Move m) { return DoMoveInternal(m, false); }
+  UndoInfo DoMoveInternal(Move m, bool update_auxiliary, int gives_check);
+  UndoInfo DoMoveForMovegen(Move m) {
+    return DoMoveInternal(m, false, -1);
+  }
+
+  MoveList GenerateEvasionMovesImpl(bool stop_after_one);
 
   // Generate pseudo-legal board moves (non-drop).
   void GenerateBoardMoves(MoveList& moves) const;

@@ -125,8 +125,9 @@ void USIEngine::CmdUsi() {
   Send("option name MinibatchSize type spin default 256 min 1 max 4096");
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
-  Send("option name LeafMateMode type combo default dfpn var off var dfpn var shallow");
-  Send("option name LeafMateDepth type spin default 3 min 1 max 7");
+  Send("option name LeafMateMode type combo default shallow var off var dfpn var shallow");
+  Send("option name LeafMateDepth type spin default 5 min 1 max 7");
+  Send("option name RootMateDepth type spin default 7 min 0 max 7");
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
   // MaxGpuBatch sets the TRT engine's max profile shape (and the
@@ -241,6 +242,7 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     } else {
       lc0_config_.leaf_mate_depth = 0;
     }
+    lc0_search_.reset();
   } else if (name_lower == "leafmatedepth") {
     int d = std::stoi(value);
     // Clamp to supported odd values: 1, 3, 5, 7.
@@ -248,6 +250,14 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     if (d > 7) d = 7;
     if (d % 2 == 0) d -= 1;          // round even down to odd
     lc0_config_.leaf_mate_depth = d;
+    lc0_search_.reset();
+  } else if (name_lower == "rootmatedepth") {
+    int d = std::stoi(value);
+    if (d < 0) d = 0;
+    if (d > 7) d = 7;
+    if (d > 0 && d % 2 == 0) d -= 1;
+    lc0_config_.root_mate_depth = d;
+    lc0_search_.reset();
   } else if (name_lower == "nncachesize") {
     lc0_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
     // The cache is owned by the persistent Search object, so rebuild it when

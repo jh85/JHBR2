@@ -373,6 +373,13 @@ int main() {
                     /*actual_mate_depth=*/1);
     }
 
+    // Exact mate-in-7 fixture from dlshogi's shallow-mate test set.
+    assert_mate(
+        "Mate-in-7 (dlshogi fixture)",
+        "l3S1kpl/3r1gs2/1p2p2P1/p1p2P1+Bp/3s2Ps1/2P2p+b1P/"
+        "PP2K4/7R1/LN1g4L w GNPg2n3p 5",
+        /*actual_mate_depth=*/7);
+
     // Mate-in-3 fixture: classic 3-ply puzzle.
     // I'll use a known 3-ply position.
     // Position: black has rook giving check from far, defender's only
