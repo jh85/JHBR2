@@ -17,8 +17,8 @@
 //     call the specialized `GenerateEvasionMoves` path directly.
 //   - dlshogi has a 6-state RepetitionResult; jhbr2 has 4. The
 //     superior/inferior material variants don't apply here.
-//   - dlshogi's `mateMoveIn1Ply()` optimization is replaced by an
-//     inline mate-in-1 detector inside our MateIn3Ply.
+//   - dlshogi's `mateMoveIn1Ply()` is exposed as the shared
+//     `ShogiBoard::FindMateInOneNonCheck()` bitboard routine.
 //   - We omit the `gamePly() + N > draw_ply` cap (dlshogi optimization
 //     for very long games) — not exposed cleanly on ShogiBoard.
 //
@@ -160,19 +160,11 @@ inline bool MateIn3Ply(ShogiBoard& board) {
                 continue;  // this evasion fails, try next
             }
 
-            // OR node (depth 3): attacker plays mate-in-1.
-            // Specialized check-only generator (Phase 6).
-            auto attacker_moves = board.GenerateCheckingMovesNonCheck();
-            bool found_mate1 = false;
-            for (size_t k = 0; k < attacker_moves.size(); ++k) {
-                Move m3 = attacker_moves[k];
-                UndoInfo undo3 = board.DoMove(m3, true);
-                if (!board.HasLegalEvasion()) {
-                    found_mate1 = true;
-                }
-                board.UndoMove(m3, undo3);
-                if (found_mate1) break;
-            }
+            // OR node (depth 3): use the hand-specialized bitboard
+            // mate-in-1 routine. Counterchecks were rejected above, so
+            // the non-check precondition is guaranteed.
+            bool found_mate1 =
+                !board.FindMateInOneNonCheck().is_null();
 
             board.UndoMove(m2, undo2);
             if (!found_mate1) {
@@ -307,27 +299,11 @@ inline bool MateInOddPly<3, true>(ShogiBoard& board) {
 // MateInOddPly<1> — direct mate-in-1 detection
 template <>
 inline bool MateInOddPly<1, false>(ShogiBoard& board) {
-    auto moves = board.GenerateCheckingMovesNonCheck();
-    for (size_t i = 0; i < moves.size(); ++i) {
-        Move m = moves[i];
-        UndoInfo undo = board.DoMove(m, true);
-        bool no_escape = !board.HasLegalEvasion();
-        board.UndoMove(m, undo);
-        if (no_escape) return true;
-    }
-    return false;
+    return !board.FindMateInOneNonCheck().is_null();
 }
 template <>
 inline bool MateInOddPly<1, true>(ShogiBoard& board) {
-    auto moves = board.GenerateCheckingMoves();
-    for (size_t i = 0; i < moves.size(); ++i) {
-        Move m = moves[i];
-        UndoInfo undo = board.DoMove(m, true);
-        bool no_escape = !board.HasLegalEvasion();
-        board.UndoMove(m, undo);
-        if (no_escape) return true;
-    }
-    return false;
+    return !board.FindMateInOne().is_null();
 }
 
 // =============================================================

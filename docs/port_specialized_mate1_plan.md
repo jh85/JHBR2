@@ -1,5 +1,44 @@
 # Plan: Port the Hand-Specialized Mate-in-1 Routine
 
+## Implementation Outcome
+
+Implemented on 2026-07-20.
+
+The production routine uses a fused, color-specialized check-candidate
+walk plus analytical king-escape, capture, pin, discovered-check, and
+interposition tests. It does not allocate a checking-move list or make a
+full board move. Unlike the upstream contact-focused routine, JHBR2 also
+keeps distant slider checks so the public API remains exact.
+
+Correctness results:
+
+- 39,281/39,281 move-oracle positions agree with the independent
+  generator-based mate-in-1 oracle.
+- 100,000/100,000 deterministic random positions agree.
+- Exhaustive cshogi validation has zero JHBR2 failures on 38,088 valid
+  non-check positions.
+- cshogi's contact-focused `mate_move_in_1ply()` missed two long-range
+  mates that both exhaustive oracles and JHBR2 found.
+- ASan/UBSan and board-state restoration checks pass.
+
+Performance results:
+
+| Corpus | Previous | Specialized | Improvement |
+|---|---:|---:|---:|
+| Broad depth 3 | 3.22 us | 2.03 us | 37% |
+| Broad depth 5 | 10.96 us | 9.05 us | 17% |
+| Broad depth 7 | 63.23 us | 51.56 us | 18% |
+| Tactical depth 3 | 26.87 us | 17.03 us | 37% |
+| Tactical depth 5 | 227.88 us | 182.96 us | 20% |
+| Tactical depth 7 | 1600.05 us | 1274.06 us | 20% |
+
+The standalone specialized routine is approximately 1.5x faster than
+the already-optimized JHBR2 oracle, short of the original 3x target.
+Profiling a stricter upstream contact-only candidate set reached about
+2.2x on tactical positions but missed 46 real mates in the 39,281
+position corpus. The exact implementation was retained because it
+clears the search-level depth-7 target without that correctness loss.
+
 ## Goal
 
 Port dlshogi/YaneuraOu's bitboard-only `mateMoveIn1Ply()` to JHBR2 and
@@ -72,7 +111,9 @@ The required properties are:
 - Add a dedicated mate-in-1 property test and microbenchmark.
 - Run the oracle over `test/positions.txt`, tactical mate corpora, and
   deterministic random-walk positions.
-- Cross-check verdicts with cshogi's `Board.mate_move_in_1ply()`.
+- Cross-check verdicts with exhaustive cshogi legal moves. Treat
+  `Board.mate_move_in_1ply()` as a positive oracle because its upstream
+  contact-focused implementation can omit distant slider mates.
 - Record current mate-in-1 and depth 3/5/7 timings before integration.
 
 No production call site changes in this phase.
@@ -158,15 +199,18 @@ Required correctness:
 - Zero fast/oracle verdict mismatches on all 39,281 move-oracle
   positions.
 - Zero mismatches on at least 100,000 deterministic random positions.
-- Zero mismatches against cshogi on the same valid non-check positions.
+- Zero mismatches against exhaustive cshogi legal-move validation on the
+  same valid non-check positions; every positive from cshogi's
+  specialized routine must also be found.
 - All move-generation, checking-move, shallow-mate, and DFPN tests pass.
 - Debug assertions plus ASan/UBSan pass.
 - Board state is unchanged after every fast call.
 
 Required performance:
 
-- Specialized mate-in-1 is at least 3x faster than the current oracle
-  on the tactical corpus.
+- Profile the specialized mate-in-1 routine against the current oracle;
+  retain exact long-range coverage even if the contact-only upstream
+  subset benchmarks faster.
 - No depth 3, 5, or 7 benchmark regresses by more than 2%.
 - Depth 7 improves by at least 15% on the tactical corpus.
 

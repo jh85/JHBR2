@@ -1089,6 +1089,373 @@ MoveList ShogiBoard::GenerateCheckingMovesNonCheck() {
   return result;
 }
 
+// =====================================================================
+// Hand-specialized mate-in-1.
+//
+// Adapted from dlshogi/YaneuraOu's Position::mateMoveIn1Ply at
+// DeepLearningShogi commit 5bdf2c8c7ae664651204f29fdbc3d1f2937a8135.
+// The candidate walk is fused with analytical evasion tests: it never
+// creates a checking-move list and never makes a full board move.
+// =====================================================================
+
+Move ShogiBoard::FindMateInOne() {
+  if (!king_sq_[BLACK].IsValid() || !king_sq_[WHITE].IsValid()) {
+    return Move();
+  }
+  if (!InCheck()) return FindMateInOneNonCheck();
+
+  // The upstream specialized routine requires a non-check position.
+  // Preserve the complete legal checking-move path for counterchecks.
+  MoveList checks = GenerateCheckingMoves();
+  for (const Move& move : checks) {
+    UndoInfo undo = DoMove(move, true);
+    const bool mate = !HasLegalEvasion();
+    UndoMove(move, undo);
+    if (mate) return move;
+  }
+  return Move();
+}
+
+Move ShogiBoard::FindMateInOneNonCheck() {
+  if (!king_sq_[BLACK].IsValid() || !king_sq_[WHITE].IsValid()) {
+    return Move();
+  }
+  assert(!InCheck());
+  Move result = side_to_move_ == BLACK
+                    ? FindMateInOneNonCheckImpl<BLACK>()
+                    : FindMateInOneNonCheckImpl<WHITE>();
+
+#ifndef NDEBUG
+  if (!result.is_null()) {
+    MoveList legal = GenerateLegalMoves();
+    bool found = false;
+    for (const Move& move : legal) {
+      if (move == result) {
+        found = true;
+        break;
+      }
+    }
+    assert(found);
+    UndoInfo undo = DoMove(result, true);
+    assert(!HasLegalEvasion());
+    UndoMove(result, undo);
+  }
+#endif
+
+  return result;
+}
+
+bool ShogiBoard::CanKingEscapeAfterMateProbe(
+    Color attacker, Square checker_square, const Bitboard& occupied_after,
+    const Bitboard& moved_checker_attacks) const {
+  const Color defender = ~attacker;
+  const Square king_square = king_sq_[defender];
+
+  Bitboard targets =
+      ShogiTables::KingEffectBB[king_square.as_idx()] & ~pieces(defender);
+
+  // The moved checker is deliberately absent from the persistent piece
+  // bitboards. Add its square explicitly as a possible king capture.
+  if (ShogiTables::KingEffectBB[king_square.as_idx()].Test(checker_square)) {
+    targets.Set(checker_square);
+  }
+
+  Bitboard occupied_without_king = occupied_after;
+  occupied_without_king.Clear(king_square);
+
+  while (targets.Any()) {
+    const Square to = targets.Pop();
+    Bitboard escape_occupied = occupied_without_king;
+
+    if (to == checker_square) {
+      // The moved checker is not installed in the persistent piece
+      // bitboards, so clearing its square gives the exact post-capture
+      // occupancy for attacks by all supporting pieces.
+      escape_occupied.Clear(checker_square);
+      if (!IsSquareAttacked(to, escape_occupied, attacker)) return true;
+      continue;
+    }
+
+    if (moved_checker_attacks.Test(to)) continue;
+    if (!IsSquareAttacked(to, escape_occupied, attacker)) return true;
+  }
+
+  return false;
+}
+
+bool ShogiBoard::CanDefenderCaptureMateChecker(
+    Color defender, Square checker_square,
+    const Bitboard& occupied_after) const {
+  Bitboard candidates =
+      AttackersTo(checker_square, occupied_after) & pieces(defender);
+  candidates.Clear(king_sq_[defender]);
+  if (candidates.Empty()) return false;
+
+  const Square king_square = king_sq_[defender];
+  const Bitboard pinned =
+      ComputeBlockersForKing(defender) & pieces(defender);
+  while (candidates.Any()) {
+    const Square from = candidates.Pop();
+    if (!pinned.Test(from) ||
+        ShogiTables::LineBB[from.as_idx()][king_square.as_idx()]
+            .Test(checker_square)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ShogiBoard::CanDefenderInterposeMateCheck(
+    Color defender, const Bitboard& between,
+    const Bitboard& occupied_after) const {
+  if (between.Empty()) return false;
+
+  const Bitboard defenders = pieces(defender);
+  const Square king_square = king_sq_[defender];
+  const Bitboard pinned =
+      ComputeBlockersForKing(defender) & defenders;
+
+  Bitboard sources = defenders;
+  sources.Clear(king_square);
+  while (sources.Any()) {
+    const Square from = sources.Pop();
+    const PieceType type = piece_on(from).GetType();
+    Bitboard targets =
+        PieceAttacks(type, defender, from, occupied_after) & between;
+    if (targets.Empty()) continue;
+
+    if (!pinned.Test(from)) return true;
+    targets &=
+        ShogiTables::LineBB[from.as_idx()][king_square.as_idx()];
+    if (targets.Any()) return true;
+  }
+
+  Bitboard empty_between = between & ~occupied_after;
+  if (empty_between.Empty()) return false;
+
+  const Hand defender_hand = hand_[defender];
+  const Bitboard defender_pawns = pieces(defender, kPawn);
+  for (int type_idx = kPawn.idx; type_idx <= kGold.idx; ++type_idx) {
+    const PieceType type = PieceType::FromIdx(type_idx);
+    if (!defender_hand.Has(type)) continue;
+
+    Bitboard targets = empty_between;
+    if (type == kPawn || type == kLance) {
+      targets &= ~(defender == BLACK ? ShogiTables::RankBB[0]
+                                     : ShogiTables::RankBB[8]);
+    }
+    if (type == kKnight) {
+      if (defender == BLACK) {
+        targets &= ~ShogiTables::RankBB[0];
+        targets &= ~ShogiTables::RankBB[1];
+      } else {
+        targets &= ~ShogiTables::RankBB[7];
+        targets &= ~ShogiTables::RankBB[8];
+      }
+    }
+    if (type == kPawn) {
+      for (int file = 0; file < 9; ++file) {
+        if ((defender_pawns & ShogiTables::FileBB[file]).Any()) {
+          targets &= ~ShogiTables::FileBB[file];
+        }
+      }
+    }
+    if (targets.Any()) return true;
+  }
+
+  return false;
+}
+
+template <Color Us>
+bool ShogiBoard::IsMateAfterMateProbe(PieceType moved_type,
+                                      Square checker_square) {
+  constexpr Color Them = Us == BLACK ? WHITE : BLACK;
+  const Square king_square = king_sq_[Them];
+  MateProbeCaptureRemoval capture_removal(*this, checker_square);
+
+  Bitboard occupied_after = occupied();
+  occupied_after.Set(checker_square);
+  Bitboard occupied_without_king = occupied_after;
+  occupied_without_king.Clear(king_square);
+
+  const Bitboard moved_checker_attacks =
+      PieceAttacks(moved_type, Us, checker_square, occupied_without_king);
+  const bool direct_check = moved_checker_attacks.Test(king_square);
+
+  // The moved checker is deliberately absent from the persistent
+  // bitboards. Any attacker found here is a discovered checker.
+  Bitboard discovered_checkers =
+      AttackersTo(king_square, occupied_after) & pieces(Us);
+  if (!direct_check && discovered_checkers.Empty()) return false;
+
+  if (CanKingEscapeAfterMateProbe(
+          Us, checker_square, occupied_after, moved_checker_attacks)) {
+    return false;
+  }
+
+  const int checker_count =
+      discovered_checkers.PopCount() + (direct_check ? 1 : 0);
+  if (checker_count > 1) {
+    // As with ordinary double check, only a king move can resolve both
+    // the moved checker and the discovered checker.
+    return true;
+  }
+
+  const Square sole_checker =
+      direct_check ? checker_square : discovered_checkers.Peek();
+  if (CanDefenderCaptureMateChecker(Them, sole_checker, occupied_after)) {
+    return false;
+  }
+
+  const Bitboard between =
+      ShogiTables::BetweenBB[king_square.as_idx()][sole_checker.as_idx()];
+  if (CanDefenderInterposeMateCheck(Them, between, occupied_after)) {
+    return false;
+  }
+
+  return true;
+}
+
+template <Color Us>
+Move ShogiBoard::FindMateInOneNonCheckImpl() {
+  constexpr Color Them = Us == BLACK ? WHITE : BLACK;
+  const Square king_square = king_sq_[Them];
+  const int king_idx = king_square.as_idx();
+  const Bitboard occupied = this->occupied();
+  const Bitboard our_pieces = pieces(Us);
+
+  auto try_drops = [&](PieceType type, Bitboard check_zone) {
+    if (!hand_[Us].Has(type)) return Move();
+    Bitboard targets = check_zone & ~occupied;
+    while (targets.Any()) {
+      const Square to = targets.Pop();
+      if (IsMateAfterMateProbe<Us>(type, to)) {
+        return Move::Drop(type, to);
+      }
+    }
+    return Move();
+  };
+
+  // Preserve the upstream ordering: major drops first, followed by
+  // gold/silver/knight. Pawn-drop mate is illegal and is never tried.
+  Move mate = try_drops(kRook, ShogiTables::RookEffectBB[king_idx]);
+  if (!mate.is_null()) return mate;
+  mate = try_drops(kLance, ShogiTables::LanceCheckBB[king_idx][Us]);
+  if (!mate.is_null()) return mate;
+  mate = try_drops(kBishop, ShogiTables::BishopCheckBB[king_idx]);
+  if (!mate.is_null()) return mate;
+  mate = try_drops(kGold, ShogiTables::GoldCheckBB[king_idx][Us]);
+  if (!mate.is_null()) return mate;
+  mate = try_drops(kSilver, ShogiTables::SilverCheckBB[king_idx][Us]);
+  if (!mate.is_null()) return mate;
+  mate = try_drops(kKnight, ShogiTables::KnightCheckBB[king_idx][Us]);
+  if (!mate.is_null()) return mate;
+
+  const Bitboard discovered =
+      ComputeBlockersForKing(Them) & our_pieces;
+  const Bitboard pinned =
+      ComputeBlockersForKing(Us) & our_pieces;
+
+  Bitboard direct_candidates =
+      (pieces(Us, kPawn) &
+       ShogiTables::PawnMoveCheckBB[king_idx][Us]) |
+      (pieces(Us, kLance) &
+       ShogiTables::LanceMoveCheckBB[king_idx][Us]) |
+      (pieces(Us, kKnight) &
+       ShogiTables::KnightMoveCheckBB[king_idx][Us]) |
+      (pieces(Us, kSilver) &
+       ShogiTables::SilverMoveCheckBB[king_idx][Us]) |
+      ((pieces(Us, kGold) | pieces(Us, kProPawn) |
+        pieces(Us, kProLance) | pieces(Us, kProKnight) |
+        pieces(Us, kProSilver)) &
+       ShogiTables::GoldMoveCheckBB[king_idx][Us]) |
+      (pieces(Us, kBishop) &
+       ShogiTables::BishopMoveCheckBB[king_idx][Us]) |
+      (pieces(Us, kHorse) &
+       ShogiTables::HorseMoveCheckBB[king_idx]) |
+      pieces(Us, kRook) | pieces(Us, kDragon);
+
+  const Bitboard candidates = direct_candidates | discovered;
+  static constexpr int kPieceOrder[] = {
+      kDragon.idx, kRook.idx, kHorse.idx, kBishop.idx,
+      kGold.idx, kProPawn.idx, kProLance.idx, kProKnight.idx,
+      kProSilver.idx, kSilver.idx, kKnight.idx, kLance.idx,
+      kPawn.idx, kKing.idx,
+  };
+
+  auto must_promote = [&](PieceType type, Square to) {
+    if (type != kPawn && type != kLance && type != kKnight) return false;
+    const Rank rank = to.rank();
+    const Rank relative =
+        Us == BLACK ? rank : Rank::FromIdx(8 - rank.idx);
+    return type == kKnight ? relative.idx <= 1 : relative.idx == 0;
+  };
+
+  auto can_promote = [&](PieceType type, Square from, Square to) {
+    return type.CanPromote() &&
+           (from.InPromotionZone(Us) || to.InPromotionZone(Us));
+  };
+
+  for (const int type_idx : kPieceOrder) {
+    const PieceType type = PieceType::FromIdx(type_idx);
+    Bitboard sources = pieces(Us, type) & candidates;
+    while (sources.Any()) {
+      const Square from = sources.Pop();
+      Bitboard targets =
+          PieceAttacks(type, Us, from, occupied) & ~our_pieces;
+      const bool source_discovers = discovered.Test(from);
+      const Bitboard check_line =
+          ShogiTables::LineBB[from.as_idx()][king_idx];
+
+      if (pinned.Test(from)) {
+        targets &=
+            ShogiTables::LineBB[from.as_idx()][king_sq_[Us].as_idx()];
+      }
+      if (type == kKing) {
+        Bitboard legal_king_targets = Bitboard::Zero();
+        while (targets.Any()) {
+          const Square to = targets.Pop();
+          if (IsLegal(Move::Normal(from, to), pinned)) {
+            legal_king_targets.Set(to);
+          }
+        }
+        targets = legal_king_targets;
+      }
+
+      MateProbeSourceRemoval source_removal(*this, Us, type, from);
+      while (targets.Any()) {
+        const Square to = targets.Pop();
+        const bool discovered_check =
+            source_discovers && !check_line.Test(to);
+        Bitboard occupied_after = this->occupied();
+        occupied_after.Set(to);
+        Bitboard occupied_without_king = occupied_after;
+        occupied_without_king.Clear(king_square);
+
+        auto try_variant = [&](PieceType moved_type, Move move) {
+          const bool direct_check =
+              PieceAttacks(moved_type, Us, to, occupied_without_king)
+                  .Test(king_square);
+          if (!direct_check && !discovered_check) return Move();
+          return IsMateAfterMateProbe<Us>(moved_type, to) ? move : Move();
+        };
+
+        if (can_promote(type, from, to)) {
+          mate = try_variant(
+              type.Promote(), Move::Promotion(from, to));
+          if (!mate.is_null()) return mate;
+        }
+        if (!must_promote(type, to)) {
+          mate = try_variant(type, Move::Normal(from, to));
+          if (!mate.is_null()) return mate;
+        }
+      }
+    }
+  }
+
+  return Move();
+}
+
 bool ShogiBoard::IsLegal(Move m, const Bitboard& pinned) {
   Color us = side_to_move_;
   Square ksq = king_sq_[us];

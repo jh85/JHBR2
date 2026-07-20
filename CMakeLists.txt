@@ -217,6 +217,14 @@ target_link_libraries(test_shallow_mate PRIVATE mate_solver shogi_core)
 add_executable(bench_shallow_mate test/bench_shallow_mate.cc)
 target_link_libraries(bench_shallow_mate PRIVATE mate_solver shogi_core)
 
+# ---- Bench: mate-in-1 oracle vs specialized implementation ----
+add_executable(bench_mate1 test/bench_mate1.cc)
+target_link_libraries(bench_mate1 PRIVATE shogi_core)
+
+# ---- Test: specialized mate-in-1 vs move-generation oracle ----
+add_executable(test_mate1 test/test_mate1.cc)
+target_link_libraries(test_mate1 PRIVATE shogi_core)
+
 # ---- Test: GenerateCheckingMoves property test ----
 add_executable(test_check_movegen test/test_check_movegen.cc)
 target_link_libraries(test_check_movegen PRIVATE shogi_core)

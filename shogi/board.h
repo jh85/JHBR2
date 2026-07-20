@@ -139,6 +139,12 @@ class ShogiBoard {
   // guarantee InCheck().
   bool HasLegalEvasion();
 
+  // Return a legal mate-in-1 move, or a null move if none exists.
+  // FindMateInOneNonCheck uses the hand-specialized bitboard path and
+  // requires that the side to move is not in check.
+  Move FindMateInOne();
+  Move FindMateInOneNonCheck();
+
   // Generate the subset of legal moves that give check to the
   // opponent. Equivalent to filter(GenerateLegalMoves, MoveGivesCheck).
   //
@@ -263,6 +269,73 @@ class ShogiBoard {
   UndoInfo DoMoveForMovegen(Move m) {
     return DoMoveInternal(m, false, -1);
   }
+
+  class MateProbeSourceRemoval {
+   public:
+    MateProbeSourceRemoval(ShogiBoard& board, Color color, PieceType type,
+                           Square square)
+        : board_(board), color_(color), type_(type), square_(square) {
+      assert(board_.by_color_[color_].Test(square_));
+      assert(board_.by_type_[type_.idx].Test(square_));
+      board_.by_color_[color_].Clear(square_);
+      board_.by_type_[type_.idx].Clear(square_);
+    }
+
+    ~MateProbeSourceRemoval() {
+      board_.by_color_[color_].Set(square_);
+      board_.by_type_[type_.idx].Set(square_);
+    }
+
+    MateProbeSourceRemoval(const MateProbeSourceRemoval&) = delete;
+    MateProbeSourceRemoval& operator=(const MateProbeSourceRemoval&) = delete;
+
+   private:
+    ShogiBoard& board_;
+    Color color_;
+    PieceType type_;
+    Square square_;
+  };
+
+  class MateProbeCaptureRemoval {
+   public:
+    MateProbeCaptureRemoval(ShogiBoard& board, Square square)
+        : board_(board), piece_(board.piece_on(square)), square_(square) {
+      if (piece_.IsNone()) return;
+      board_.by_color_[piece_.GetColor()].Clear(square_);
+      board_.by_type_[piece_.GetType().idx].Clear(square_);
+    }
+
+    ~MateProbeCaptureRemoval() {
+      if (piece_.IsNone()) return;
+      board_.by_color_[piece_.GetColor()].Set(square_);
+      board_.by_type_[piece_.GetType().idx].Set(square_);
+    }
+
+    MateProbeCaptureRemoval(const MateProbeCaptureRemoval&) = delete;
+    MateProbeCaptureRemoval& operator=(const MateProbeCaptureRemoval&) =
+        delete;
+
+   private:
+    ShogiBoard& board_;
+    Piece piece_;
+    Square square_;
+  };
+
+  template <Color Us>
+  Move FindMateInOneNonCheckImpl();
+
+  template <Color Us>
+  bool IsMateAfterMateProbe(PieceType moved_type, Square checker_square);
+
+  bool CanKingEscapeAfterMateProbe(
+      Color attacker, Square checker_square, const Bitboard& occupied_after,
+      const Bitboard& moved_checker_attacks) const;
+  bool CanDefenderCaptureMateChecker(
+      Color defender, Square checker_square,
+      const Bitboard& occupied_after) const;
+  bool CanDefenderInterposeMateCheck(
+      Color defender, const Bitboard& between,
+      const Bitboard& occupied_after) const;
 
   MoveList GenerateEvasionMovesImpl(bool stop_after_one);
 

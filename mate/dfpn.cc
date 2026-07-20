@@ -346,18 +346,7 @@ MoveList MateDfpnSolver::GenerateChecks(ShogiBoard& board) {
 // =====================================================================
 
 Move MateDfpnSolver::Mate1Ply(ShogiBoard& board) {
-  MoveList moves = board.GenerateLegalMoves();
-  for (const Move& m : moves) {
-    UndoInfo undo = board.DoMove(m);
-    if (board.InCheck(board.side_to_move())) {
-      if (board.GenerateLegalMoves().empty()) {
-        board.UndoMove(m, undo);
-        return m;
-      }
-    }
-    board.UndoMove(m, undo);
-  }
-  return Move();
+  return board.FindMateInOne();
 }
 
 // =====================================================================

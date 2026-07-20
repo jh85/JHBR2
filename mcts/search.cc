@@ -648,17 +648,7 @@ void MCTSSearch::AddDirichletNoise(Node* root) {
 }
 
 Move MCTSSearch::Mate1Ply(ShogiBoard& board) {
-  // Try each legal move; if it results in checkmate, return it.
-  // This is extremely fast for typical positions because we bail
-  // at the first mate found.
-  MoveList moves = board.GenerateLegalMoves();
-  for (const Move& m : moves) {
-    UndoInfo undo = board.DoMove(m);
-    bool is_mate = board.GenerateLegalMoves().empty();
-    board.UndoMove(m, undo);
-    if (is_mate) return m;
-  }
-  return Move();  // No 1-ply mate
+  return board.FindMateInOne();
 }
 
 // =====================================================================
