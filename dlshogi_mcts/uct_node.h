@@ -82,8 +82,9 @@ struct uct_node_t {
 class NodeTree {
  public:
   NodeTree();
-  ~NodeTree() { DeallocateTree(); }
+  ~NodeTree();
 
+  // Returns true when the new move history extends the previous root.
   bool ResetToPosition(uint64_t starting_pos_key,
                        const std::vector<lczero::Move>& moves);
   uct_node_t* GetCurrentHead() const { return current_head_; }
@@ -93,6 +94,8 @@ class NodeTree {
   uct_node_t* current_head_ = nullptr;
   std::unique_ptr<uct_node_t> gamebegin_node_;
   uint64_t history_starting_pos_key_ = 0;
+  std::vector<lczero::Move> current_position_moves_;
+  bool has_position_ = false;
 };
 
 }  // namespace dlshogi_mcts

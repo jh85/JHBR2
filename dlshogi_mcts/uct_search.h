@@ -70,6 +70,8 @@ struct SearchConfig {
 struct SearchResult {
   lczero::Move best_move;
   lczero::Move ponder_move;
+  bool tree_reused = false;
+  int root_visits_before = 0;
   int nodes = 0;
   float time_sec = 0.0f;
   float nps = 0.0f;
@@ -136,6 +138,8 @@ class Search {
   jhbr2::NNCache nn_cache_;
   lczero::ShogiBoard root_board_;
   uct_node_t* root_ = nullptr;
+  bool tree_reused_ = false;
+  int root_visits_before_ = 0;
   std::atomic<bool> stop_{false};
   std::atomic<int> playout_count_{0};
   Timer timer_;

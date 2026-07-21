@@ -305,14 +305,18 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
   timer_.Restart();
   last_info_ms_ = 0;
   root_board_ = std::move(board);
-  tree_.ResetToPosition(starting_pos_key, moves);
+  tree_reused_ = tree_.ResetToPosition(starting_pos_key, moves);
   root_ = tree_.GetCurrentHead();
+  root_visits_before_ =
+      std::max(0, root_->move_count.load(std::memory_order_acquire));
 
   auto root_legal = root_board_.GenerateLegalMoves();
   if (root_legal.empty()) return BuildResult();
   if (root_legal.size() == 1) {
     SearchResult result;
     result.best_move = root_legal[0];
+    result.tree_reused = tree_reused_;
+    result.root_visits_before = root_visits_before_;
     result.nn_cache = nn_cache_.GetStats();
     return result;
   }
@@ -671,6 +675,8 @@ void Search::MaybeOutputInfo() {
 
 SearchResult Search::BuildResult() const {
   SearchResult result;
+  result.tree_reused = tree_reused_;
+  result.root_visits_before = root_visits_before_;
   result.nodes = playout_count_.load(std::memory_order_acquire);
   result.time_sec = timer_.ElapsedMs() / 1000.0f;
   result.nps = result.time_sec > 0.001f ? result.nodes / result.time_sec : 0.0f;

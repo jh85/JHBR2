@@ -201,6 +201,13 @@ target_link_libraries(test_max_legal_moves PRIVATE shogi_core)
 # ---- Test: sharded NN cache ----
 add_executable(test_nn_cache test/test_nn_cache.cc)
 
+# ---- Test: MCTS subtree reuse ----
+add_executable(test_tree_reuse
+  test/test_tree_reuse.cc
+  dlshogi_mcts/uct_node.cc
+)
+target_link_libraries(test_tree_reuse PRIVATE shogi_core)
+
 # ---- Test: game replay (DoMove chain) ----
 add_executable(test_replay test/test_replay.cc)
 target_link_libraries(test_replay PRIVATE shogi_core)

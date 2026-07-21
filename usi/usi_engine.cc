@@ -547,6 +547,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
       search_->Run(board_, position_start_key_, position_moves_, game_ply_);
   search_done.store(true, std::memory_order_release);
   if (watchdog.joinable()) watchdog.join();
+  Log(std::string("tree_reused ") + (result.tree_reused ? "true" : "false") +
+      " root_visits_before " +
+      std::to_string(result.root_visits_before));
 
   // If MCTS finishes first, preserve the original clock-scaled grace period
   // for root df-pn. The grace period is capped by DfPnMaxTime and by the move

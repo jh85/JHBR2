@@ -1,8 +1,74 @@
 #include "dlshogi_mcts/uct_node.h"
 
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <utility>
 
 namespace dlshogi_mcts {
+namespace {
+
+// Releasing a large discarded branch can otherwise consume the next move's
+// time budget. Ownership is transferred here before the new search starts.
+class NodeGarbageCollector {
+ public:
+  NodeGarbageCollector() : worker_([this] { Run(); }) {}
+
+  ~NodeGarbageCollector() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stopping_ = true;
+    }
+    ready_.notify_one();
+    worker_.join();
+  }
+
+  void DeleteLater(std::unique_ptr<uct_node_t> node) {
+    if (!node) return;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_.push_back(std::move(node));
+    }
+    ready_.notify_one();
+  }
+
+ private:
+  void Run() {
+    while (true) {
+      std::unique_ptr<uct_node_t> node;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+        if (pending_.empty()) {
+          if (stopping_) return;
+          continue;
+        }
+        node = std::move(pending_.front());
+        pending_.pop_front();
+      }
+      node.reset();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable ready_;
+  std::deque<std::unique_ptr<uct_node_t>> pending_;
+  bool stopping_ = false;
+  std::thread worker_;
+};
+
+NodeGarbageCollector& GarbageCollector() {
+  static NodeGarbageCollector collector;
+  return collector;
+}
+
+void DeleteSubtreeLater(std::unique_ptr<uct_node_t> node) {
+  if (node) GarbageCollector().DeleteLater(std::move(node));
+}
+
+}  // namespace
 
 void uct_node_t::ExpandNode(const lczero::ShogiBoard* board) {
   auto moves = const_cast<lczero::ShogiBoard*>(board)->GenerateLegalMoves();
@@ -41,6 +107,11 @@ uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
   }
 
   InitChildNodes();
+  if (child_num == 1 && child[0].move == move) {
+    if (!child_nodes[0]) child_nodes[0] = std::make_unique<uct_node_t>();
+    return child_nodes[0].get();
+  }
+
   for (int i = 0; i < child_num; ++i) {
     if (child[i].move == move) {
       if (!child_nodes[i]) child_nodes[i] = std::make_unique<uct_node_t>();
@@ -48,6 +119,11 @@ uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
       kept_child[0] = std::move(child[i]);
       auto kept_nodes = std::make_unique<std::unique_ptr<uct_node_t>[]>(1);
       kept_nodes[0] = std::move(child_nodes[i]);
+      for (int sibling = 0; sibling < child_num; ++sibling) {
+        if (sibling != i) {
+          DeleteSubtreeLater(std::move(child_nodes[sibling]));
+        }
+      }
       child = std::move(kept_child);
       child_nodes = std::move(kept_nodes);
       child_num = 1;
@@ -55,6 +131,9 @@ uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
     }
   }
 
+  for (int i = 0; i < child_num; ++i) {
+    DeleteSubtreeLater(std::move(child_nodes[i]));
+  }
   CreateSingleChildNode(move);
   child_nodes[0] = std::make_unique<uct_node_t>();
   return child_nodes[0].get();
@@ -62,54 +141,52 @@ uct_node_t* uct_node_t::ReleaseChildrenExceptOne(lczero::Move move) {
 
 NodeTree::NodeTree() { DeallocateTree(); }
 
+NodeTree::~NodeTree() { DeleteSubtreeLater(std::move(gamebegin_node_)); }
+
 bool NodeTree::ResetToPosition(uint64_t starting_pos_key,
                                const std::vector<lczero::Move>& moves) {
   const bool same_game =
-      gamebegin_node_ && history_starting_pos_key_ == starting_pos_key;
+      has_position_ && history_starting_pos_key_ == starting_pos_key;
+  const bool can_reuse =
+      same_game && current_position_moves_.size() <= moves.size() &&
+      std::equal(current_position_moves_.begin(),
+                 current_position_moves_.end(), moves.begin());
   if (!same_game) {
     DeallocateTree();
   }
-  if (!gamebegin_node_) DeallocateTree();
-  history_starting_pos_key_ = starting_pos_key;
 
-  uct_node_t* old_head = same_game ? current_head_ : nullptr;
   uct_node_t* prev_head = nullptr;
   current_head_ = gamebegin_node_.get();
-  bool seen_old_head = old_head && current_head_ == old_head;
   for (lczero::Move move : moves) {
-    // Check before pruning: ReleaseChildrenExceptOne may delete sibling
-    // subtrees, so old_head must only be compared while it is still live.
-    if (!seen_old_head && old_head && current_head_->child &&
-        current_head_->child_nodes) {
-      for (int i = 0; i < current_head_->child_num; ++i) {
-        if (current_head_->child[i].move == move &&
-            current_head_->child_nodes[i].get() == old_head) {
-          seen_old_head = true;
-          break;
-        }
-      }
-    }
     prev_head = current_head_;
     current_head_ = current_head_->ReleaseChildrenExceptOne(move);
   }
 
   // Moving backward to a pruned ancestor would leave only the previously
   // played child available from the new root, so restart that head.
-  if (old_head && !seen_old_head && current_head_ != old_head) {
+  if (same_game && !can_reuse) {
     if (prev_head) {
+      DeleteSubtreeLater(std::move(prev_head->child_nodes[0]));
       prev_head->child_nodes[0] = std::make_unique<uct_node_t>();
       current_head_ = prev_head->child_nodes[0].get();
     } else {
       DeallocateTree();
-      history_starting_pos_key_ = starting_pos_key;
     }
   }
-  return seen_old_head;
+
+  history_starting_pos_key_ = starting_pos_key;
+  current_position_moves_ = moves;
+  has_position_ = true;
+  return can_reuse;
 }
 
 void NodeTree::DeallocateTree() {
+  DeleteSubtreeLater(std::move(gamebegin_node_));
   gamebegin_node_ = std::make_unique<uct_node_t>();
   current_head_ = gamebegin_node_.get();
+  history_starting_pos_key_ = 0;
+  current_position_moves_.clear();
+  has_position_ = false;
 }
 
 }  // namespace dlshogi_mcts
