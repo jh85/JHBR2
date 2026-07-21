@@ -17,7 +17,7 @@ Read first (in order):
 ## Context (what got us here)
 
 jhbr2 is a Shogi engine using lc0-derived MCTS. Per-worker GPU
-dispatch already works (`mcts/nn_tensorrt.cc` has multi-slot per
+dispatch already works (`inference/nn_tensorrt.cc` has multi-slot per
 GPU, matching dlshogi's `IExecutionContext`-per-worker model).
 However, multi-worker NPS does NOT scale: W=2 is *worse* than W=1.
 
@@ -46,9 +46,9 @@ flat-Node-array approach.
 
 ## What you keep from jhbr2 (do NOT touch these)
 
-- `mcts/nn_tensorrt.{h,cc}` — multi-slot direct TRT. Per-worker
+- `inference/nn_tensorrt.{h,cc}` — multi-slot direct TRT. Per-worker
   `IExecutionContext` + CUDA stream + buffers. Already correct.
-- `mcts/nn_eval.{h,cc}` — ORT fallback path.
+- `inference/nn_eval.{h,cc}` — ORT fallback path.
 - `shogi/board.{h,cc}`, `shogi/` — board representation,
   move generation, encoder. Includes recent fixes: OUTE_SENNICHITE
   detection (`continuous_check_` += 2, 2nd-occurrence detect),
@@ -188,7 +188,7 @@ directly to the TRT slot's pinned host buffer.
 
 ## TRT integration
 
-Our `mcts/nn_tensorrt.h` already exposes:
+Our `inference/nn_tensorrt.h` already exposes:
 ```cpp
 class NNEvaluator {
   NNEvaluator(string engine_path, bool use_gpu, int device_id, int max_batch, int num_slots);
@@ -264,7 +264,7 @@ acceptance for step 3 in the master plan.
 │   └── cppshogi/Node.h        # ← port from
 ├── shogi/                     # our board (real path; shogi/ is a symlink)
 ├── lc0_mcts/                  # current MCTS (don't touch in this step)
-├── mcts/                      # NN evaluator (keep, don't touch)
+├── inference/                 # NN evaluator (keep, don't touch)
 ├── usi/                       # USI engine (touch only for build flag)
 ├── docs/                      # planning docs
 │   ├── concurrency_dlshogi_vs_jhbr2.md

@@ -12,11 +12,11 @@
 #include <vector>
 
 #include "dlshogi_mcts/uct_node.h"
-#include "mcts/nn_cache.h"
+#include "inference/nn_cache.h"
 #ifdef USE_TENSORRT
-#include "mcts/nn_tensorrt.h"
+#include "inference/nn_tensorrt.h"
 #else
-#include "mcts/nn_eval.h"
+#include "inference/nn_eval.h"
 #endif
 
 namespace dlshogi_mcts {

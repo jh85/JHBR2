@@ -16,9 +16,9 @@ into jhbr2 wholesale**, mating it with our existing components
 
 These are independent of the MCTS internals and have been validated:
 
-- `mcts/nn_tensorrt.{h,cc}` — direct TRT, multi-slot per GPU, per-worker
+- `inference/nn_tensorrt.{h,cc}` — direct TRT, multi-slot per GPU, per-worker
   `IExecutionContext` + CUDA stream. Already matches dlshogi's slot model.
-- `mcts/nn_eval.{h,cc}` — ORT fallback (rarely used).
+- `inference/nn_eval.{h,cc}` — ORT fallback (rarely used).
 - `shogi/board.h`, `shogi/encoder.{h,cc}` — board + plane encoder. Includes
   recent fixes: OUTE_SENNICHITE detection (`continuous_check_` increment by 2,
   2nd-occurrence detection), MaxMovesToDraw, ply() accessor, CanDeclareWin.
@@ -74,7 +74,7 @@ Re-add iteratively after the base port works:
    - `pos->gamePly()` → `board.ply()`.
    - `pos->getKey()` → `board.Hash()`.
    - dlshogi's encoder → our `EncodeShogiPosition`.
-   - dlshogi's `nn_tensorrt`/`nn_onnxruntime` → our `mcts/nn_tensorrt.h`.
+   - dlshogi's `nn_tensorrt`/`nn_onnxruntime` → our `inference/nn_tensorrt.h`.
 4. Build target `dlshogi_mcts` as a static lib alongside `mcts`.
 5. Add a build flag `USE_DLSHOGI_MCTS` (CMake option) to switch between
    `lc0_mcts` and `dlshogi_mcts` at link time.

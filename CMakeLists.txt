@@ -66,7 +66,7 @@ set(SHOGI_ENGINE_SRCS
   shogi/encoder.cc
 )
 
-# MCTS (dlshogi-style search + NN backend)
+# Search and inference backends
 option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
 
 set(DLSHOGI_MCTS_SRCS
@@ -77,7 +77,7 @@ set(DLSHOGI_MCTS_SRCS
 if(USE_TENSORRT)
   # The native TRT backend uses a CUDA kernel to expand bit-packed input
   # features on the GPU (dlshogi-style). Enable the CUDA language before the
-  # mcts target consumes the .cu source.
+  # nn_backend target consumes the .cu source.
   enable_language(CUDA)
   set(CMAKE_CUDA_STANDARD 17)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
@@ -87,15 +87,13 @@ if(USE_TENSORRT)
       set(CMAKE_CUDA_ARCHITECTURES 70 75 80 86)
     endif()
   endif()
-  set(MCTS_SRCS
-    ${DLSHOGI_MCTS_SRCS}
-    mcts/nn_tensorrt.cc
+  set(NN_BACKEND_SRCS
+    inference/nn_tensorrt.cc
     shogi/encoder_unpack.cu
   )
 else()
-  set(MCTS_SRCS
-    ${DLSHOGI_MCTS_SRCS}
-    mcts/nn_eval.cc
+  set(NN_BACKEND_SRCS
+    inference/nn_eval.cc
   )
 endif()
 
@@ -130,9 +128,15 @@ target_include_directories(time_manager PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(mate_solver STATIC ${MATE_SRCS})
 target_link_libraries(mate_solver PUBLIC shogi_core)
 
-# ---- Library: mcts ----
-add_library(mcts STATIC ${MCTS_SRCS})
-target_link_libraries(mcts PUBLIC shogi_core mate_solver)
+# ---- Library: NN inference backend ----
+add_library(nn_backend STATIC ${NN_BACKEND_SRCS})
+target_include_directories(nn_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nn_backend PUBLIC shogi_core)
+
+# ---- Library: dlshogi-style MCTS ----
+add_library(dlshogi_mcts STATIC ${DLSHOGI_MCTS_SRCS})
+target_include_directories(dlshogi_mcts PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(dlshogi_mcts PUBLIC nn_backend mate_solver shogi_core)
 
 if(USE_TENSORRT)
   # Native TensorRT backend.
@@ -153,35 +157,35 @@ if(USE_TENSORRT)
   endif()
   message(STATUS "TensorRT include: ${TENSORRT_INCLUDE_DIR}")
   message(STATUS "TensorRT nvinfer: ${TENSORRT_NVINFER}")
-  target_compile_definitions(mcts PUBLIC USE_TENSORRT=1)
-  target_include_directories(mcts PUBLIC
+  target_compile_definitions(nn_backend PUBLIC USE_TENSORRT=1)
+  target_include_directories(nn_backend PUBLIC
     ${CUDAToolkit_INCLUDE_DIRS}
     ${TENSORRT_INCLUDE_DIR}
   )
-  target_link_libraries(mcts PUBLIC ${TENSORRT_NVINFER} CUDA::cudart)
+  target_link_libraries(nn_backend PUBLIC ${TENSORRT_NVINFER} CUDA::cudart)
   if(CUDNN_ROOT)
-    target_include_directories(mcts PUBLIC ${CUDNN_ROOT}/include)
-    target_link_directories(mcts PUBLIC ${CUDNN_ROOT}/lib)
-    set_target_properties(mcts PROPERTIES
+    target_include_directories(nn_backend PUBLIC ${CUDNN_ROOT}/include)
+    target_link_directories(nn_backend PUBLIC ${CUDNN_ROOT}/lib)
+    set_target_properties(nn_backend PROPERTIES
       BUILD_RPATH "${TENSORRT_ROOT}/lib;${CUDNN_ROOT}/lib;${CUDAToolkit_LIBRARY_DIR}"
     )
   else()
-    set_target_properties(mcts PROPERTIES
+    set_target_properties(nn_backend PROPERTIES
       BUILD_RPATH "${TENSORRT_ROOT}/lib;${CUDAToolkit_LIBRARY_DIR}"
     )
   endif()
 elseif(ORT_INCLUDE)
   # ONNX Runtime backend.
-  target_include_directories(mcts PUBLIC ${ORT_INCLUDE})
-  target_link_directories(mcts PUBLIC ${ORT_LIB})
-  target_link_libraries(mcts PUBLIC onnxruntime)
-  target_compile_definitions(mcts PUBLIC HAS_ONNXRUNTIME=1)
+  target_include_directories(nn_backend PUBLIC ${ORT_INCLUDE})
+  target_link_directories(nn_backend PUBLIC ${ORT_LIB})
+  target_link_libraries(nn_backend PUBLIC onnxruntime)
+  target_compile_definitions(nn_backend PUBLIC HAS_ONNXRUNTIME=1)
 endif()
 
 # ---- Executable ----
 add_executable(jhbr2 main.cc ${USI_SRCS})
-target_link_libraries(jhbr2 PRIVATE mcts mate_solver opening_book time_manager
-                                    shogi_core)
+target_link_libraries(jhbr2 PRIVATE dlshogi_mcts nn_backend mate_solver
+                                    opening_book time_manager shogi_core)
 if(NOT USE_TENSORRT AND ORT_INCLUDE)
   target_include_directories(jhbr2 PRIVATE ${ORT_INCLUDE})
 endif()

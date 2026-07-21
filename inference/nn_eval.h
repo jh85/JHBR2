@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "mcts/model_format.h"
+#include "inference/model_format.h"
 #include "shogi/board.h"
 #include "shogi/encoder.h"
 #include "shogi/types.h"

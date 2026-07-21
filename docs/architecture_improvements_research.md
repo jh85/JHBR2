@@ -180,7 +180,7 @@ vector → ~250 MB at 2M entries.
 | dlshogi LRU cache | `DeepLearningShogi/selfplay/LruCache.h` |
 | dlshogi cache config / lookup | `DeepLearningShogi/selfplay/self_play.cpp:152, 765, 1082, 1721` |
 | lc0 memcache (unused in jhbr2) | `lc0/src/neural/memcache.{h,cc}` |
-| jhbr2 evaluator (no cache) | `mcts/nn_eval.h`, `mcts/nn_tensorrt.h` |
+| jhbr2 evaluator (no cache) | `inference/nn_eval.h`, `inference/nn_tensorrt.h` |
 
 ---
 

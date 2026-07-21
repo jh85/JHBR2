@@ -90,7 +90,7 @@ one (evaluator, slot). USI option `WorkersPerGpu` (default 2),
 `Threads` is an alias.
 
 **Per-worker GPU resources.** Each evaluator owns N TRT slots
-(`mcts/nn_tensorrt.cc`, `Slot` struct). Each slot has its own
+(`inference/nn_tensorrt.cc`, `Slot` struct). Each slot has its own
 `IExecutionContext`, CUDA stream, pinned host buffers, device
 buffers. Allocated at evaluator construction. Worker `i` uses
 slot `i % workers_per_gpu`. **Equivalent to dlshogi.**
@@ -127,7 +127,7 @@ pickers.**
 `lc0_mcts/node.h:189`). `TryStartScoreUpdate` is a CAS loop. This
 was the only field made atomic in the recent rewrite.
 
-**NN cache.** `mcts/nn_cache.h` — opt-in (default size 0 = off),
+**NN cache.** `inference/nn_cache.h` — opt-in (default size 0 = off),
 single global mutex. Disabled by default.
 
 ---
@@ -175,7 +175,7 @@ The remaining gap is entirely on the CPU/concurrency side.
 ### Option A: Copy dlshogi's MCTS+GPU layer wholesale into jhbr2
 
 Replace `lc0_mcts/{node, search}` with a port of dlshogi's
-`UctSearch.{cpp,h}` and `Node.h`. Keep `mcts/nn_tensorrt.cc` (we
+`UctSearch.{cpp,h}` and `Node.h`. Keep `inference/nn_tensorrt.cc` (we
 already have multi-slot). Keep the encoder.
 
 **Pros**

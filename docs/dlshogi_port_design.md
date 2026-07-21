@@ -46,7 +46,7 @@ gap is due to BT4 model size, not architecture.
 | Board representation | `shogi/board.{h,cc}` | All move-gen, repetition, mate-by-move-limit, nyugyoku. Tested. |
 | Move type | `shogi/types.h` | Already used everywhere. |
 | Encoder | `shogi/encoder.{h,cc}` | 48-plane input matched to current TRT engine. |
-| NN evaluator | `mcts/nn_tensorrt.{h,cc}` | Multi-slot direct TRT, already correct. |
+| NN evaluator | `inference/nn_tensorrt.{h,cc}` | Multi-slot direct TRT, already correct. |
 | Shallow mate | `mate/shallow_mate.h` | Optional leaf mate (replaces dlshogi's df-pn at leaf). |
 | USI handler | `usi/usi_engine.{h,cc}` | All USI plumbing, watchdog, tree reuse, MaxMovesToDraw, VirtualLossWeight. |
 | Opening book | `book/opening_book.{h,cc}` | Independent of the search implementation. |
@@ -591,8 +591,8 @@ For the implementing agent, in order:
    i. `SetLimits`, time management.
    j. `InterruptionCheck` (when to stop searching).
 
-5. **CMakeLists.txt** for `dlshogi_mcts/`. Single static library
-   linking against jhbr2's `shogi/`, `mcts/`, `mate/`. ~30 lines.
+5. **Top-level CMake target** for `dlshogi_mcts`. Single static library
+   linking against jhbr2's `shogi/`, `inference/`, and `mate/` modules.
 
 6. **Wire into usi_engine.cc** behind `USE_DLSHOGI_MCTS` cmake
    flag. Both backends compile; A/B by rebuild.

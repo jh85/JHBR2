@@ -10,7 +10,7 @@
     3. CPU (fallback)
 */
 
-#include "mcts/nn_eval.h"
+#include "inference/nn_eval.h"
 
 #include <algorithm>
 #include <cmath>

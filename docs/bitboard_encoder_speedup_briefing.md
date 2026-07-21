@@ -306,7 +306,7 @@ worth a release.
 ├── shogi/                  # ← board, bitboard, encoder, types (your focus)
 ├── lc0_mcts/               # current MCTS (don't touch)
 ├── dlshogi_mcts/           # in-progress port (don't touch)
-├── mcts/                   # NN evaluator (don't touch)
+├── inference/              # NN evaluator (don't touch)
 ├── usi/                    # USI handler (don't touch)
 ├── mate/                   # mate detection (don't touch)
 ├── test/                   # tests + corpora

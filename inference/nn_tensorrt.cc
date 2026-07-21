@@ -9,7 +9,7 @@
 
 #ifdef USE_TENSORRT
 
-#include "mcts/nn_tensorrt.h"
+#include "inference/nn_tensorrt.h"
 
 #include <NvInfer.h>
 #include <cuda_runtime_api.h>
