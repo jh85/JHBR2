@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "dlshogi_mcts/search_repetition.h"
 #include "mate/shallow_mate.h"
 
 namespace dlshogi_mcts {
@@ -391,7 +392,7 @@ float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
   if (parent && parent->IsLose()) return 1.0f;
   if (parent && parent->IsDraw()) return DrawValue(cfg, board->side_to_move());
 
-  switch (board->CheckRepetition()) {
+  switch (GetSearchRepetitionResult(*board, parent == nullptr)) {
     case ShogiBoard::RepetitionResult::kLoss:
       if (parent) parent->SetLose();
       return 1.0f;

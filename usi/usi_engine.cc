@@ -17,6 +17,7 @@
 
 #include "mate/dfpn.h"
 #include "shogi/encoder.h"
+#include "usi/search_info.h"
 #include "usi/time_manager.h"
 
 namespace jhbr2 {
@@ -84,6 +85,15 @@ static std::string FormatNNCacheStats(const NNCacheStats& stats) {
       << " lock_contentions " << stats.lock_contentions
       << " lock_wait_us " << stats.lock_wait_ns / 1000;
   return out.str();
+}
+
+// USI hashfull is expressed in permill.  JHBR2 does not have a fixed-size
+// MCTS node arena like dlshogi, so its bounded NN position cache is the only
+// meaningful hash-table occupancy to report.
+static int NNCacheHashfull(const NNCacheStats& stats) {
+  if (stats.capacity == 0) return 0;
+  const size_t used = std::min(stats.size, stats.capacity);
+  return static_cast<int>(used * 1000 / stats.capacity);
 }
 
 // =====================================================================
@@ -492,20 +502,23 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // --- Run dlshogi-style MCTS ---
   // Set info callback for periodic GUI output during search.
   search_config_.info_callback = [this](const dlshogi_mcts::SearchInfo& info) {
-    std::string pv_str;
-    for (const auto& m : info.pv) {
-      if (!pv_str.empty()) pv_str += " ";
-      pv_str += m.ToString();
-    }
-    Send("info depth " + std::to_string(info.depth) +
-         " score cp " + std::to_string(info.score_cp) +
-         " nodes " + std::to_string(info.nodes) +
-         " nps " + std::to_string(info.nps) +
-         " time " + std::to_string(info.time_ms) +
-         (pv_str.empty() ? "" : " pv " + pv_str));
+    // Keep free-form diagnostics before the structured record.  Some GUIs
+    // incorrectly treat `info string` as a new empty analysis record, so the
+    // last line in each update must be the complete depth/score/PV record.
     if (info.nn_cache.capacity > 0) {
       Log(FormatNNCacheStats(info.nn_cache));
     }
+
+    USISearchInfo usi_info;
+    usi_info.depth = info.depth;
+    usi_info.seldepth = info.depth;
+    usi_info.score_cp = info.score_cp;
+    usi_info.nodes = std::max(info.nodes, 0);
+    usi_info.nps = std::max(info.nps, 0);
+    usi_info.hashfull = NNCacheHashfull(info.nn_cache);
+    usi_info.time_ms = std::max(info.time_ms, 0);
+    usi_info.pv = info.pv;
+    Send(FormatUSISearchInfo(usi_info));
   };
 
   // Persistent Search object across `go` commands.
@@ -606,23 +619,22 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     return;
   }
 
-  std::string pv_str;
-  for (const auto& m : result.pv) {
-    if (!pv_str.empty()) pv_str += " ";
-    pv_str += m.ToString();
-  }
-  if (pv_str.empty()) pv_str = result.best_move.ToString();
-
-  int pv_depth = static_cast<int>(result.pv.size());
-  Send("info depth " + std::to_string(std::max(pv_depth, 1)) +
-       " score cp " + std::to_string(result.score_cp) +
-       " nodes " + std::to_string(result.nodes) +
-       " time " + std::to_string(static_cast<int>(result.time_sec * 1000)) +
-       " nps " + std::to_string(static_cast<int>(result.nps)) +
-       " pv " + pv_str);
   if (result.nn_cache.capacity > 0) {
     Log(FormatNNCacheStats(result.nn_cache));
   }
+
+  USISearchInfo usi_info;
+  usi_info.pv = result.pv;
+  if (usi_info.pv.empty()) usi_info.pv.push_back(result.best_move);
+  usi_info.depth = static_cast<int>(usi_info.pv.size());
+  usi_info.seldepth = usi_info.depth;
+  usi_info.score_cp = result.score_cp;
+  usi_info.nodes = std::max(result.nodes, 0);
+  usi_info.nps = static_cast<std::uint64_t>(std::max(result.nps, 0.0f));
+  usi_info.hashfull = NNCacheHashfull(result.nn_cache);
+  usi_info.time_ms = static_cast<std::uint64_t>(
+      std::max(result.time_sec, 0.0f) * 1000.0f);
+  Send(FormatUSISearchInfo(usi_info));
 
   Send("bestmove " + result.best_move.ToString());
 }

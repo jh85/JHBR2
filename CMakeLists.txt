@@ -104,6 +104,7 @@ set(MATE_SRCS
 
 # USI
 set(USI_SRCS
+  usi/search_info.cc
   usi/usi_engine.cc
 )
 
@@ -208,6 +209,10 @@ add_executable(test_tree_reuse
 )
 target_link_libraries(test_tree_reuse PRIVATE shogi_core)
 
+# ---- Test: root vs descendant repetition search policy ----
+add_executable(test_search_repetition test/test_search_repetition.cc)
+target_link_libraries(test_search_repetition PRIVATE shogi_core)
+
 # ---- Test: game replay (DoMove chain) ----
 add_executable(test_replay test/test_replay.cc)
 target_link_libraries(test_replay PRIVATE shogi_core)
@@ -255,3 +260,10 @@ target_link_libraries(test_opening_book PRIVATE opening_book)
 # ---- Test: pure move-time calculation ----
 add_executable(test_time_manager test/test_time_manager.cc)
 target_link_libraries(test_time_manager PRIVATE time_manager)
+
+# ---- Test: canonical USI search-info formatting ----
+add_executable(test_search_info
+  test/test_search_info.cc
+  usi/search_info.cc
+)
+target_link_libraries(test_search_info PRIVATE shogi_core)
