@@ -122,6 +122,10 @@ target_include_directories(shogi_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 add_library(opening_book STATIC book/opening_book.cc)
 target_include_directories(opening_book PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
+# ---- Library: pure move-time calculation ----
+add_library(time_manager STATIC usi/time_manager.cc)
+target_include_directories(time_manager PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 # ---- Library: mate solver ----
 add_library(mate_solver STATIC ${MATE_SRCS})
 target_link_libraries(mate_solver PUBLIC shogi_core)
@@ -176,7 +180,8 @@ endif()
 
 # ---- Executable ----
 add_executable(jhbr2 main.cc ${USI_SRCS})
-target_link_libraries(jhbr2 PRIVATE mcts mate_solver opening_book shogi_core)
+target_link_libraries(jhbr2 PRIVATE mcts mate_solver opening_book time_manager
+                                    shogi_core)
 if(NOT USE_TENSORRT AND ORT_INCLUDE)
   target_include_directories(jhbr2 PRIVATE ${ORT_INCLUDE})
 endif()
@@ -228,3 +233,7 @@ target_link_libraries(test_check_movegen PRIVATE shogi_core)
 # ---- Test: opening book preload and on-the-fly lookup ----
 add_executable(test_opening_book test/test_opening_book.cc)
 target_link_libraries(test_opening_book PRIVATE opening_book)
+
+# ---- Test: pure move-time calculation ----
+add_executable(test_time_manager test/test_time_manager.cc)
+target_link_libraries(test_time_manager PRIVATE time_manager)

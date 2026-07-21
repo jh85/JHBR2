@@ -1,6 +1,6 @@
 /*
   JHBR2 Shogi Engine — USI Protocol Implementation
-  Now using lc0-style MCTS search.
+  Uses the dlshogi-style MCTS search.
 */
 
 #include "usi/usi_engine.h"
@@ -16,6 +16,7 @@
 
 #include "mate/dfpn.h"
 #include "shogi/encoder.h"
+#include "usi/time_manager.h"
 
 namespace jhbr2 {
 
@@ -362,7 +363,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // Parse time controls.
   int btime = 0, wtime = 0, byoyomi = 0, binc = 0, winc = 0;
   int nodes_limit = max_nodes_;
-  float max_time = 0.0f;
 
   size_t i = 1;
   while (i < parts.size()) {
@@ -379,7 +379,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     } else if (parts[i] == "nodes" && i + 1 < parts.size()) {
       nodes_limit = std::stoi(parts[i + 1]); i += 2;
     } else if (parts[i] == "infinite") {
-      max_time = 0; nodes_limit = 10000000; i++;
+      nodes_limit = 10000000; i++;
     } else if (parts[i] == "mate") {
       CmdGoMate(parts);
       return;
@@ -390,26 +390,20 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     }
   }
 
-  // Time management.
-  if (byoyomi > 0) {
-    max_time = byoyomi / 1000.0f * 0.9f;
-  } else if (btime > 0 || wtime > 0) {
-    int my_time = (board_.side_to_move() == BLACK) ? btime : wtime;
-    int my_inc = (board_.side_to_move() == BLACK) ? binc : winc;
-    max_time = (my_time * 0.05f + my_inc * 0.8f) / 1000.0f;
-    max_time = std::max(max_time, 0.1f);
-  }
+  TimeControl time_control;
+  time_control.main_time_ms =
+      board_.side_to_move() == BLACK ? btime : wtime;
+  time_control.increment_ms =
+      board_.side_to_move() == BLACK ? binc : winc;
+  time_control.byoyomi_ms = byoyomi;
+  time_control.has_main_time = btime > 0 || wtime > 0;
 
-  {
-    int my_time = (board_.side_to_move() == BLACK) ? btime : wtime;
-    int cap_ms = max_move_time_ms_;
-    if (max_move_time_1m_ms_ > 0 && my_time > 0 && my_time < 60000)
-      cap_ms = max_move_time_1m_ms_;
-    if (cap_ms > 0) {
-      float cap = std::max(cap_ms / 1000.0f - 0.5f, 0.5f);
-      if (max_time <= 0.0f || cap < max_time) max_time = cap;
-    }
-  }
+  TimeOptions time_options;
+  time_options.max_move_time_ms = max_move_time_ms_;
+  time_options.max_move_time_1m_ms = max_move_time_1m_ms_;
+  time_options.dfpn_max_time_ms = dfpn_max_time_ms_;
+  const TimeBudget time_budget =
+      TimeManager::Compute(time_control, time_options);
 
   // Check entering-king declaration.
   if (board_.CanDeclareWin()) {
@@ -435,42 +429,10 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 
   // Configure the dlshogi-style MCTS search.
   search_config_.max_nodes = nodes_limit;
-  search_config_.max_time = max_time;
+  search_config_.max_time = time_budget.mcts_time_seconds;
 
   // --- Launch root df-pn in parallel ---
-  int my_time_ms = (board_.side_to_move() == BLACK) ? btime : wtime;
-  int my_inc_ms = (board_.side_to_move() == BLACK) ? binc : winc;
-  int available_ms = my_time_ms + my_inc_ms + byoyomi;
-
-  int dfpn_min_wait_ms;
-  size_t root_dfpn_nodes;
-  if (available_ms <= 0) {
-    dfpn_min_wait_ms = 300; root_dfpn_nodes = 100000;
-  } else if (available_ms < 10000) {
-    dfpn_min_wait_ms = 100; root_dfpn_nodes = 10000;
-  } else if (available_ms < 60000) {
-    dfpn_min_wait_ms = 300; root_dfpn_nodes = 100000;
-  } else if (available_ms < 300000) {
-    dfpn_min_wait_ms = 500; root_dfpn_nodes = 500000;
-  } else {
-    dfpn_min_wait_ms = 1000; root_dfpn_nodes = 2000000;
-  }
-
   auto move_start_time = std::chrono::steady_clock::now();
-  int hard_deadline_ms = 0;
-  if (max_move_time_ms_ > 0) {
-    hard_deadline_ms = max_move_time_ms_;
-  } else if (max_time > 0.0f) {
-    hard_deadline_ms = static_cast<int>(max_time * 1000) + 2000;
-  }
-
-  // DfPnMaxTime is an upper bound on the concurrent root mate search.
-  // Leave a small margin when the move itself has a tighter deadline.
-  int root_dfpn_time_ms = dfpn_max_time_ms_;
-  if (hard_deadline_ms > 0) {
-    root_dfpn_time_ms =
-        std::min(root_dfpn_time_ms, std::max(hard_deadline_ms - 50, 1));
-  }
 
   // Keep the solver and its result in one state shared by the worker and
   // deadline timer.
@@ -481,18 +443,21 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     ShogiBoard board;
     DfpnState(size_t nodes, const ShogiBoard& b) : solver(nodes), board(b) {}
   };
-  auto dfpn = std::make_shared<DfpnState>(root_dfpn_nodes, board_);
+  auto dfpn =
+      std::make_shared<DfpnState>(time_budget.root_dfpn_nodes, board_);
 
-  auto dfpn_thread = std::thread([dfpn, root_dfpn_nodes]() {
-    dfpn->mate_move = dfpn->solver.search(dfpn->board, root_dfpn_nodes);
-    dfpn->done.store(true, std::memory_order_release);
-  });
+  auto dfpn_thread =
+      std::thread([dfpn, root_dfpn_nodes = time_budget.root_dfpn_nodes]() {
+        dfpn->mate_move = dfpn->solver.search(dfpn->board, root_dfpn_nodes);
+        dfpn->done.store(true, std::memory_order_release);
+      });
 
   // Enforce DfPnMaxTime independently of MCTS duration. Cancellation is
   // atomic and checked throughout df-pn, so the worker can always be joined
   // safely instead of being detached while its result is still shared.
   auto dfpn_timer = std::thread(
-      [dfpn, root_dfpn_time_ms, move_start_time]() {
+      [dfpn, root_dfpn_time_ms = time_budget.root_dfpn_time_ms,
+       move_start_time]() {
         while (!dfpn->done.load(std::memory_order_acquire)) {
           const auto elapsed_ms =
               std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -539,19 +504,22 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // searches intentionally have no implicit time cap.
   std::atomic<bool> search_done{false};
   std::thread watchdog;
-  if (hard_deadline_ms > 0) {
-    watchdog = std::thread([this, &search_done, hard_deadline_ms,
-                            move_start_time]() {
-      while (!search_done.load(std::memory_order_acquire)) {
-        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - move_start_time).count();
-        if (elapsed_ms >= hard_deadline_ms) {
-          if (search_) search_->Stop();
-          return;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      }
-    });
+  if (time_budget.hard_deadline_ms > 0) {
+    watchdog = std::thread(
+        [this, &search_done,
+         hard_deadline_ms = time_budget.hard_deadline_ms, move_start_time]() {
+          while (!search_done.load(std::memory_order_acquire)) {
+            auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - move_start_time)
+                    .count();
+            if (elapsed_ms >= hard_deadline_ms) {
+              if (search_) search_->Stop();
+              return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          }
+        });
   }
 
   auto result =
@@ -564,13 +532,15 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // deadline, so it cannot recreate the old tournament time overruns.
   auto dfpn_wait_deadline =
       std::chrono::steady_clock::now() +
-      std::chrono::milliseconds(dfpn_min_wait_ms);
+      std::chrono::milliseconds(time_budget.root_dfpn_grace_ms);
   const auto dfpn_time_deadline =
-      move_start_time + std::chrono::milliseconds(root_dfpn_time_ms);
+      move_start_time +
+      std::chrono::milliseconds(time_budget.root_dfpn_time_ms);
   dfpn_wait_deadline = std::min(dfpn_wait_deadline, dfpn_time_deadline);
-  if (hard_deadline_ms > 0) {
+  if (time_budget.hard_deadline_ms > 0) {
     const auto move_deadline =
-        move_start_time + std::chrono::milliseconds(hard_deadline_ms);
+        move_start_time +
+        std::chrono::milliseconds(time_budget.hard_deadline_ms);
     dfpn_wait_deadline = std::min(dfpn_wait_deadline, move_deadline);
   }
 
