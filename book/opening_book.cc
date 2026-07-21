@@ -5,14 +5,15 @@
   approach. The file must be sorted lexicographically by SFEN line.
 */
 
-#include "lc0_mcts/book.h"
+#include "book/opening_book.h"
 
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 
-namespace lc0_shogi {
+namespace jhbr2 {
 
 OpeningBook::~OpeningBook() {
   if (fs_.is_open()) fs_.close();
@@ -197,4 +198,4 @@ const BookEntry* OpeningBook::Probe(const std::string& sfen) {
   return &it->second;
 }
 
-}  // namespace lc0_shogi
+}  // namespace jhbr2

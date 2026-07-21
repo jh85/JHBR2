@@ -66,14 +66,8 @@ set(SHOGI_ENGINE_SRCS
   shogi/encoder.cc
 )
 
-# MCTS (lc0-style port + NN backend)
+# MCTS (dlshogi-style search + NN backend)
 option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
-
-set(LC0_MCTS_SRCS
-  lc0_mcts/node.cc
-  lc0_mcts/search.cc
-  lc0_mcts/book.cc
-)
 
 set(DLSHOGI_MCTS_SRCS
   dlshogi_mcts/uct_node.cc
@@ -94,14 +88,12 @@ if(USE_TENSORRT)
     endif()
   endif()
   set(MCTS_SRCS
-    ${LC0_MCTS_SRCS}
     ${DLSHOGI_MCTS_SRCS}
     mcts/nn_tensorrt.cc
     shogi/encoder_unpack.cu
   )
 else()
   set(MCTS_SRCS
-    ${LC0_MCTS_SRCS}
     ${DLSHOGI_MCTS_SRCS}
     mcts/nn_eval.cc
   )
@@ -125,6 +117,10 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 # ---- Library: shogi engine core ----
 add_library(shogi_core STATIC ${SHOGI_ENGINE_SRCS})
 target_include_directories(shogi_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
+# ---- Library: opening book ----
+add_library(opening_book STATIC book/opening_book.cc)
+target_include_directories(opening_book PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 # ---- Library: mate solver ----
 add_library(mate_solver STATIC ${MATE_SRCS})
@@ -180,7 +176,7 @@ endif()
 
 # ---- Executable ----
 add_executable(jhbr2 main.cc ${USI_SRCS})
-target_link_libraries(jhbr2 PRIVATE mcts mate_solver shogi_core)
+target_link_libraries(jhbr2 PRIVATE mcts mate_solver opening_book shogi_core)
 if(NOT USE_TENSORRT AND ORT_INCLUDE)
   target_include_directories(jhbr2 PRIVATE ${ORT_INCLUDE})
 endif()
@@ -228,3 +224,7 @@ target_link_libraries(test_mate1 PRIVATE shogi_core)
 # ---- Test: GenerateCheckingMoves property test ----
 add_executable(test_check_movegen test/test_check_movegen.cc)
 target_link_libraries(test_check_movegen PRIVATE shogi_core)
+
+# ---- Test: opening book preload and on-the-fly lookup ----
+add_executable(test_opening_book test/test_opening_book.cc)
+target_link_libraries(test_opening_book PRIVATE opening_book)

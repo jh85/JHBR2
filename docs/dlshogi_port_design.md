@@ -1,5 +1,8 @@
 # Technical Design: dlshogi-style MCTS for jhbr2
 
+**Status:** Implemented. The retired `lc0_mcts` backend has been removed;
+this document is retained as the design record for the migration.
+
 This document supersedes the mechanical-port plan in
 `docs/dlshogi_port_step1_briefing.md`. After completing the
 mechanical step 1, ~440 lines of stub baggage accumulated (stub
@@ -46,7 +49,7 @@ gap is due to BT4 model size, not architecture.
 | NN evaluator | `mcts/nn_tensorrt.{h,cc}` | Multi-slot direct TRT, already correct. |
 | Shallow mate | `mate/shallow_mate.h` | Optional leaf mate (replaces dlshogi's df-pn at leaf). |
 | USI handler | `usi/usi_engine.{h,cc}` | All USI plumbing, watchdog, tree reuse, MaxMovesToDraw, VirtualLossWeight. |
-| Opening book | `lc0_mcts/book.{h,cc}` | Move out of `lc0_mcts/` to a top-level `book/` directory. |
+| Opening book | `book/opening_book.{h,cc}` | Independent of the search implementation. |
 | Benchmark | `tools/benchmark.py` | Already produces measurable numbers. |
 
 ## 3. What we replace
@@ -58,8 +61,8 @@ gap is due to BT4 model size, not architecture.
 | `lc0_mcts/backend.h` | (removed — direct evaluator calls) |
 | `lc0_mcts/types.h` | merged into `uct_node.h` or kept minimal in `dlshogi_mcts/types.h` |
 
-Eventually `lc0_mcts/` is deleted entirely once dlshogi_mcts is
-verified working.
+The retired `lc0_mcts/` implementation was deleted after dlshogi_mcts
+became the verified production backend.
 
 ## 4. Module file structure (clean target)
 

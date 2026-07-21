@@ -157,7 +157,7 @@ void USIEngine::CmdIsReady() {
       evaluators_.push_back(
           std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
                                         max_gpu_batch_,
-                                        lc0_config_.workers_per_gpu,
+                                        search_config_.workers_per_gpu,
                                         model_format_));
     }
 
@@ -195,16 +195,16 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   } else if (name_lower == "onnxmodel") {
     onnx_path_ = value;
     evaluators_.clear();
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "modelformat") {
     model_format_ = ParseModelFormat(value);
     evaluators_.clear();
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "dlshogimodel") {
     model_format_ = (value == "true") ? ModelFormat::kDlshogi
                                       : ModelFormat::kAuto;
     evaluators_.clear();
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "noiseepsilon") {
     noise_epsilon_ = std::stof(value);
     // dlshogi-style search does not inject root noise in USI play.
@@ -213,20 +213,20 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   } else if (name_lower == "threads") {
     // Backward-compat alias for WorkersPerGpu.
     int n = std::stoi(value);
-    lc0_config_.workers_per_gpu = n;
-    lc0_search_.reset();
+    search_config_.workers_per_gpu = n;
+    search_.reset();
     evaluators_.clear();
   } else if (name_lower == "workerspergpu") {
     int n = std::stoi(value);
     if (n < 1) n = 1;
-    lc0_config_.workers_per_gpu = n;
+    search_config_.workers_per_gpu = n;
     // Each evaluator must be (re-)constructed with this many TRT
     // execution slots, so drop both Search and evaluators.
-    lc0_search_.reset();
+    search_.reset();
     evaluators_.clear();
   } else if (name_lower == "minibatchsize") {
-    lc0_config_.minibatch_size = std::stoi(value);
-    lc0_search_.reset();
+    search_config_.minibatch_size = std::stoi(value);
+    search_.reset();
   } else if (name_lower == "perleafgathering") {
     // Per-leaf gathering is always enabled by the dlshogi-style worker loop.
   } else if (name_lower == "leafdfpnnodes") {
@@ -235,49 +235,50 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     std::string v = value;
     for (auto& c : v) c = std::tolower(c);
     if (v == "shallow") {
-      if (lc0_config_.leaf_mate_depth <= 0 ||
-          lc0_config_.leaf_mate_depth % 2 == 0) {
-        lc0_config_.leaf_mate_depth = 5;
+      if (search_config_.leaf_mate_depth <= 0 ||
+          search_config_.leaf_mate_depth % 2 == 0) {
+        search_config_.leaf_mate_depth = 5;
       }
     } else {
-      lc0_config_.leaf_mate_depth = 0;
+      search_config_.leaf_mate_depth = 0;
     }
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "leafmatedepth") {
     int d = std::stoi(value);
     // Clamp to supported odd values: 1, 3, 5, 7.
     if (d < 1) d = 1;
     if (d > 7) d = 7;
     if (d % 2 == 0) d -= 1;          // round even down to odd
-    lc0_config_.leaf_mate_depth = d;
-    lc0_search_.reset();
+    search_config_.leaf_mate_depth = d;
+    search_.reset();
   } else if (name_lower == "rootmatedepth") {
     int d = std::stoi(value);
     if (d < 0) d = 0;
     if (d > 7) d = 7;
     if (d > 0 && d % 2 == 0) d -= 1;
-    lc0_config_.root_mate_depth = d;
-    lc0_search_.reset();
+    search_config_.root_mate_depth = d;
+    search_.reset();
   } else if (name_lower == "nncachesize") {
-    lc0_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
+    search_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
     // The cache is owned by the persistent Search object, so rebuild it when
     // capacity changes. Evaluators can stay loaded.
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "numgpus") {
     num_gpus_ = std::stoi(value);
-    lc0_config_.num_gpus = num_gpus_;
+    search_config_.num_gpus = num_gpus_;
     evaluators_.clear();
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "maxmovestodraw") {
     int n = std::stoi(value);
     if (n < 1) n = 1;
-    lc0_config_.max_moves_to_draw = n;
+    search_config_.max_moves_to_draw = n;
   } else if (name_lower == "movesleftweight") {
-    lc0_config_.moves_left_weight = std::max(0.0f, std::stof(value));
+    search_config_.moves_left_weight = std::max(0.0f, std::stof(value));
   } else if (name_lower == "movesleftthreshold") {
-    lc0_config_.moves_left_threshold = std::clamp(std::stof(value), 0.0f, 0.5f);
+    search_config_.moves_left_threshold =
+        std::clamp(std::stof(value), 0.0f, 0.5f);
   } else if (name_lower == "movesleftcap") {
-    lc0_config_.moves_left_cap = std::max(0.0f, std::stof(value));
+    search_config_.moves_left_cap = std::max(0.0f, std::stof(value));
   } else if (name_lower == "virtuallossweight") {
     float w = std::stof(value);
     if (w < 0.1f) w = 0.1f;
@@ -288,7 +289,7 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     // Evaluators bake the TRT max_shapes profile at construction time, so
     // a change here only takes effect after isready rebuilds them.
     evaluators_.clear();
-    lc0_search_.reset();
+    search_.reset();
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {
@@ -313,7 +314,7 @@ void USIEngine::CmdUsiNewGame() {
   // Drop the Search object so the next `go` rebuilds it with a fresh
   // tree. Otherwise tree reuse would carry over visit counts from the
   // previous game's positions, which is incorrect.
-  lc0_search_.reset();
+  search_.reset();
 }
 
 void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
@@ -432,9 +433,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     }
   }
 
-  // Configure lc0 MCTS search.
-  lc0_config_.max_nodes = nodes_limit;
-  lc0_config_.max_time = max_time;
+  // Configure the dlshogi-style MCTS search.
+  search_config_.max_nodes = nodes_limit;
+  search_config_.max_time = max_time;
 
   // --- Launch root df-pn in parallel ---
   int my_time_ms = (board_.side_to_move() == BLACK) ? btime : wtime;
@@ -507,7 +508,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
 
   // --- Run dlshogi-style MCTS ---
   // Set info callback for periodic GUI output during search.
-  lc0_config_.info_callback = [this](const dlshogi_mcts::SearchInfo& info) {
+  search_config_.info_callback = [this](const dlshogi_mcts::SearchInfo& info) {
     std::string pv_str;
     for (const auto& m : info.pv) {
       if (!pv_str.empty()) pv_str += " ";
@@ -522,16 +523,17 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   };
 
   // Persistent Search object across `go` commands.
-  if (!lc0_search_) {
+  if (!search_) {
     std::vector<jhbr2::NNEvaluator*> eval_ptrs;
     for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
-    lc0_search_ = std::make_unique<dlshogi_mcts::Search>(eval_ptrs, lc0_config_);
+    search_ =
+        std::make_unique<dlshogi_mcts::Search>(eval_ptrs, search_config_);
   }
   // Search holds its own config snapshot — push per-move
   // updates so max_time / max_nodes reflect THIS go command, not the
   // first one ever issued.
-  lc0_search_->SetMaxTime(lc0_config_.max_time);
-  lc0_search_->SetMaxNodes(lc0_config_.max_nodes);
+  search_->SetMaxTime(search_config_.max_time);
+  search_->SetMaxNodes(search_config_.max_nodes);
 
   // Watchdog: hard deadline enforcement for timed searches. Pure node-limited
   // searches intentionally have no implicit time cap.
@@ -544,7 +546,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
         auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - move_start_time).count();
         if (elapsed_ms >= hard_deadline_ms) {
-          if (lc0_search_) lc0_search_->Stop();
+          if (search_) search_->Stop();
           return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -552,8 +554,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     });
   }
 
-  auto result = lc0_search_->Run(board_, position_start_key_, position_moves_,
-                                 game_ply_);
+  auto result =
+      search_->Run(board_, position_start_key_, position_moves_, game_ply_);
   search_done.store(true, std::memory_order_release);
   if (watchdog.joinable()) watchdog.join();
 
@@ -692,7 +694,7 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
 }
 
 void USIEngine::CmdStop() {
-  if (lc0_search_) lc0_search_->Stop();
+  if (search_) search_->Stop();
 }
 
 void USIEngine::CmdGameOver(const std::vector<std::string>& parts) {

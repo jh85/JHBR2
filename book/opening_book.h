@@ -20,7 +20,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace lc0_shogi {
+namespace jhbr2 {
 
 struct BookEntry {
   std::string move_usi;    // best move USI string
@@ -59,4 +59,4 @@ class OpeningBook {
   BookEntry otf_result_;  // reusable buffer for on-the-fly results
 };
 
-}  // namespace lc0_shogi
+}  // namespace jhbr2

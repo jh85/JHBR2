@@ -20,8 +20,8 @@
 #else
 #include "mcts/nn_eval.h"
 #endif
+#include "book/opening_book.h"
 #include "dlshogi_mcts/uct_search.h"
-#include "lc0_mcts/book.h"
 #include "shogi/board.h"
 
 namespace jhbr2 {
@@ -56,8 +56,8 @@ class USIEngine {
   // --- Members ---
   lczero::ShogiBoard board_;
   std::vector<std::unique_ptr<NNEvaluator>> evaluators_;
-  std::unique_ptr<dlshogi_mcts::Search> lc0_search_;
-  dlshogi_mcts::SearchConfig lc0_config_;
+  std::unique_ptr<dlshogi_mcts::Search> search_;
+  dlshogi_mcts::SearchConfig search_config_;
   int game_ply_ = 0;
   uint64_t position_start_key_ = 0;
   std::vector<lczero::Move> position_moves_;
@@ -75,7 +75,7 @@ class USIEngine {
   int max_move_time_1m_ms_ = 0;
   std::string book_path_;
   bool book_on_the_fly_ = false;
-  lc0_shogi::OpeningBook book_;
+  OpeningBook book_;
 };
 
 }  // namespace jhbr2

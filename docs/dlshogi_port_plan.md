@@ -110,10 +110,10 @@ In priority order, only as needed:
 3. Watchdog deadline enforcement.
 4. VirtualLossWeight USI option.
 
-### Step 5: deprecate lc0_mcts
+### Step 5: deprecate lc0_mcts (completed)
 
-Once dlshogi_mcts is the production backend, remove `lc0_mcts/` and
-the build flag. Single MCTS implementation.
+`dlshogi_mcts` is the production backend. The opening book was moved to
+`book/`, and the retired `lc0_mcts/` search implementation was removed.
 
 ## Effort estimate
 
