@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -58,6 +59,31 @@ static std::string ModelFormatToString(ModelFormat format) {
       return "dlshogi";
   }
   return "auto";
+}
+
+static std::string FormatNNCacheStats(const NNCacheStats& stats) {
+  const double hit_rate = stats.lookups == 0
+                              ? 0.0
+                              : 100.0 * static_cast<double>(stats.hits) /
+                                    static_cast<double>(stats.lookups);
+  const double reuse_rate =
+      stats.lookups == 0
+          ? 0.0
+          : 100.0 * static_cast<double>(stats.hits + stats.in_flight_waits) /
+                static_cast<double>(stats.lookups);
+  std::ostringstream out;
+  out << "nncache size " << stats.size << "/" << stats.capacity
+      << " probes " << stats.lookups << " hits " << stats.hits
+      << " hitrate " << std::fixed << std::setprecision(1) << hit_rate << "%"
+      << " reuse_rate " << reuse_rate << "%"
+      << " inserts " << stats.inserts
+      << " duplicate_inserts " << stats.duplicate_inserts
+      << " evictions " << stats.evictions
+      << " in_flight_owners " << stats.in_flight_owners
+      << " in_flight_waits " << stats.in_flight_waits
+      << " lock_contentions " << stats.lock_contentions
+      << " lock_wait_us " << stats.lock_wait_ns / 1000;
+  return out.str();
 }
 
 // =====================================================================
@@ -477,6 +503,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
          " nps " + std::to_string(info.nps) +
          " time " + std::to_string(info.time_ms) +
          (pv_str.empty() ? "" : " pv " + pv_str));
+    if (info.nn_cache.capacity > 0) {
+      Log(FormatNNCacheStats(info.nn_cache));
+    }
   };
 
   // Persistent Search object across `go` commands.
@@ -588,6 +617,9 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
        " time " + std::to_string(static_cast<int>(result.time_sec * 1000)) +
        " nps " + std::to_string(static_cast<int>(result.nps)) +
        " pv " + pv_str);
+  if (result.nn_cache.capacity > 0) {
+    Log(FormatNNCacheStats(result.nn_cache));
+  }
 
   Send("bestmove " + result.best_move.ToString());
 }

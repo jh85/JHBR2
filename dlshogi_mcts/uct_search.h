@@ -28,6 +28,7 @@ struct SearchInfo {
   int nps = 0;
   int time_ms = 0;
   std::vector<lczero::Move> pv;
+  jhbr2::NNCacheStats nn_cache;
 };
 using InfoCallback = std::function<void(const SearchInfo&)>;
 
@@ -75,6 +76,7 @@ struct SearchResult {
   float root_q = 0.0f;
   int score_cp = 0;
   std::vector<lczero::Move> pv;
+  jhbr2::NNCacheStats nn_cache;
 };
 
 class Search;

@@ -73,26 +73,14 @@ struct BatchCacheKeyHash {
   }
 };
 
-jhbr2::NNOutput FromCachedNNValue(const jhbr2::CachedNNValue& cached) {
-  jhbr2::NNOutput out;
-  out.wdl[0] = cached.wdl[0];
-  out.wdl[1] = cached.wdl[1];
-  out.wdl[2] = cached.wdl[2];
-  out.value = cached.wdl[0] - cached.wdl[2];
-  out.draw = cached.wdl[1];
-  out.moves_left = cached.moves_left;
-  out.policy = cached.policy;
-  return out;
-}
-
-jhbr2::CachedNNValue ToCachedNNValue(const jhbr2::NNOutput& out,
+jhbr2::CachedNNValue ToCachedNNValue(jhbr2::NNOutput&& out,
                                      uint16_t num_legal_moves) {
   jhbr2::CachedNNValue cached;
   cached.wdl[0] = out.wdl[0];
   cached.wdl[1] = out.wdl[1];
   cached.wdl[2] = out.wdl[2];
   cached.moves_left = out.moves_left;
-  cached.policy = out.policy;
+  cached.policy = std::move(out.policy);
   cached.num_legal_moves = num_legal_moves;
   return cached;
 }
@@ -112,12 +100,58 @@ struct visitor_t {
 };
 
 struct batch_element_t {
-  uct_node_t* node = nullptr;
+  batch_element_t(uct_node_t* node_in, const ShogiBoard& board_in,
+                  float* value_win_in, float* value_m_in)
+      : node(node_in),
+        board(board_in),
+        value_win(value_win_in),
+        value_m(value_m_in) {
+    for (int i = 0; i < node->child_num; ++i) {
+      legal_moves.push_back(node->child[i].move);
+    }
+  }
+
+  uct_node_t* node;
   ShogiBoard board;
   MoveList legal_moves;
-  lczero::Color color = BLACK;
-  float* value_win = nullptr;
-  float* value_m = nullptr;
+  float* value_win;
+  float* value_m;
+};
+
+void ApplyEvaluation(batch_element_t& elem, float value, float moves_left,
+                     const std::vector<float>& policy) {
+  float visited_policy = 0.0f;
+  for (int i = 0; i < elem.node->child_num; ++i) {
+    const float probability =
+        i < static_cast<int>(policy.size())
+            ? policy[i]
+            : 1.0f / std::max<int>(1, elem.node->child_num);
+    elem.node->child[i].nnrate = probability;
+    if (elem.node->child[i].move_count.load(std::memory_order_acquire) > 0) {
+      visited_policy += probability;
+    }
+  }
+  elem.node->visited_nnrate.store(visited_policy, std::memory_order_release);
+  elem.node->eval_m = moves_left;
+  if (elem.value_win) *elem.value_win = (value + 1.0f) * 0.5f;
+  if (elem.value_m) *elem.value_m = moves_left;
+  elem.node->SetEvaled();
+}
+
+void ApplyEvaluation(batch_element_t& elem,
+                     const jhbr2::CachedNNValue& cached) {
+  ApplyEvaluation(elem, cached.wdl[0] - cached.wdl[2], cached.moves_left,
+                  cached.policy);
+}
+
+void ApplyEvaluation(batch_element_t& elem, const jhbr2::NNOutput& output) {
+  ApplyEvaluation(elem, output.value, output.moves_left, output.policy);
+}
+
+struct LocalCacheProbe {
+  jhbr2::NNCache::Handle hit;
+  int miss_index = -1;
+  int wait_index = -1;
 };
 
 class UCTSearcher {
@@ -267,6 +301,7 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
                          const std::vector<Move>& moves, int) {
   stop_.store(false, std::memory_order_release);
   playout_count_.store(0, std::memory_order_release);
+  nn_cache_.ResetStats();
   timer_.Restart();
   last_info_ms_ = 0;
   root_board_ = std::move(board);
@@ -278,6 +313,7 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
   if (root_legal.size() == 1) {
     SearchResult result;
     result.best_move = root_legal[0];
+    result.nn_cache = nn_cache_.GetStats();
     return result;
   }
 
@@ -410,26 +446,29 @@ float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
 
 void UCTSearcher::QueuingNode(const ShogiBoard* board, uct_node_t* node,
                               float* value_win, float* value_m) {
-  batch_.push_back(
-      batch_element_t{node, *board, const_cast<ShogiBoard*>(board)->GenerateLegalMoves(),
-                      board->side_to_move(), value_win, value_m});
+  batch_.emplace_back(node, *board, value_win, value_m);
 }
 
 void UCTSearcher::EvalNode() {
   if (batch_.empty()) return;
 
   const size_t batch_size = batch_.size();
-  std::vector<jhbr2::NNOutput> results(batch_size);
   std::vector<int> result_to_miss(batch_size, -1);
   std::vector<std::pair<ShogiBoard, MoveList>> miss_batch;
   std::vector<uint64_t> miss_keys;
   std::vector<uint16_t> miss_num_moves;
-  std::unordered_map<BatchCacheKey, int, BatchCacheKeyHash> local_misses;
+  std::vector<jhbr2::NNCache::Probe> miss_reservations;
+  std::vector<jhbr2::NNCache::Probe> wait_probes;
+  std::vector<int> result_to_wait(batch_size, -1);
+  std::unordered_map<BatchCacheKey, LocalCacheProbe, BatchCacheKeyHash>
+      local_probes;
 
   miss_batch.reserve(batch_size);
   miss_keys.reserve(batch_size);
   miss_num_moves.reserve(batch_size);
-  local_misses.reserve(batch_size);
+  miss_reservations.reserve(batch_size);
+  wait_probes.reserve(batch_size);
+  local_probes.reserve(batch_size);
 
   auto& nn_cache = grp_->owner->nn_cache_;
   for (size_t i = 0; i < batch_size; ++i) {
@@ -438,65 +477,76 @@ void UCTSearcher::EvalNode() {
     const uint16_t num_moves =
         static_cast<uint16_t>(elem.legal_moves.size());
 
-    jhbr2::CachedNNValue cached;
-    if (nn_cache.Lookup(key, num_moves, &cached)) {
-      results[i] = FromCachedNNValue(cached);
+    const BatchCacheKey batch_key{key, num_moves};
+    auto [probe_it, inserted] = local_probes.try_emplace(batch_key);
+    if (!inserted) {
+      if (probe_it->second.hit) {
+        ApplyEvaluation(elem, *probe_it->second.hit);
+      } else if (probe_it->second.miss_index >= 0) {
+        result_to_miss[i] = probe_it->second.miss_index;
+      } else {
+        result_to_wait[i] = probe_it->second.wait_index;
+      }
       continue;
     }
 
-    BatchCacheKey batch_key{key, num_moves};
-    auto it = local_misses.find(batch_key);
-    if (it != local_misses.end()) {
-      result_to_miss[i] = it->second;
-      continue;
+    jhbr2::NNCache::Probe cache_probe;
+    if (nn_cache.Enabled()) {
+      cache_probe = nn_cache.LookupOrReserve(key, num_moves);
+      if (cache_probe.IsHit()) {
+        probe_it->second.hit = cache_probe.Hit();
+        ApplyEvaluation(elem, *probe_it->second.hit);
+        continue;
+      }
+      if (cache_probe.IsWaiter()) {
+        const int wait_idx = static_cast<int>(wait_probes.size());
+        probe_it->second.wait_index = wait_idx;
+        result_to_wait[i] = wait_idx;
+        wait_probes.push_back(std::move(cache_probe));
+        continue;
+      }
     }
 
     const int miss_idx = static_cast<int>(miss_batch.size());
-    local_misses.emplace(batch_key, miss_idx);
+    probe_it->second.miss_index = miss_idx;
     result_to_miss[i] = miss_idx;
     miss_batch.emplace_back(elem.board, elem.legal_moves);
     miss_keys.push_back(key);
     miss_num_moves.push_back(num_moves);
+    if (nn_cache.Enabled()) {
+      miss_reservations.push_back(std::move(cache_probe));
+    }
   }
 
   std::vector<jhbr2::NNOutput> miss_results;
   if (!miss_batch.empty()) {
     miss_results = grp_->nn->EvaluateBatchSlot(thread_id_, miss_batch);
-    for (size_t i = 0; i < miss_results.size(); ++i) {
-      nn_cache.Insert(miss_keys[i],
-                      ToCachedNNValue(miss_results[i], miss_num_moves[i]));
-    }
   }
 
   for (size_t i = 0; i < batch_size; ++i) {
     const int miss_idx = result_to_miss[i];
     if (miss_idx >= 0) {
-      results[i] = miss_results[miss_idx];
+      ApplyEvaluation(batch_[i], miss_results[miss_idx]);
     }
   }
 
-  for (int i = 0; i < static_cast<int>(batch_size); ++i) {
-    auto& elem = batch_[i];
-    const auto& result = results[i];
-    float visited_policy = 0.0f;
-    for (int j = 0; j < elem.node->child_num; ++j) {
-      const float p = j < static_cast<int>(result.policy.size())
-                          ? result.policy[j]
-                          : 1.0f / std::max<int>(1, elem.node->child_num);
-      elem.node->child[j].nnrate = p;
-      if (elem.node->child[j].move_count.load(std::memory_order_acquire) > 0) {
-        visited_policy += p;
-      }
+  if (nn_cache.Enabled()) {
+    for (size_t i = 0; i < miss_results.size(); ++i) {
+      nn_cache.Publish(std::move(miss_reservations[i]),
+                       ToCachedNNValue(std::move(miss_results[i]),
+                                       miss_num_moves[i]));
     }
-    elem.node->visited_nnrate.store(visited_policy, std::memory_order_release);
-    elem.node->eval_m = result.moves_left;  // visible via the SetEvaled() release
-    if (elem.value_win) {
-      *elem.value_win = (result.value + 1.0f) * 0.5f;
+  }
+
+  std::vector<jhbr2::NNCache::Handle> waited_values(wait_probes.size());
+  for (size_t i = 0; i < wait_probes.size(); ++i) {
+    waited_values[i] = wait_probes[i].Wait();
+  }
+  for (size_t i = 0; i < batch_size; ++i) {
+    const int wait_idx = result_to_wait[i];
+    if (wait_idx >= 0 && waited_values[wait_idx]) {
+      ApplyEvaluation(batch_[i], *waited_values[wait_idx]);
     }
-    if (elem.value_m) {
-      *elem.value_m = result.moves_left;
-    }
-    elem.node->SetEvaled();
   }
   batch_.clear();
 }
@@ -605,6 +655,7 @@ void Search::MaybeOutputInfo() {
   info.nps = elapsed > 0 ? static_cast<int>(nodes * 1000LL / elapsed) : 0;
   info.pv = GetPV();
   info.depth = static_cast<int>(info.pv.size());
+  info.nn_cache = nn_cache_.GetStats();
   if (root_ && root_->child_num > 0) {
     const unsigned best = SelectBestChild(root_);
     const auto& ch = root_->child[best];
@@ -623,6 +674,7 @@ SearchResult Search::BuildResult() const {
   result.nodes = playout_count_.load(std::memory_order_acquire);
   result.time_sec = timer_.ElapsedMs() / 1000.0f;
   result.nps = result.time_sec > 0.001f ? result.nodes / result.time_sec : 0.0f;
+  result.nn_cache = nn_cache_.GetStats();
   if (!root_ || root_->child_num == 0) return result;
 
   const unsigned best = SelectBestChild(root_);
