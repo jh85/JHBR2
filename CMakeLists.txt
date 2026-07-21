@@ -194,6 +194,10 @@ endif()
 add_executable(test_movegen test/test_movegen.cc)
 target_link_libraries(test_movegen PRIVATE shogi_core)
 
+# ---- Test: maximum legal move bound ----
+add_executable(test_max_legal_moves test/test_max_legal_moves.cc)
+target_link_libraries(test_max_legal_moves PRIVATE shogi_core)
+
 # ---- Test: game replay (DoMove chain) ----
 add_executable(test_replay test/test_replay.cc)
 target_link_libraries(test_replay PRIVATE shogi_core)

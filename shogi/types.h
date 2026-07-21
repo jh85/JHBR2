@@ -430,11 +430,19 @@ class Move {
   static constexpr uint16_t kFlagMask    = kDropFlag | kPromoteFlag;
 };
 
-// Stack-allocated move list. Max legal moves in shogi is ~593.
+// Maximum legal moves in a shogi position. This position reaches the bound:
+// R8/2K1S1SSk/4B4/9/9/9/9/9/1L1L1L3 b PLNSGBR17p3n3g 1
+inline constexpr int kMaxLegalMoves = 593;
+
+// Stack-allocated move list. No sentinel slot is needed because count_ stores
+// the end position explicitly.
 class MoveList {
  public:
   MoveList() = default;
-  void push_back(Move m) { assert(count_ < kMaxMoves); moves_[count_++] = m; }
+  void push_back(Move m) {
+    assert(count_ < kMaxLegalMoves);
+    moves_[count_++] = m;
+  }
   int size() const { return count_; }
   bool empty() const { return count_ == 0; }
   void reserve(int) {}  // no-op, for compatibility
@@ -446,8 +454,7 @@ class MoveList {
   const Move* end() const { return moves_ + count_; }
 
  private:
-  static constexpr int kMaxMoves = 600;
-  Move moves_[kMaxMoves];
+  Move moves_[kMaxLegalMoves];
   int count_ = 0;
 };
 
