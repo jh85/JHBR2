@@ -501,7 +501,7 @@ void USIEngine::CmdIsReady() {
     ShogiEncoderTables::Init();
     for (int g = 0; g < num_gpus_; g++) {
       evaluators_.push_back(std::make_unique<NNEvaluator>(
-          onnx_path_, use_gpu_, g, max_gpu_batch_, workers_per_gpu_));
+          onnx_path_, use_gpu_, g, workers_per_gpu_));
     }
     
     // Initialize MCTS infrastructure

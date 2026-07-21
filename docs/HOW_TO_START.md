@@ -135,7 +135,7 @@ Use the engine path from the previous step:
 ```bash
 ENGINE=/path/to/JHBR2/engines/shogi_bt4_epoch23_trt_b256.engine
 
-printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 1\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nsetoption name MaxGpuBatch value 256\nisready\nposition startpos\ngo nodes 256\nquit\n' "$ENGINE" \
+printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 1\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo nodes 256\nquit\n' "$ENGINE" \
 | ./build-trt/jhbr2
 ```
 
@@ -156,15 +156,30 @@ For a two-GPU machine:
 ```bash
 ENGINE=/path/to/JHBR2/engines/shogi_bt4_epoch23_trt_b256.engine
 
-printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 2\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nsetoption name MaxGpuBatch value 256\nisready\nposition startpos\ngo byoyomi 1000\nquit\n' "$ENGINE" \
+printf 'usi\nsetoption name OnnxModel value %s\nsetoption name ModelFormat value jhbr2\nsetoption name NumGPUs value 2\nsetoption name WorkersPerGpu value 2\nsetoption name MinibatchSize value 128\nisready\nposition startpos\ngo byoyomi 1000\nquit\n' "$ENGINE" \
 | ./build-trt/jhbr2
 ```
 
-If you built the `b128` engine, use:
+`MinibatchSize` is the per-worker search batch. The TensorRT engine's
+`maxShapes` profile is its hard inference limit; larger worker batches are
+split automatically at that limit.
 
-```text
-setoption name MaxGpuBatch value 128
+## 8. Optional ONNX Runtime Fallback
+
+The fallback build accepts one JHBR2 ONNX model whose batch dimension is
+dynamic. Fixed-batch models and `_bN.onnx` sidecar models are not supported.
+
+```bash
+cmake -S . -B build-ort -DCMAKE_BUILD_TYPE=Release \
+  -DUSE_TENSORRT=OFF \
+  -DONNXRUNTIME_ROOT=/path/to/onnxruntime
+cmake --build build-ort -j"$(nproc)"
 ```
+
+With `UseGPU=true`, ONNX Runtime tries its CUDA provider on the requested GPU
+and falls back to CPU if a CUDA session cannot be created. Set `UseGPU=false`
+to select CPU directly. This build is intended for validation and fallback;
+use the native TensorRT build for production play.
 
 ## Troubleshooting
 

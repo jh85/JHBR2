@@ -123,7 +123,7 @@ void USIEngine::CmdUsi() {
   // Threads is kept as an alias for WorkersPerGpu (backward compat).
   Send("option name Threads type spin default 2 min 1 max 8");
   Send("option name WorkersPerGpu type spin default 2 min 1 max 8");
-  Send("option name MinibatchSize type spin default 256 min 1 max 4096");
+  Send("option name MinibatchSize type spin default 128 min 1 max 4096");
   Send("option name PerLeafGathering type check default true");
   Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
   Send("option name LeafMateMode type combo default shallow var off var dfpn var shallow");
@@ -131,10 +131,6 @@ void USIEngine::CmdUsi() {
   Send("option name RootMateDepth type spin default 7 min 0 max 7");
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
-  // MaxGpuBatch sets the TRT engine's max profile shape (and the
-  // per-slot buffer size). With per-worker submission there is no
-  // combining, so this should match MinibatchSize.
-  Send("option name MaxGpuBatch type spin default 1024 min 64 max 16384");
   Send("option name VirtualLossWeight type string default 1.0");
   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
   Send("option name MovesLeftWeight type string default 0.0");
@@ -157,7 +153,6 @@ void USIEngine::CmdIsReady() {
       Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
       evaluators_.push_back(
           std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
-                                        max_gpu_batch_,
                                         search_config_.workers_per_gpu,
                                         model_format_));
     }
@@ -226,7 +221,8 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     search_.reset();
     evaluators_.clear();
   } else if (name_lower == "minibatchsize") {
-    search_config_.minibatch_size = std::stoi(value);
+    search_config_.minibatch_size =
+        std::clamp(std::stoi(value), 1, 4096);
     search_.reset();
   } else if (name_lower == "perleafgathering") {
     // Per-leaf gathering is always enabled by the dlshogi-style worker loop.
@@ -286,11 +282,7 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     if (w > 100.0f) w = 100.0f;
     (void)w;
   } else if (name_lower == "maxgpubatch") {
-    max_gpu_batch_ = std::stoi(value);
-    // Evaluators bake the TRT max_shapes profile at construction time, so
-    // a change here only takes effect after isready rebuilds them.
-    evaluators_.clear();
-    search_.reset();
+    Log("MaxGpuBatch is deprecated and ignored");
   } else if (name_lower == "dfpnmaxtime") {
     dfpn_max_time_ms_ = std::stoi(value);
   } else if (name_lower == "maxmovetime") {

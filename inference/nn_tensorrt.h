@@ -51,10 +51,8 @@ class NNEvaluator {
   // created on this GPU. Multiple workers can call EvaluateBatchSlot
   // concurrently — one worker per slot. Slot 0 is always allocated
   // and used by the legacy single-threaded entry points.
-  // max_batch_size is forwarded to the ONNX Runtime path only.
   explicit NNEvaluator(const std::string& engine_path, bool use_gpu = true,
-                       int device_id = 0, int max_batch_size = 1024,
-                       int num_slots = 1,
+                       int device_id = 0, int num_slots = 1,
                        ModelFormat model_format = ModelFormat::kAuto);
   ~NNEvaluator();
 

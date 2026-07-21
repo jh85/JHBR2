@@ -91,7 +91,7 @@ Map our existing options to dlshogi's where they overlap:
 | `MaxNodes` | `UCT_NodeLimit` | Keep our names. |
 | `OnnxModel` | `DNN_Model` | Keep ours. |
 | `NumGPUs` | (per-GPU `Threads_GPUN`) | Map our `NumGPUs=N` to spawning N evaluator+searcher pairs. |
-| `MaxGpuBatch` | (n/a) | Drop. |
+| `MaxGpuBatch` | (n/a) | Dropped; engine profile is authoritative. |
 
 ### Step 3: validate on Panda23
 
@@ -144,6 +144,6 @@ the dlshogi-based MCTS replaces lc0_mcts.
 - `e4c52f6` — OUTE_SENNICHITE fix (continuous_check += 2 + 2nd-occurrence).
 - `f94b7f6` + `aa314bb` — VirtualLossWeight option + bulk-path coverage.
   (Bulk path will be removed; option carries forward to dlshogi base.)
-- `5617a35` — benchmark.py --max-gpu-batch flag.
-- `564c7c5` — MaxGpuBatch USI option (will be dropped at port time).
+- `5617a35` — historical benchmark.py --max-gpu-batch flag (removed).
+- `564c7c5` — historical MaxGpuBatch USI option (removed).
 - `db0797a` — atomic n_in_flight_ (carries forward; matches dlshogi).

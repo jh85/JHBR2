@@ -67,7 +67,6 @@ class USIEngine {
   ModelFormat model_format_ = ModelFormat::kAuto;
   int max_nodes_ = 800;
   int num_gpus_ = 1;
-  int max_gpu_batch_ = 4096;
   float noise_epsilon_ = 0.0f;
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;

@@ -189,8 +189,8 @@ int GetMaxBatch(nvinfer1::ICudaEngine* engine, const char* input_name,
 
 
 NNEvaluator::NNEvaluator(const std::string& engine_path, bool /*use_gpu*/,
-                         int device_id, int /*max_batch_size*/,
-                         int num_slots, ModelFormat model_format)
+                         int device_id, int num_slots,
+                         ModelFormat model_format)
     : impl_(std::make_unique<Impl>()) {
 
   CUDA_CHECK(cudaSetDevice(device_id));

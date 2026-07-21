@@ -47,12 +47,12 @@ struct NNOutput {
 class NNEvaluator {
  public:
   // Load model from ONNX file.
-  // use_gpu: try CUDA provider first, fall back to CPU.
-  // num_slots is accepted for signature parity with the direct-TRT
-  // path but ignored here — ORT sessions are themselves single-threaded.
+  // use_gpu: create a CUDA session first, then fall back to CPU.
+  // The model must have one dynamic-batch input shaped (batch, C, 9, 9).
+  // num_slots is accepted for signature parity and ignored; one ORT session
+  // is shared by all workers.
   explicit NNEvaluator(const std::string& onnx_path, bool use_gpu = true,
-                       int device_id = 0, int max_batch_size = 1024,
-                       int num_slots = 1,
+                       int device_id = 0, int num_slots = 1,
                        ModelFormat model_format = ModelFormat::kAuto);
   ~NNEvaluator();
 
@@ -66,9 +66,8 @@ class NNEvaluator {
   std::vector<NNOutput> EvaluateBatch(
       const std::vector<std::pair<ShogiBoard, MoveList>>& batch);
 
-  // Slot-aware variant; for the ORT path slot_id is ignored (and a
-  // mutex serializes calls). Provided only for signature compatibility
-  // with the direct-TRT path.
+  // Slot-aware variant provided for signature compatibility. ORT sessions
+  // support concurrent Run calls, so slot_id is not needed here.
   std::vector<NNOutput> EvaluateBatchSlot(
       int slot_id,
       const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
@@ -85,7 +84,6 @@ class NNEvaluator {
   struct Impl;
   std::unique_ptr<Impl> impl_;
   bool using_gpu_ = false;
-  bool supports_batch_ = false;  // True if ONNX model handles batch > 1
 };
 
 }  // namespace jhbr2

@@ -1,5 +1,8 @@
 # Panda23 TensorRT 10 Handoff
 
+> Historical note: `MaxGpuBatch` has since been retired. Native TensorRT uses
+> the batch profile stored in the serialized engine.
+
 This note is for continuing the JHBR2 dlshogi-style MCTS validation on
 Panda23 with 2x RTX 3090.
 

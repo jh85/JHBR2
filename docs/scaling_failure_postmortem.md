@@ -243,8 +243,8 @@ Requires CUDA + TensorRT installed.
 USI options that affect scaling:
 - `Threads` (alias) / `WorkersPerGpu`: workers per GPU. Default 2.
 - `NumGPUs`: number of GPUs. Default 1.
-- `MinibatchSize`: per-worker batch size. Default 256.
-- `MaxGpuBatch`: per-call batch cap (chunks if exceeded). Default 1024.
+- `MinibatchSize`: per-worker batch size. Current default 128.
+- The serialized TensorRT engine profile supplies the inference batch limit.
 - `PerLeafGathering`: should stay `true`. Bulk path is dead code.
 
 ## 8. What "success" looks like for this investigation
