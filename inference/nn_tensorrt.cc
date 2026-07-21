@@ -394,14 +394,14 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
   // Multi-GPU contexts: ensure CUDA calls in this thread go to our device.
   cudaSetDevice(impl_->device_id);
 
-  // For dynamic engines: use actual batch size. For static: pad to max.
-  int run_batch = impl_->dynamic_batch ? batch_size : impl_->max_batch_size;
-  if (batch_size > run_batch) {
-    // Batch too large — chunk and recurse on the same slot.
+  // Buffers are allocated at the engine profile's maximum batch size, so
+  // split oversized requests before preparing inputs or setting shapes.
+  if (batch_size > impl_->max_batch_size) {
     std::vector<NNOutput> results;
     results.reserve(batch_size);
-    for (int start = 0; start < batch_size; start += run_batch) {
-      int end = std::min(start + run_batch, batch_size);
+    for (int start = 0; start < batch_size;
+         start += impl_->max_batch_size) {
+      int end = std::min(start + impl_->max_batch_size, batch_size);
       std::vector<std::pair<ShogiBoard, MoveList>> chunk(
           batch.begin() + start, batch.begin() + end);
       auto chunk_results = EvaluateBatchSlot(slot_id, chunk);
@@ -409,6 +409,11 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     }
     return results;
   }
+
+  // For dynamic engines use the actual batch size. Static engines require
+  // padding to their fixed batch size.
+  const int run_batch =
+      impl_->dynamic_batch ? batch_size : impl_->max_batch_size;
 
   if (is_dlshogi) {
     std::fill(slot.h_input,
