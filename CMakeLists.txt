@@ -70,6 +70,7 @@ set(SHOGI_ENGINE_SRCS
 option(USE_TENSORRT "Use native TensorRT backend (no ONNX Runtime needed)" OFF)
 
 set(DLSHOGI_MCTS_SRCS
+  dlshogi_mcts/search_primitives.cc
   dlshogi_mcts/uct_node.cc
   dlshogi_mcts/uct_search.cc
 )
@@ -212,6 +213,14 @@ target_link_libraries(test_tree_reuse PRIVATE shogi_core)
 # ---- Test: root vs descendant repetition search policy ----
 add_executable(test_search_repetition test/test_search_repetition.cc)
 target_link_libraries(test_search_repetition PRIVATE shogi_core)
+
+# ---- Test: MCTS terminal backup, PUCT/FPU, and proven propagation ----
+add_executable(test_search_primitives
+  test/test_search_primitives.cc
+  dlshogi_mcts/search_primitives.cc
+  dlshogi_mcts/uct_node.cc
+)
+target_link_libraries(test_search_primitives PRIVATE shogi_core)
 
 # ---- Test: game replay (DoMove chain) ----
 add_executable(test_replay test/test_replay.cc)

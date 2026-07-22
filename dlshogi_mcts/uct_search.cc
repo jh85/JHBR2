@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "dlshogi_mcts/search_primitives.h"
 #include "dlshogi_mcts/search_repetition.h"
 #include "mate/shallow_mate.h"
 
@@ -37,19 +38,6 @@ void AddVirtualLoss(child_node_t* child, uct_node_t* current) {
 void SubVirtualLoss(child_node_t* child, uct_node_t* current) {
   current->move_count.fetch_sub(kVirtualLoss, std::memory_order_acq_rel);
   child->move_count.fetch_sub(kVirtualLoss, std::memory_order_acq_rel);
-}
-
-void UpdateResult(child_node_t* child, float result, float m_value,
-                  uct_node_t* current) {
-  AtomicFetchAdd(&current->win, result);
-  if constexpr (kVirtualLoss != 1) {
-    current->move_count.fetch_add(1 - kVirtualLoss, std::memory_order_acq_rel);
-  }
-  AtomicFetchAdd(&child->win, result);
-  AtomicFetchAdd(&child->sum_m, m_value);
-  if constexpr (kVirtualLoss != 1) {
-    child->move_count.fetch_add(1 - kVirtualLoss, std::memory_order_acq_rel);
-  }
 }
 
 float DrawValue(const SearchConfig& cfg, lczero::Color color) {
@@ -88,17 +76,15 @@ jhbr2::CachedNNValue ToCachedNNValue(jhbr2::NNOutput&& out,
 
 }  // namespace
 
-struct trajectory_t {
-  uct_node_t* parent = nullptr;
-  unsigned child_idx = 0;
-};
-
 struct visitor_t {
   std::vector<trajectory_t> trajectories;
   float value_win = 0.5f;
   float value_m = 0.0f;  // leaf moves-left, filled by EvalNode
+  float terminal_value = 0.5f;  // perspective of the final edge's mover
   visitor_t() { trajectories.reserve(128); }
 };
+
+enum class PlayoutStatus { kTerminal, kQueuing, kDiscarded };
 
 struct batch_element_t {
   batch_element_t(uct_node_t* node_in, const ShogiBoard& board_in,
@@ -121,18 +107,16 @@ struct batch_element_t {
 
 void ApplyEvaluation(batch_element_t& elem, float value, float moves_left,
                      const std::vector<float>& policy) {
-  float visited_policy = 0.0f;
   for (int i = 0; i < elem.node->child_num; ++i) {
     const float probability =
         i < static_cast<int>(policy.size())
             ? policy[i]
             : 1.0f / std::max<int>(1, elem.node->child_num);
     elem.node->child[i].nnrate = probability;
-    if (elem.node->child[i].move_count.load(std::memory_order_acquire) > 0) {
-      visited_policy += probability;
-    }
   }
-  elem.node->visited_nnrate.store(visited_policy, std::memory_order_release);
+  // No child can be selected before SetEvaled() below. From this point on,
+  // SelectPuctChild() accumulates the selected priors exactly as dlshogi does.
+  elem.node->visited_nnrate.store(0.0f, std::memory_order_release);
   elem.node->eval_m = moves_left;
   if (elem.value_win) *elem.value_win = (value + 1.0f) * 0.5f;
   if (elem.value_m) *elem.value_m = moves_left;
@@ -170,8 +154,8 @@ class UCTSearcher {
 
  private:
   void ParallelUctSearch();
-  float UctSearch(ShogiBoard* board, child_node_t* parent, uct_node_t* current,
-                  visitor_t& visitor);
+  PlayoutStatus UctSearch(ShogiBoard* board, child_node_t* parent,
+                          uct_node_t* current, visitor_t& visitor);
   unsigned SelectMaxUcbChild(child_node_t* parent, uct_node_t* current);
   void QueuingNode(const ShogiBoard* board, uct_node_t* node,
                    float* value_win, float* value_m);
@@ -333,82 +317,59 @@ SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
 unsigned UCTSearcher::SelectMaxUcbChild(child_node_t* parent,
                                         uct_node_t* current) {
   const auto& cfg = grp_->owner->config_;
-  const int parent_visits =
-      std::max(1, current->move_count.load(std::memory_order_acquire));
-  const float sqrt_sum = std::sqrt(static_cast<float>(parent_visits));
   const bool is_root = parent == nullptr;
-  const float c_init = is_root ? cfg.c_init_root : cfg.c_init;
-  const float c_base = is_root ? cfg.c_base_root : cfg.c_base;
-  const float fpu_reduction =
+  PuctParameters params;
+  params.c_init = is_root ? cfg.c_init_root : cfg.c_init;
+  params.c_base = is_root ? cfg.c_base_root : cfg.c_base;
+  params.fpu_reduction =
       is_root ? cfg.c_fpu_reduction_root : cfg.c_fpu_reduction;
-  const float c = c_init + std::log((parent_visits + c_base) / c_base);
-  const float visited = current->visited_nnrate.load(std::memory_order_acquire);
-  const float fpu = fpu_reduction * std::sqrt(std::max(visited, 0.0f));
-
-  // Moves-left (MLH) effect: prefer shorter lines when winning, longer when
-  // losing. Off unless moves_left_weight > 0 (and the net has an MLH head).
-  const bool use_m = cfg.moves_left_weight > 0.0f;
-  const float parent_m = use_m ? current->eval_m : 0.0f;
-
-  float best_score = -std::numeric_limits<float>::infinity();
-  unsigned best = 0;
-  bool found = false;
-  for (int i = 0; i < current->child_num; ++i) {
-    auto& child = current->child[i];
-    if (child.IsLose()) return static_cast<unsigned>(i);
-    if (child.IsWin()) continue;
-
-    const int n = child.move_count.load(std::memory_order_acquire);
-    const float q =
-        n == 0 ? -fpu : child.win.load(std::memory_order_acquire) / n;
-    const float u = c * sqrt_sum * child.nnrate / (1.0f + n);
-    float m_effect = 0.0f;
-    if (use_m && n > 0) {
-      const float q_centered = q - 0.5f;  // >0 winning, <0 losing
-      if (std::fabs(q_centered) > cfg.moves_left_threshold) {
-        const float child_m = child.sum_m.load(std::memory_order_acquire) / n;
-        float m_delta = child_m - parent_m;  // >0 = longer than parent estimate
-        m_delta = std::clamp(m_delta, -cfg.moves_left_cap, cfg.moves_left_cap);
-        const float sign = (q_centered > 0.0f) ? 1.0f : -1.0f;
-        m_effect = -cfg.moves_left_weight * sign * m_delta;
-      }
-    }
-    const float score = q + u + m_effect;
-    if (!found || score > best_score) {
-      found = true;
-      best_score = score;
-      best = static_cast<unsigned>(i);
-    }
-  }
-  return best;
+  params.moves_left_weight = cfg.moves_left_weight;
+  params.moves_left_threshold = cfg.moves_left_threshold;
+  params.moves_left_cap = cfg.moves_left_cap;
+  return SelectPuctChild(parent, current, params);
 }
 
-float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
-                             uct_node_t* current, visitor_t& visitor) {
+PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
+                                     uct_node_t* current,
+                                     visitor_t& visitor) {
   const auto& cfg = grp_->owner->config_;
+  const float parent_draw_value =
+      DrawValue(cfg, ~board->side_to_move());
 
-  if (board->CanDeclareWin()) return 1.0f;
-  if (parent && parent->IsWin()) return 0.0f;
-  if (parent && parent->IsLose()) return 1.0f;
-  if (parent && parent->IsDraw()) return DrawValue(cfg, board->side_to_move());
+  if (TryGetProvenEdgeValue(parent, parent_draw_value,
+                            &visitor.terminal_value)) {
+    return PlayoutStatus::kTerminal;
+  }
+  if (board->CanDeclareWin()) {
+    visitor.terminal_value =
+        ResolveTerminalEdge(parent, EdgeOutcome::kLoss);
+    return PlayoutStatus::kTerminal;
+  }
 
   switch (GetSearchRepetitionResult(*board, parent == nullptr)) {
     case ShogiBoard::RepetitionResult::kLoss:
-      if (parent) parent->SetLose();
-      return 1.0f;
+      visitor.terminal_value =
+          ResolveTerminalEdge(parent, EdgeOutcome::kWin);
+      return PlayoutStatus::kTerminal;
     case ShogiBoard::RepetitionResult::kWin:
-      if (parent) parent->SetWin();
-      return 0.0f;
+      visitor.terminal_value =
+          ResolveTerminalEdge(parent, EdgeOutcome::kLoss);
+      return PlayoutStatus::kTerminal;
     case ShogiBoard::RepetitionResult::kDraw:
-      if (parent) parent->SetDraw();
-      return DrawValue(cfg, board->side_to_move());
+      visitor.terminal_value = ResolveTerminalEdge(
+          parent, EdgeOutcome::kDraw, parent_draw_value);
+      return PlayoutStatus::kTerminal;
     case ShogiBoard::RepetitionResult::kNone:
       break;
   }
 
   if (board->ply() > cfg.max_moves_to_draw) {
-    if (parent) parent->SetDraw();
-    return DrawValue(cfg, board->side_to_move());
+    const EdgeOutcome outcome = board->GenerateLegalMoves().empty()
+                                    ? EdgeOutcome::kWin
+                                    : EdgeOutcome::kDraw;
+    visitor.terminal_value =
+        ResolveTerminalEdge(parent, outcome, parent_draw_value);
+    return PlayoutStatus::kTerminal;
   }
 
   unsigned next = 0;
@@ -417,24 +378,31 @@ float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
   {
     std::lock_guard<std::mutex> lk(GetPositionMutex(board));
     if (!current->IsEvaled()) {
-      if (current->child_num != 0) return kDiscarded;
+      if (current->child_num != 0) return PlayoutStatus::kDiscarded;
       if (cfg.leaf_mate_depth > 0) {
         ShogiBoard tmp = *board;
         if (jhbr2::shallow_mate::HasMateWithin(tmp, cfg.leaf_mate_depth)) {
-          if (parent) parent->SetWin();
-          return 0.0f;
+          visitor.terminal_value =
+              ResolveTerminalEdge(parent, EdgeOutcome::kLoss);
+          return PlayoutStatus::kTerminal;
         }
       }
       current->ExpandNode(board);
       if (current->child_num == 0) {
         current->SetEvaled();
-        return 0.0f;
+        visitor.terminal_value =
+            ResolveTerminalEdge(parent, EdgeOutcome::kWin);
+        return PlayoutStatus::kTerminal;
       }
       QueuingNode(board, current, &visitor.value_win, &visitor.value_m);
-      return kQueuing;
+      return PlayoutStatus::kQueuing;
     }
 
-    if (current->child_num == 0) return 0.0f;
+    if (current->child_num == 0) {
+      visitor.terminal_value =
+          ResolveTerminalEdge(parent, EdgeOutcome::kWin);
+      return PlayoutStatus::kTerminal;
+    }
     next = SelectMaxUcbChild(parent, current);
     AddVirtualLoss(&current->child[next], current);
     visitor.trajectories.push_back({current, next});
@@ -444,9 +412,7 @@ float UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
   }
 
   board->DoMove(next_move);
-  const float value = UctSearch(board, &current->child[next], next_node, visitor);
-  if (value == kQueuing || value == kDiscarded) return value;
-  return 1.0f - value;
+  return UctSearch(board, &current->child[next], next_node, visitor);
 }
 
 void UCTSearcher::QueuingNode(const ShogiBoard* board, uct_node_t* node,
@@ -583,23 +549,18 @@ void UCTSearcher::ParallelUctSearch() {
     for (int i = 0; i < batch_max_ && grp_->owner->IsSearchActive(); ++i) {
       ShogiBoard board = grp_->owner->root_board_;
       visitor_pool[i].trajectories.clear();
-      const float result = UctSearch(&board, nullptr, current_root, visitor_pool[i]);
-      if (result != kDiscarded) {
+      const PlayoutStatus status =
+          UctSearch(&board, nullptr, current_root, visitor_pool[i]);
+      if (status != PlayoutStatus::kDiscarded) {
         grp_->owner->playout_count_.fetch_add(1, std::memory_order_acq_rel);
       }
-      if (result == kDiscarded) {
+      if (status == PlayoutStatus::kDiscarded) {
         discarded.push_back(&visitor_pool[i].trajectories);
-      } else if (result == kQueuing) {
+      } else if (status == PlayoutStatus::kQueuing) {
         visitor_batch.push_back(&visitor_pool[i]);
       } else {
-        float value = result;
-        float m = 0.0f;  // terminal leaf: game ends here (0 plies left)
-        for (auto it = visitor_pool[i].trajectories.rbegin();
-             it != visitor_pool[i].trajectories.rend(); ++it) {
-          UpdateResult(&it->parent->child[it->child_idx], value, m, it->parent);
-          value = 1.0f - value;
-          m += 1.0f;
-        }
+        BackupTrajectory(visitor_pool[i].trajectories,
+                         visitor_pool[i].terminal_value);
       }
     }
 
@@ -612,14 +573,8 @@ void UCTSearcher::ParallelUctSearch() {
     }
 
     for (auto* visitor : visitor_batch) {
-      float value = 1.0f - visitor->value_win;
-      float m = visitor->value_m;  // leaf's NN moves-left estimate
-      for (auto it = visitor->trajectories.rbegin();
-           it != visitor->trajectories.rend(); ++it) {
-        UpdateResult(&it->parent->child[it->child_idx], value, m, it->parent);
-        value = 1.0f - value;
-        m += 1.0f;
-      }
+      BackupTrajectory(visitor->trajectories, 1.0f - visitor->value_win,
+                       visitor->value_m);
     }
 
     grp_->owner->MaybeOutputInfo();

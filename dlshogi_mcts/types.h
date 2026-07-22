@@ -7,8 +7,6 @@
 namespace dlshogi_mcts {
 
 constexpr int kNotExpanded = -1;
-constexpr float kQueuing = 3.402823466e38F;
-constexpr float kDiscarded = -3.402823466e38F;
 constexpr int kVirtualLoss = 1;
 
 template <typename T>
