@@ -4,12 +4,16 @@
 #include <array>
 #include <cmath>
 #include <condition_variable>
+#include <iomanip>
 #include <limits>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <utility>
 
 #include "dlshogi_mcts/search_primitives.h"
 #include "dlshogi_mcts/search_repetition.h"
+#include "inference/nn_diagnostics.h"
 #include "mate/shallow_mate.h"
 
 namespace dlshogi_mcts {
@@ -74,6 +78,74 @@ jhbr2::CachedNNValue ToCachedNNValue(jhbr2::NNOutput&& out,
   return cached;
 }
 
+bool ValidateProbabilities(const float wdl[3],
+                           const std::vector<float>& policy,
+                           size_t expected_policy_size,
+                           float moves_left, std::string* reason) {
+  float wdl_sum = 0.0f;
+  for (int i = 0; i < 3; ++i) {
+    if (!std::isfinite(wdl[i]) || wdl[i] < 0.0f || wdl[i] > 1.0f) {
+      if (reason) *reason = "non-finite or out-of-range WDL probability";
+      return false;
+    }
+    wdl_sum += wdl[i];
+  }
+  if (!std::isfinite(wdl_sum) || std::abs(wdl_sum - 1.0f) > 1.0e-3f) {
+    if (reason) *reason = "WDL probabilities do not sum to one";
+    return false;
+  }
+  if (!std::isfinite(moves_left)) {
+    if (reason) *reason = "non-finite moves-left value";
+    return false;
+  }
+  if (policy.size() != expected_policy_size || policy.empty()) {
+    if (reason) *reason = "policy size does not match legal move count";
+    return false;
+  }
+  float policy_sum = 0.0f;
+  for (float probability : policy) {
+    if (!std::isfinite(probability) || probability < 0.0f ||
+        probability > 1.0f) {
+      if (reason) *reason = "non-finite or out-of-range policy probability";
+      return false;
+    }
+    policy_sum += probability;
+  }
+  if (!std::isfinite(policy_sum) ||
+      std::abs(policy_sum - 1.0f) > 1.0e-3f) {
+    if (reason) *reason = "policy probabilities do not sum to one";
+    return false;
+  }
+  return true;
+}
+
+bool ValidateNNOutput(const jhbr2::NNOutput& output,
+                      size_t expected_policy_size, std::string* reason) {
+  if (!output.valid) {
+    if (reason) *reason = "inference backend rejected the batch";
+    return false;
+  }
+  if (!std::isfinite(output.value) || output.value < -1.001f ||
+      output.value > 1.001f || !std::isfinite(output.draw)) {
+    if (reason) *reason = "non-finite or out-of-range processed value";
+    return false;
+  }
+  return ValidateProbabilities(output.wdl, output.policy,
+                               expected_policy_size, output.moves_left,
+                               reason);
+}
+
+bool ValidateCachedValue(const jhbr2::CachedNNValue& value,
+                         size_t expected_policy_size, std::string* reason) {
+  if (value.num_legal_moves != expected_policy_size) {
+    if (reason) *reason = "cached legal move count mismatch";
+    return false;
+  }
+  return ValidateProbabilities(value.wdl, value.policy,
+                               expected_policy_size, value.moves_left,
+                               reason);
+}
+
 }  // namespace
 
 struct visitor_t {
@@ -81,6 +153,7 @@ struct visitor_t {
   float value_win = 0.5f;
   float value_m = 0.0f;  // leaf moves-left, filled by EvalNode
   float terminal_value = 0.5f;  // perspective of the final edge's mover
+  bool eval_valid = true;
   visitor_t() { trajectories.reserve(128); }
 };
 
@@ -88,11 +161,12 @@ enum class PlayoutStatus { kTerminal, kQueuing, kDiscarded };
 
 struct batch_element_t {
   batch_element_t(uct_node_t* node_in, const ShogiBoard& board_in,
-                  float* value_win_in, float* value_m_in)
+                  float* value_win_in, float* value_m_in, bool* valid_in)
       : node(node_in),
         board(board_in),
         value_win(value_win_in),
-        value_m(value_m_in) {
+        value_m(value_m_in),
+        valid(valid_in) {
     for (int i = 0; i < node->child_num; ++i) {
       legal_moves.push_back(node->child[i].move);
     }
@@ -103,6 +177,7 @@ struct batch_element_t {
   MoveList legal_moves;
   float* value_win;
   float* value_m;
+  bool* valid;
 };
 
 void ApplyEvaluation(batch_element_t& elem, float value, float moves_left,
@@ -137,6 +212,7 @@ struct LocalCacheProbe {
   jhbr2::NNCache::Handle hit;
   int miss_index = -1;
   int wait_index = -1;
+  bool invalid = false;
 };
 
 class UCTSearcher {
@@ -158,7 +234,7 @@ class UCTSearcher {
                           uct_node_t* current, visitor_t& visitor);
   unsigned SelectMaxUcbChild(child_node_t* parent, uct_node_t* current);
   void QueuingNode(const ShogiBoard* board, uct_node_t* node,
-                   float* value_win, float* value_m);
+                   float* value_win, float* value_m, bool* valid);
   void EvalNode();
 
   UCTSearcherGroup* grp_;
@@ -394,7 +470,8 @@ PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
             ResolveTerminalEdge(parent, EdgeOutcome::kWin);
         return PlayoutStatus::kTerminal;
       }
-      QueuingNode(board, current, &visitor.value_win, &visitor.value_m);
+      QueuingNode(board, current, &visitor.value_win, &visitor.value_m,
+                  &visitor.eval_valid);
       return PlayoutStatus::kQueuing;
     }
 
@@ -416,8 +493,8 @@ PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
 }
 
 void UCTSearcher::QueuingNode(const ShogiBoard* board, uct_node_t* node,
-                              float* value_win, float* value_m) {
-  batch_.emplace_back(node, *board, value_win, value_m);
+                              float* value_win, float* value_m, bool* valid) {
+  batch_.emplace_back(node, *board, value_win, value_m, valid);
 }
 
 void UCTSearcher::EvalNode() {
@@ -442,6 +519,28 @@ void UCTSearcher::EvalNode() {
   local_probes.reserve(batch_size);
 
   auto& nn_cache = grp_->owner->nn_cache_;
+  auto reject = [&](batch_element_t& elem, const char* stage,
+                    const std::string& reason) {
+    // Expansion happens before inference.  Leave a rejected node in a safe,
+    // evaluated state so a reused tree cannot permanently discard this branch.
+    // The synthetic neutral value is not backed up or cached.
+    if (!elem.node->IsEvaled()) {
+      const float uniform =
+          elem.node->child_num > 0 ? 1.0f / elem.node->child_num : 0.0f;
+      std::vector<float> neutral_policy(elem.node->child_num, uniform);
+      ApplyEvaluation(elem, 0.0f, 0.0f, neutral_policy);
+    }
+    if (elem.valid) *elem.valid = false;
+    grp_->owner->Stop();
+    std::ostringstream details;
+    details << "backend=mcts reason=\"" << reason << "\""
+            << " gpu=" << grp_->gpu_id << " slot=" << thread_id_
+            << " position_hash=0x" << std::hex << elem.board.Hash()
+            << std::dec << " legal_moves=" << elem.legal_moves.size()
+            << " sfen=\"" << elem.board.ToSfen() << "\"";
+    jhbr2::nn_diagnostics::LogOnce(stage, details.str());
+  };
+
   for (size_t i = 0; i < batch_size; ++i) {
     auto& elem = batch_[i];
     const uint64_t key = elem.board.Hash();
@@ -451,7 +550,9 @@ void UCTSearcher::EvalNode() {
     const BatchCacheKey batch_key{key, num_moves};
     auto [probe_it, inserted] = local_probes.try_emplace(batch_key);
     if (!inserted) {
-      if (probe_it->second.hit) {
+      if (probe_it->second.invalid) {
+        reject(elem, "local_batch", "duplicate of an invalid evaluation");
+      } else if (probe_it->second.hit) {
         ApplyEvaluation(elem, *probe_it->second.hit);
       } else if (probe_it->second.miss_index >= 0) {
         result_to_miss[i] = probe_it->second.miss_index;
@@ -466,6 +567,12 @@ void UCTSearcher::EvalNode() {
       cache_probe = nn_cache.LookupOrReserve(key, num_moves);
       if (cache_probe.IsHit()) {
         probe_it->second.hit = cache_probe.Hit();
+        std::string reason;
+        if (!ValidateCachedValue(*probe_it->second.hit, num_moves, &reason)) {
+          probe_it->second.invalid = true;
+          reject(elem, "nncache_hit", reason);
+          continue;
+        }
         ApplyEvaluation(elem, *probe_it->second.hit);
         continue;
       }
@@ -494,18 +601,49 @@ void UCTSearcher::EvalNode() {
     miss_results = grp_->nn->EvaluateBatchSlot(thread_id_, miss_batch);
   }
 
+  if (miss_results.size() != miss_batch.size()) {
+    std::ostringstream reason;
+    reason << "inference result count " << miss_results.size()
+           << " does not match request count " << miss_batch.size();
+    miss_results.resize(miss_batch.size());
+    for (auto& output : miss_results) output.valid = false;
+    if (!batch_.empty()) reject(batch_.front(), "inference_count", reason.str());
+  }
+
+  std::vector<bool> miss_valid(miss_results.size(), false);
+  for (size_t i = 0; i < miss_results.size(); ++i) {
+    std::string reason;
+    miss_valid[i] =
+        ValidateNNOutput(miss_results[i], miss_num_moves[i], &reason);
+    if (!miss_valid[i]) {
+      auto it = std::find(result_to_miss.begin(), result_to_miss.end(),
+                          static_cast<int>(i));
+      if (it != result_to_miss.end()) {
+        reject(batch_[std::distance(result_to_miss.begin(), it)],
+               "inference_result", reason);
+      }
+    }
+  }
+
   for (size_t i = 0; i < batch_size; ++i) {
     const int miss_idx = result_to_miss[i];
-    if (miss_idx >= 0) {
+    if (miss_idx >= 0 && miss_valid[miss_idx]) {
       ApplyEvaluation(batch_[i], miss_results[miss_idx]);
+    } else if (miss_idx >= 0) {
+      reject(batch_[i], "inference_result",
+             "inference result rejected before cache/backup");
     }
   }
 
   if (nn_cache.Enabled()) {
     for (size_t i = 0; i < miss_results.size(); ++i) {
-      nn_cache.Publish(std::move(miss_reservations[i]),
-                       ToCachedNNValue(std::move(miss_results[i]),
-                                       miss_num_moves[i]));
+      if (miss_valid[i]) {
+        nn_cache.Publish(std::move(miss_reservations[i]),
+                         ToCachedNNValue(std::move(miss_results[i]),
+                                         miss_num_moves[i]));
+      } else {
+        nn_cache.Cancel(std::move(miss_reservations[i]));
+      }
     }
   }
 
@@ -515,31 +653,50 @@ void UCTSearcher::EvalNode() {
   }
   for (size_t i = 0; i < batch_size; ++i) {
     const int wait_idx = result_to_wait[i];
-    if (wait_idx >= 0 && waited_values[wait_idx]) {
-      ApplyEvaluation(batch_[i], *waited_values[wait_idx]);
+    if (wait_idx < 0) continue;
+    if (!waited_values[wait_idx]) {
+      reject(batch_[i], "nncache_wait", "owner cancelled invalid inference");
+      continue;
     }
+    std::string reason;
+    if (!ValidateCachedValue(*waited_values[wait_idx],
+                             batch_[i].legal_moves.size(), &reason)) {
+      reject(batch_[i], "nncache_wait", reason);
+      continue;
+    }
+    ApplyEvaluation(batch_[i], *waited_values[wait_idx]);
   }
   batch_.clear();
 }
 
 void UCTSearcher::ParallelUctSearch() {
   auto* current_root = grp_->owner->root_;
+  if (!grp_->owner->IsSearchActive()) return;
   {
     std::lock_guard<std::mutex> lk(g_root_expand_mutex);
-    if (!current_root->IsEvaled()) {
+    if (grp_->owner->IsSearchActive() && !current_root->IsEvaled()) {
       batch_.clear();
       float value_win = 0.5f;
       float value_m = 0.0f;
-      QueuingNode(&grp_->owner->root_board_, current_root, &value_win, &value_m);
+      bool eval_valid = true;
+      QueuingNode(&grp_->owner->root_board_, current_root, &value_win, &value_m,
+                  &eval_valid);
       EvalNode();
+      if (!eval_valid) return;
     }
   }
+  if (!grp_->owner->IsSearchActive()) return;
 
   std::vector<visitor_t> visitor_pool(batch_max_);
   std::vector<visitor_t*> visitor_batch;
   std::vector<std::vector<trajectory_t>*> discarded;
   visitor_batch.reserve(batch_max_);
   discarded.reserve(batch_max_);
+  auto unwind = [](const std::vector<trajectory_t>& path) {
+    for (auto it = path.rbegin(); it != path.rend(); ++it) {
+      SubVirtualLoss(&it->parent->child[it->child_idx], it->parent);
+    }
+  };
 
   while (grp_->owner->IsSearchActive()) {
     visitor_batch.clear();
@@ -549,6 +706,10 @@ void UCTSearcher::ParallelUctSearch() {
     for (int i = 0; i < batch_max_ && grp_->owner->IsSearchActive(); ++i) {
       ShogiBoard board = grp_->owner->root_board_;
       visitor_pool[i].trajectories.clear();
+      visitor_pool[i].value_win = 0.5f;
+      visitor_pool[i].value_m = 0.0f;
+      visitor_pool[i].terminal_value = 0.5f;
+      visitor_pool[i].eval_valid = true;
       const PlayoutStatus status =
           UctSearch(&board, nullptr, current_root, visitor_pool[i]);
       if (status != PlayoutStatus::kDiscarded) {
@@ -559,22 +720,30 @@ void UCTSearcher::ParallelUctSearch() {
       } else if (status == PlayoutStatus::kQueuing) {
         visitor_batch.push_back(&visitor_pool[i]);
       } else {
-        BackupTrajectory(visitor_pool[i].trajectories,
-                         visitor_pool[i].terminal_value);
+        if (!BackupTrajectory(visitor_pool[i].trajectories,
+                              visitor_pool[i].terminal_value)) {
+          unwind(visitor_pool[i].trajectories);
+          grp_->owner->Stop();
+        }
       }
     }
 
     EvalNode();
 
     for (auto* path : discarded) {
-      for (auto it = path->rbegin(); it != path->rend(); ++it) {
-        SubVirtualLoss(&it->parent->child[it->child_idx], it->parent);
-      }
+      unwind(*path);
     }
 
     for (auto* visitor : visitor_batch) {
-      BackupTrajectory(visitor->trajectories, 1.0f - visitor->value_win,
-                       visitor->value_m);
+      if (!visitor->eval_valid) {
+        unwind(visitor->trajectories);
+        continue;
+      }
+      if (!BackupTrajectory(visitor->trajectories,
+                            1.0f - visitor->value_win, visitor->value_m)) {
+        unwind(visitor->trajectories);
+        grp_->owner->Stop();
+      }
     }
 
     grp_->owner->MaybeOutputInfo();
@@ -582,6 +751,13 @@ void UCTSearcher::ParallelUctSearch() {
 }
 
 int Search::QToCentipawns(float win_rate) const {
+  if (!std::isfinite(win_rate)) {
+    std::ostringstream details;
+    details << "backend=mcts reason=\"non-finite root win rate\""
+            << " win_rate=" << win_rate;
+    jhbr2::nn_diagnostics::LogOnce("cp_conversion", details.str());
+    return 0;
+  }
   win_rate = std::clamp(win_rate, 0.001f, 0.999f);
   return static_cast<int>(-std::log(1.0f / win_rate - 1.0f) * 756.0f);
 }
@@ -647,9 +823,17 @@ SearchResult Search::BuildResult() const {
                    : child.IsWin() ? 0.0f
                    : n > 0 ? child.win.load(std::memory_order_acquire) / n
                            : 0.5f;
-  if (wp < config_.resign_threshold) result.best_move = Move();
-  result.root_q = wp * 2.0f - 1.0f;
-  result.score_cp = QToCentipawns(wp);
+  const float safe_wp = std::isfinite(wp) ? wp : 0.5f;
+  if (!std::isfinite(wp)) {
+    std::ostringstream details;
+    details << "backend=mcts reason=\"non-finite final root win rate\""
+            << " visits=" << n << " win="
+            << child.win.load(std::memory_order_acquire);
+    jhbr2::nn_diagnostics::LogOnce("build_result", details.str());
+  }
+  if (safe_wp < config_.resign_threshold) result.best_move = Move();
+  result.root_q = safe_wp * 2.0f - 1.0f;
+  result.score_cp = QToCentipawns(safe_wp);
   result.pv = GetPV();
   return result;
 }

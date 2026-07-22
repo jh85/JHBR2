@@ -223,6 +223,30 @@ class NNCache {
     return published;
   }
 
+  // Complete an in-flight reservation without publishing a value.  This is
+  // used when inference returns an invalid result: waiters must be released,
+  // but the bad value must never enter the cache.
+  void Cancel(Probe probe) {
+    if (!probe.IsOwner() || !probe.pending_) return;
+
+    Shard& shard = GetShard(probe.key_);
+    {
+      auto lock = LockShard(shard);
+      const PendingKey pending_key{probe.key_, probe.num_legal_moves_};
+      const auto pending = shard.in_flight.find(pending_key);
+      if (pending != shard.in_flight.end() &&
+          pending->second == probe.pending_) {
+        shard.in_flight.erase(pending);
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lock(probe.pending_->mutex);
+      probe.pending_->value.reset();
+      probe.pending_->ready = true;
+    }
+    probe.pending_->ready_cv.notify_all();
+  }
+
   void Clear() {
     for (auto& shard_ptr : shards_) {
       Shard& shard = *shard_ptr;

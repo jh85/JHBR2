@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -102,6 +103,21 @@ void TestTerminalBackupAlternatesOncePerEdge() {
             leaf_parent.child[0].move_count.load() == 1);
 }
 
+void TestInvalidBackupIsContained() {
+  uct_node_t root;
+  InitNode(&root, 1);
+  root.move_count.store(1, std::memory_order_relaxed);
+  root.child[0].move_count.store(1, std::memory_order_relaxed);
+  const std::vector<trajectory_t> path = {{&root, 0}};
+
+  Check("NaN backup is rejected",
+        !BackupTrajectory(path, std::numeric_limits<float>::quiet_NaN()));
+  Check("rejected backup leaves parent accumulator unchanged",
+        Near(root.win.load(), 0.0f));
+  Check("rejected backup leaves child accumulator unchanged",
+        Near(root.child[0].win.load(), 0.0f));
+}
+
 void TestParentQFpuForUnvisitedChildren() {
   uct_node_t node;
   InitNode(&node, 2);
@@ -198,6 +214,7 @@ void TestProvenStatePropagation() {
 int main() {
   TestTerminalEdgeConvention();
   TestTerminalBackupAlternatesOncePerEdge();
+  TestInvalidBackupIsContained();
   TestParentQFpuForUnvisitedChildren();
   TestSelectedPriorAccumulatesForFpu();
   TestDlshogiExplorationConstant();

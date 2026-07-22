@@ -37,10 +37,11 @@ using lczero::MoveList;
 
 // Re-use the same NNOutput struct.
 struct NNOutput {
-  float value;
-  float draw;
-  float wdl[3];
+  float value = 0.0f;
+  float draw = 0.0f;
+  float wdl[3] = {0.0f, 0.0f, 0.0f};
   float moves_left = 0.0f;  // MLH head: model's plies-to-end estimate (0 if none)
+  bool valid = true;  // false results must not be cached or backed up
   std::vector<float> policy;
 };
 

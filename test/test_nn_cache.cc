@@ -109,6 +109,21 @@ void TestInFlightReservation() {
         stats.duplicate_inserts == 0);
 }
 
+void TestCancelledReservation() {
+  jhbr2::NNCache cache(4);
+  auto owner = cache.LookupOrReserve(23, 5);
+  auto waiter = cache.LookupOrReserve(23, 5);
+
+  jhbr2::NNCache::Handle waited_value;
+  std::thread waiting_thread([&] { waited_value = waiter.Wait(); });
+  cache.Cancel(std::move(owner));
+  waiting_thread.join();
+
+  Check("cancel wakes waiter with no value", !waited_value);
+  Check("cancel does not insert", cache.Size() == 0);
+  Check("cancel permits a new owner", cache.LookupOrReserve(23, 5).IsOwner());
+}
+
 void TestConcurrentAccess() {
   constexpr int kThreads = 8;
   constexpr int kEntriesPerThread = 256;
@@ -159,6 +174,7 @@ int main() {
   TestFifoAndHandleLifetime();
   TestDuplicateInsert();
   TestInFlightReservation();
+  TestCancelledReservation();
   TestConcurrentAccess();
 
   std::printf("\n=== NN cache: %d failed ===\n", failures);

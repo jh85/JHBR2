@@ -15,14 +15,23 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <functional>
+#include <iomanip>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <sstream>
+#include <string>
+#include <thread>
 #include <vector>
 
+#include "inference/nn_diagnostics.h"
 #include "shogi/encoder.h"
 #include "shogi/encoder_unpack.h"
 
@@ -49,16 +58,19 @@ class TrtLogger : public nvinfer1::ILogger {
 // Softmax helper
 // =====================================================================
 
-static void Softmax(float* data, int size) {
+static bool Softmax(float* data, int size) {
+  for (int i = 0; i < size; ++i) {
+    if (!std::isfinite(data[i])) return false;
+  }
   float max_val = *std::max_element(data, data + size);
   float sum = 0.0f;
   for (int i = 0; i < size; i++) {
     data[i] = std::exp(data[i] - max_val);
     sum += data[i];
   }
-  if (sum > 0.0f) {
-    for (int i = 0; i < size; i++) data[i] /= sum;
-  }
+  if (!std::isfinite(sum) || sum <= 0.0f) return false;
+  for (int i = 0; i < size; i++) data[i] /= sum;
+  return true;
 }
 
 // =====================================================================
@@ -94,6 +106,8 @@ struct Slot {
   float* h_policy = nullptr;
   float* h_wdl = nullptr;
   float* h_mlh = nullptr;
+  std::atomic_flag in_use = ATOMIC_FLAG_INIT;
+  std::atomic<uint64_t> sequence{0};
 
   ~Slot() {
     if (d_input)     cudaFree(d_input);
@@ -113,6 +127,41 @@ struct Slot {
     if (stream)      cudaStreamDestroy(stream);
   }
 };
+
+namespace {
+
+class SlotUseGuard {
+ public:
+  explicit SlotUseGuard(Slot& slot)
+      : slot_(slot), acquired_(!slot_.in_use.test_and_set(
+                         std::memory_order_acquire)) {}
+  ~SlotUseGuard() {
+    if (acquired_) slot_.in_use.clear(std::memory_order_release);
+  }
+  bool acquired() const { return acquired_; }
+
+ private:
+  Slot& slot_;
+  bool acquired_;
+};
+
+std::vector<NNOutput> InvalidResults(int batch_size) {
+  std::vector<NNOutput> results(batch_size);
+  for (auto& result : results) result.valid = false;
+  return results;
+}
+
+uint64_t Fnv1a(const void* data, size_t size,
+               uint64_t hash = 1469598103934665603ULL) {
+  const auto* bytes = static_cast<const uint8_t*>(data);
+  for (size_t i = 0; i < size; ++i) {
+    hash ^= bytes[i];
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+}  // namespace
 
 // =====================================================================
 // Implementation
@@ -362,8 +411,9 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatch(
 std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     int slot_id,
     const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
-
   const int batch_size = static_cast<int>(batch.size());
+  if (batch_size == 0) return {};
+
   const int C = impl_->input_channels;
   const int C2 = impl_->input2_channels;
   const int P = impl_->policy_size;
@@ -372,27 +422,22 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
   constexpr int sq = 81;
 
   if (!impl_->engine || impl_->slots.empty()) {
-    // Engine not loaded — return uniform policy (matches old fallback).
-    std::vector<NNOutput> results(batch_size);
-    for (int b = 0; b < batch_size; b++) {
-      results[b].value = 0.0f;
-      results[b].draw = 0.1f;
-      results[b].wdl[0] = 0.45f;
-      results[b].wdl[1] = 0.1f;
-      results[b].wdl[2] = 0.45f;
-      float u = batch[b].second.empty() ? 0.0f : 1.0f / batch[b].second.size();
-      results[b].policy.assign(batch[b].second.size(), u);
-    }
-    return results;
+    nn_diagnostics::LogOnce(
+        "engine_unavailable",
+        "backend=tensorrt gpu=" + std::to_string(impl_->device_id) +
+            " batch=" + std::to_string(batch_size));
+    return InvalidResults(batch_size);
   }
 
   if (slot_id < 0 || slot_id >= static_cast<int>(impl_->slots.size())) {
-    slot_id = 0;
+    nn_diagnostics::LogOnce(
+        "slot_id",
+        "backend=tensorrt gpu=" + std::to_string(impl_->device_id) +
+            " slot=" + std::to_string(slot_id) +
+            " slots=" + std::to_string(impl_->slots.size()) +
+            " batch=" + std::to_string(batch_size));
+    return InvalidResults(batch_size);
   }
-  Slot& slot = *impl_->slots[slot_id];
-
-  // Multi-GPU contexts: ensure CUDA calls in this thread go to our device.
-  cudaSetDevice(impl_->device_id);
 
   // Buffers are allocated at the engine profile's maximum batch size, so
   // split oversized requests before preparing inputs or setting shapes.
@@ -410,10 +455,100 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     return results;
   }
 
+  Slot& slot = *impl_->slots[slot_id];
+  SlotUseGuard slot_guard(slot);
+  const uint64_t sequence =
+      slot.sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (!slot_guard.acquired()) {
+    std::ostringstream details;
+    details << "backend=tensorrt reason=concurrent_slot_use"
+            << " gpu=" << impl_->device_id << " slot=" << slot_id
+            << " sequence=" << sequence << " batch=" << batch_size
+            << " thread=" << std::hash<std::thread::id>{}(
+                                   std::this_thread::get_id());
+    nn_diagnostics::LogOnce("slot_ownership", details.str());
+    return InvalidResults(batch_size);
+  }
+
   // For dynamic engines use the actual batch size. Static engines require
   // padding to their fixed batch size.
   const int run_batch =
       impl_->dynamic_batch ? batch_size : impl_->max_batch_size;
+
+  bool input_prepared = false;
+  bool outputs_ready = false;
+  auto log_failure = [&](const char* stage, const std::string& reason,
+                         int element) {
+    std::ostringstream details;
+    details << std::setprecision(9)
+            << "backend=tensorrt reason=\"" << reason << "\""
+            << " gpu=" << impl_->device_id << " slot=" << slot_id
+            << " sequence=" << sequence << " batch=" << batch_size
+            << " run_batch=" << run_batch
+            << " thread=" << std::hash<std::thread::id>{}(
+                                   std::this_thread::get_id());
+    if (element >= 0 && element < batch_size) {
+      const auto& board = batch[element].first;
+      details << " element=" << element << " position_hash=0x" << std::hex
+              << board.Hash() << std::dec
+              << " legal_moves=" << batch[element].second.size()
+              << " sfen=\"" << board.ToSfen() << "\"";
+      if (input_prepared) {
+        uint64_t input_hash = 1469598103934665603ULL;
+        if (is_dlshogi) {
+          input_hash = Fnv1a(
+              slot.h_input + static_cast<size_t>(element) * C * sq,
+              static_cast<size_t>(C) * sq * sizeof(float), input_hash);
+          input_hash = Fnv1a(
+              slot.h_input2 + static_cast<size_t>(element) * C2 * sq,
+              static_cast<size_t>(C2) * sq * sizeof(float), input_hash);
+        } else {
+          input_hash = Fnv1a(
+              slot.h_packed_f1 +
+                  static_cast<size_t>(element) * kPackedF1Bytes,
+              kPackedF1Bytes, input_hash);
+          input_hash = Fnv1a(
+              slot.h_packed_f2 +
+                  static_cast<size_t>(element) * kPackedF2Bytes,
+              kPackedF2Bytes, input_hash);
+        }
+        details << " input_fnv1a=0x" << std::hex << input_hash << std::dec;
+      }
+      if (outputs_ready) {
+        details << " raw_wdl=";
+        for (int i = 0; i < value_planes; ++i) {
+          if (i != 0) details << ',';
+          details << slot.h_wdl[element * value_planes + i];
+        }
+        if (impl_->mlh_idx >= 0) {
+          details << " raw_mlh=" << slot.h_mlh[element];
+        }
+        const float* policy = slot.h_policy + static_cast<size_t>(element) * P;
+        int policy_nonfinite = 0;
+        float policy_min = std::numeric_limits<float>::infinity();
+        float policy_max = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < P; ++i) {
+          if (!std::isfinite(policy[i])) {
+            ++policy_nonfinite;
+          } else {
+            policy_min = std::min(policy_min, policy[i]);
+            policy_max = std::max(policy_max, policy[i]);
+          }
+        }
+        details << " policy_nonfinite=" << policy_nonfinite
+                << " policy_min=" << policy_min
+                << " policy_max=" << policy_max;
+      }
+    }
+    nn_diagnostics::LogOnce(stage, details.str());
+  };
+
+  // Multi-GPU contexts: ensure CUDA calls in this thread go to our device.
+  cudaError_t cuda_error = cudaSetDevice(impl_->device_id);
+  if (cuda_error != cudaSuccess) {
+    log_failure("cuda_set_device", cudaGetErrorString(cuda_error), 0);
+    return InvalidResults(batch_size);
+  }
 
   if (is_dlshogi) {
     std::fill(slot.h_input,
@@ -426,23 +561,36 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
                             slot.h_input + static_cast<size_t>(b) * C * sq,
                             slot.h_input2 + static_cast<size_t>(b) * C2 * sq);
     }
+    input_prepared = true;
 
     nvinfer1::Dims4 input1_dims{run_batch, C, 9, 9};
     nvinfer1::Dims4 input2_dims{run_batch, C2, 9, 9};
-    slot.context->setInputShape("input1", input1_dims);
-    slot.context->setInputShape("input2", input2_dims);
+    const bool shapes_ok = slot.context->setInputShape("input1", input1_dims) &&
+                           slot.context->setInputShape("input2", input2_dims);
+    const bool addresses_ok =
+        slot.context->setTensorAddress("input1", slot.d_input) &&
+        slot.context->setTensorAddress("input2", slot.d_input2) &&
+        slot.context->setTensorAddress("output_policy", slot.d_policy) &&
+        slot.context->setTensorAddress("output_value", slot.d_wdl);
+    if (!shapes_ok || !addresses_ok) {
+      log_failure("tensor_binding", "setInputShape/setTensorAddress failed", 0);
+      return InvalidResults(batch_size);
+    }
 
-    slot.context->setTensorAddress("input1", slot.d_input);
-    slot.context->setTensorAddress("input2", slot.d_input2);
-    slot.context->setTensorAddress("output_policy", slot.d_policy);
-    slot.context->setTensorAddress("output_value", slot.d_wdl);
-
-    CUDA_CHECK(cudaMemcpyAsync(slot.d_input, slot.h_input,
+    cuda_error = cudaMemcpyAsync(slot.d_input, slot.h_input,
         static_cast<size_t>(run_batch) * C * sq * sizeof(float),
-        cudaMemcpyHostToDevice, slot.stream));
-    CUDA_CHECK(cudaMemcpyAsync(slot.d_input2, slot.h_input2,
+        cudaMemcpyHostToDevice, slot.stream);
+    if (cuda_error != cudaSuccess) {
+      log_failure("cuda_h2d_input1", cudaGetErrorString(cuda_error), 0);
+      return InvalidResults(batch_size);
+    }
+    cuda_error = cudaMemcpyAsync(slot.d_input2, slot.h_input2,
         static_cast<size_t>(run_batch) * C2 * sq * sizeof(float),
-        cudaMemcpyHostToDevice, slot.stream));
+        cudaMemcpyHostToDevice, slot.stream);
+    if (cuda_error != cudaSuccess) {
+      log_failure("cuda_h2d_input2", cudaGetErrorString(cuda_error), 0);
+      return InvalidResults(batch_size);
+    }
   } else {
     // Native JHBR2: pack each position into the small bit buffers (~300 B/pos
     // vs ~48 KB of float planes), transfer, and expand on the GPU into d_input.
@@ -457,49 +605,87 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
                         slot.h_packed_f1 + static_cast<size_t>(b) * kPackedF1Bytes,
                         slot.h_packed_f2 + static_cast<size_t>(b) * kPackedF2Bytes);
     }
+    input_prepared = true;
 
     nvinfer1::Dims4 input_dims{run_batch, C, 9, 9};
-    slot.context->setInputShape("input_planes", input_dims);
-
-    slot.context->setTensorAddress("input_planes", slot.d_input);
-    slot.context->setTensorAddress("policy", slot.d_policy);
-    slot.context->setTensorAddress("wdl", slot.d_wdl);
+    bool bindings_ok = slot.context->setInputShape("input_planes", input_dims);
+    bindings_ok = slot.context->setTensorAddress("input_planes", slot.d_input) &&
+                  bindings_ok;
+    bindings_ok = slot.context->setTensorAddress("policy", slot.d_policy) &&
+                  bindings_ok;
+    bindings_ok = slot.context->setTensorAddress("wdl", slot.d_wdl) &&
+                  bindings_ok;
     if (impl_->mlh_idx >= 0) {
-      slot.context->setTensorAddress("mlh", slot.d_mlh);
+      bindings_ok = slot.context->setTensorAddress("mlh", slot.d_mlh) &&
+                    bindings_ok;
+    }
+    if (!bindings_ok) {
+      log_failure("tensor_binding", "setInputShape/setTensorAddress failed", 0);
+      return InvalidResults(batch_size);
     }
 
-    CUDA_CHECK(cudaMemcpyAsync(slot.d_packed_f1, slot.h_packed_f1,
+    cuda_error = cudaMemcpyAsync(slot.d_packed_f1, slot.h_packed_f1,
         static_cast<size_t>(run_batch) * kPackedF1Bytes,
-        cudaMemcpyHostToDevice, slot.stream));
-    CUDA_CHECK(cudaMemcpyAsync(slot.d_packed_f2, slot.h_packed_f2,
+        cudaMemcpyHostToDevice, slot.stream);
+    if (cuda_error != cudaSuccess) {
+      log_failure("cuda_h2d_packed_f1", cudaGetErrorString(cuda_error), 0);
+      return InvalidResults(batch_size);
+    }
+    cuda_error = cudaMemcpyAsync(slot.d_packed_f2, slot.h_packed_f2,
         static_cast<size_t>(run_batch) * kPackedF2Bytes,
-        cudaMemcpyHostToDevice, slot.stream));
+        cudaMemcpyHostToDevice, slot.stream);
+    if (cuda_error != cudaSuccess) {
+      log_failure("cuda_h2d_packed_f2", cudaGetErrorString(cuda_error), 0);
+      return InvalidResults(batch_size);
+    }
     LaunchUnpackFeatures(run_batch, C,
         kShogiNumF1Planes, kPackedF1Bytes,
         kShogiNumF2Planes, kPackedF2Bytes,
         static_cast<const uint8_t*>(slot.d_packed_f1),
         static_cast<const uint8_t*>(slot.d_packed_f2),
         static_cast<float*>(slot.d_input), slot.stream);
+    cuda_error = cudaGetLastError();
+    if (cuda_error != cudaSuccess) {
+      log_failure("cuda_unpack_launch", cudaGetErrorString(cuda_error), 0);
+      return InvalidResults(batch_size);
+    }
   }
 
-  bool ok = slot.context->enqueueV3(slot.stream);
-  if (!ok) {
-    fprintf(stderr, "[TRT] Inference failed (slot=%d)\n", slot_id);
+  if (!slot.context->enqueueV3(slot.stream)) {
+    log_failure("tensorrt_enqueue", "enqueueV3 returned false", 0);
+    return InvalidResults(batch_size);
   }
 
-  CUDA_CHECK(cudaMemcpyAsync(slot.h_policy, slot.d_policy,
+  cuda_error = cudaMemcpyAsync(slot.h_policy, slot.d_policy,
       static_cast<size_t>(run_batch) * P * sizeof(float),
-      cudaMemcpyDeviceToHost, slot.stream));
-  CUDA_CHECK(cudaMemcpyAsync(slot.h_wdl, slot.d_wdl,
+      cudaMemcpyDeviceToHost, slot.stream);
+  if (cuda_error != cudaSuccess) {
+    log_failure("cuda_d2h_policy", cudaGetErrorString(cuda_error), 0);
+    return InvalidResults(batch_size);
+  }
+  cuda_error = cudaMemcpyAsync(slot.h_wdl, slot.d_wdl,
       static_cast<size_t>(run_batch) * value_planes * sizeof(float),
-      cudaMemcpyDeviceToHost, slot.stream));
+      cudaMemcpyDeviceToHost, slot.stream);
+  if (cuda_error != cudaSuccess) {
+    log_failure("cuda_d2h_wdl", cudaGetErrorString(cuda_error), 0);
+    return InvalidResults(batch_size);
+  }
   if (impl_->mlh_idx >= 0) {
-    CUDA_CHECK(cudaMemcpyAsync(slot.h_mlh, slot.d_mlh,
+    cuda_error = cudaMemcpyAsync(slot.h_mlh, slot.d_mlh,
         static_cast<size_t>(run_batch) * 1 * sizeof(float),
-        cudaMemcpyDeviceToHost, slot.stream));
+        cudaMemcpyDeviceToHost, slot.stream);
+    if (cuda_error != cudaSuccess) {
+      log_failure("cuda_d2h_mlh", cudaGetErrorString(cuda_error), 0);
+      return InvalidResults(batch_size);
+    }
   }
 
-  CUDA_CHECK(cudaStreamSynchronize(slot.stream));
+  cuda_error = cudaStreamSynchronize(slot.stream);
+  if (cuda_error != cudaSuccess) {
+    log_failure("cuda_stream_sync", cudaGetErrorString(cuda_error), 0);
+    return InvalidResults(batch_size);
+  }
+  outputs_ready = true;
 
   std::vector<NNOutput> results(batch_size);
   for (int b = 0; b < batch_size; b++) {
@@ -508,10 +694,17 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     const auto& legal_moves = batch[b].second;
 
     result.moves_left = (impl_->mlh_idx >= 0) ? slot.h_mlh[b] : 0.0f;
+    if (!std::isfinite(result.moves_left)) {
+      log_failure("raw_output", "non-finite moves-left output", b);
+      return InvalidResults(batch_size);
+    }
 
     if (is_dlshogi) {
       float value_win = slot.h_wdl[b];
-      if (!std::isfinite(value_win)) value_win = 0.5f;
+      if (!std::isfinite(value_win)) {
+        log_failure("raw_output", "non-finite value output", b);
+        return InvalidResults(batch_size);
+      }
       value_win = std::clamp(value_win, 0.0f, 1.0f);
       result.wdl[0] = value_win;
       result.wdl[1] = 0.0f;
@@ -521,7 +714,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     } else {
       float wdl[3];
       std::copy(slot.h_wdl + b * 3, slot.h_wdl + b * 3 + 3, wdl);
-      Softmax(wdl, 3);
+      if (!Softmax(wdl, 3)) {
+        log_failure("raw_output", "non-finite or invalid WDL logits", b);
+        return InvalidResults(batch_size);
+      }
       result.wdl[0] = wdl[0];
       result.wdl[1] = wdl[1];
       result.wdl[2] = wdl[2];
@@ -532,7 +728,7 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
     float* logits = slot.h_policy + b * P;
 
     std::vector<float> legal_logits(legal_moves.size());
-    float max_logit = -1e10f;
+    float max_logit = -std::numeric_limits<float>::infinity();
 
     for (size_t i = 0; i < legal_moves.size(); i++) {
       int idx;
@@ -545,6 +741,10 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       }
       if (idx >= 0 && idx < P) {
         legal_logits[i] = logits[idx];
+        if (!std::isfinite(legal_logits[i])) {
+          log_failure("raw_output", "non-finite legal policy logit", b);
+          return InvalidResults(batch_size);
+        }
       } else {
         legal_logits[i] = -1000.0f;
       }
@@ -557,8 +757,17 @@ std::vector<NNOutput> NNEvaluator::EvaluateBatchSlot(
       result.policy[i] = std::exp(legal_logits[i] - max_logit);
       total += result.policy[i];
     }
-    if (total > 0.0f) {
-      for (auto& p : result.policy) p /= total;
+    if (!std::isfinite(total) || total <= 0.0f) {
+      log_failure("policy_softmax", "invalid policy normalization", b);
+      return InvalidResults(batch_size);
+    }
+    for (auto& p : result.policy) p /= total;
+
+    const float wdl_sum = result.wdl[0] + result.wdl[1] + result.wdl[2];
+    if (!std::isfinite(result.value) || !std::isfinite(result.draw) ||
+        !std::isfinite(wdl_sum) || std::abs(wdl_sum - 1.0f) > 1.0e-3f) {
+      log_failure("postprocess", "invalid processed value/WDL", b);
+      return InvalidResults(batch_size);
     }
   }
 

@@ -46,7 +46,9 @@ unsigned SelectPuctChild(child_node_t* parent, uct_node_t* current,
 // Back up a value that is already expressed from the perspective of the
 // player who traversed the final edge. Perspective is alternated exactly once
 // per edge while walking toward the root.
-void BackupTrajectory(const std::vector<trajectory_t>& trajectory,
+// Returns false without updating the tree if the value, moves-left estimate,
+// or an existing accumulator is non-finite.
+bool BackupTrajectory(const std::vector<trajectory_t>& trajectory,
                       float leaf_parent_value, float leaf_moves_left = 0.0f);
 
 }  // namespace dlshogi_mcts

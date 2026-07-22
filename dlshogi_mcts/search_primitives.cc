@@ -3,6 +3,9 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <sstream>
+
+#include "inference/nn_diagnostics.h"
 
 namespace dlshogi_mcts {
 namespace {
@@ -155,8 +158,42 @@ unsigned SelectPuctChild(child_node_t* parent, uct_node_t* current,
   return best;
 }
 
-void BackupTrajectory(const std::vector<trajectory_t>& trajectory,
+bool BackupTrajectory(const std::vector<trajectory_t>& trajectory,
                       float leaf_parent_value, float leaf_moves_left) {
+  if (!std::isfinite(leaf_parent_value) ||
+      !std::isfinite(leaf_moves_left)) {
+    std::ostringstream details;
+    details << "backend=mcts reason=\"non-finite backup input\""
+            << " value=" << leaf_parent_value
+            << " moves_left=" << leaf_moves_left
+            << " trajectory=" << trajectory.size();
+    jhbr2::nn_diagnostics::LogOnce("mcts_backup_input", details.str());
+    return false;
+  }
+
+  // Validate the entire path before updating any accumulator, so containment
+  // cannot leave a partially backed-up trajectory.
+  size_t step = 0;
+  for (const auto& item : trajectory) {
+    const auto& child = item.parent->child[item.child_idx];
+    const float parent_win =
+        item.parent->win.load(std::memory_order_acquire);
+    const float child_win = child.win.load(std::memory_order_acquire);
+    const float child_m = child.sum_m.load(std::memory_order_acquire);
+    if (!std::isfinite(parent_win) || !std::isfinite(child_win) ||
+        !std::isfinite(child_m) || !std::isfinite(child.nnrate)) {
+      std::ostringstream details;
+      details << "backend=mcts reason=\"non-finite tree accumulator\""
+              << " step=" << step << " trajectory=" << trajectory.size()
+              << " parent_win=" << parent_win
+              << " child_win=" << child_win << " child_sum_m=" << child_m
+              << " child_prior=" << child.nnrate;
+      jhbr2::nn_diagnostics::LogOnce("mcts_backup_tree", details.str());
+      return false;
+    }
+    ++step;
+  }
+
   float value = leaf_parent_value;
   float moves_left = leaf_moves_left;
   for (auto it = trajectory.rbegin(); it != trajectory.rend(); ++it) {
@@ -165,6 +202,7 @@ void BackupTrajectory(const std::vector<trajectory_t>& trajectory,
     value = 1.0f - value;
     moves_left += 1.0f;
   }
+  return true;
 }
 
 }  // namespace dlshogi_mcts

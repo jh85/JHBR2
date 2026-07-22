@@ -4,6 +4,13 @@ project(jhbr2 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Temporary one-shot diagnostics for tracing non-finite NN/MCTS values.  The
+# validation and containment remain compiled in when this is disabled.
+option(ENABLE_NN_DIAGNOSTICS "Log the first invalid NN/MCTS value" ON)
+if(ENABLE_NN_DIAGNOSTICS)
+  add_compile_definitions(JHBR2_ENABLE_NN_DIAGNOSTICS=1)
+endif()
+
 # ---- Build type ----
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)

@@ -30,10 +30,11 @@ using lczero::MoveList;
 // =====================================================================
 
 struct NNOutput {
-  float value;    // W - L from side-to-move perspective
-  float draw;     // Draw probability
-  float wdl[3];   // [Win, Draw, Loss] probabilities
+  float value = 0.0f;    // W - L from side-to-move perspective
+  float draw = 0.0f;     // Draw probability
+  float wdl[3] = {0.0f, 0.0f, 0.0f};  // [Win, Draw, Loss] probabilities
   float moves_left = 0.0f;  // MLH head: model's plies-to-end estimate (0 if none)
+  bool valid = true;  // false results must not be cached or backed up
 
   // Policy: probability for each legal move.
   // Indexed by position in the legal_moves vector passed to Evaluate().
