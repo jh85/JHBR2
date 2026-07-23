@@ -70,6 +70,7 @@ endif()
 set(SHOGI_ENGINE_SRCS
   shogi/board.cc
   shogi/bitboard.cc
+  shogi/packed_sfen.cc
   shogi/encoder.cc
 )
 
@@ -128,6 +129,7 @@ target_include_directories(shogi_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # ---- Library: opening book ----
 add_library(opening_book STATIC book/opening_book.cc)
 target_include_directories(opening_book PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(opening_book PUBLIC shogi_core)
 
 # ---- Library: pure move-time calculation ----
 add_library(time_manager STATIC usi/time_manager.cc)
@@ -269,9 +271,23 @@ target_link_libraries(test_mate1 PRIVATE shogi_core)
 add_executable(test_check_movegen test/test_check_movegen.cc)
 target_link_libraries(test_check_movegen PRIVATE shogi_core)
 
-# ---- Test: opening book preload and on-the-fly lookup ----
+# ---- Test: native on-demand YBB lookup ----
 add_executable(test_opening_book test/test_opening_book.cc)
 target_link_libraries(test_opening_book PRIVATE opening_book)
+
+# ---- Test: YaneuraOu PackedSfen compatibility ----
+add_executable(test_packed_sfen test/test_packed_sfen.cc)
+target_link_libraries(test_packed_sfen PRIVATE shogi_core)
+
+# ---- Test: asymmetric Gote book-exit retrograde solver ----
+add_executable(test_gote_exit_solver test/test_gote_exit_solver.cc)
+
+# ---- Test: side-aware opening-book selection ----
+add_executable(test_book_selection test/test_book_selection.cc)
+
+# ---- Tool: generate compact Gote-only early-exit YBB policy ----
+add_executable(gote_book_generator tools/gote_book_generator.cc)
+target_link_libraries(gote_book_generator PRIVATE shogi_core)
 
 # ---- Test: pure move-time calculation ----
 add_executable(test_time_manager test/test_time_manager.cc)

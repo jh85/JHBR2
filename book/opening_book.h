@@ -1,62 +1,63 @@
 /*
-  JHBR2 — Opening Book (YaneuraOu DB format)
+  JHBR2 native YaneuraOu Binary Book (YBB) reader.
 
-  Reads #YANEURAOU-DB2016 format:
-    sfen <SFEN>
-    <move> <ponder> <eval> <depth> <count>
-    ...
-
-  First move per position is the best (sorted by eval descending).
-  Lookup by SFEN string (exact match, ply number ignored).
-
-  Two modes:
-    - Full load: entire book loaded into memory (fast probe, slow startup)
-    - On-the-fly: binary search on sorted file (zero startup, zero memory)
+  The index and moves areas are accessed on demand, so even multi-million
+  position books require negligible resident memory.
 */
 
 #pragma once
 
+#include <cstdint>
 #include <fstream>
 #include <string>
-#include <unordered_map>
+
+#include "book/ybb_format.h"
+#include "shogi/board.h"
 
 namespace jhbr2 {
 
 struct BookEntry {
-  std::string move_usi;    // best move USI string
-  std::string ponder_usi;  // ponder move (or "none")
-  int eval = 0;            // evaluation from side-to-move
-  int depth = 0;           // search depth when analyzed
+  lczero::Move move;
+  int eval = 0;   // Evaluation from the side-to-move perspective.
+  int depth = 0;
 };
 
 class OpeningBook {
  public:
   ~OpeningBook();
 
-  // Load book from file.
-  // on_the_fly=false: loads entire file into memory, returns position count.
-  // on_the_fly=true: opens file for binary search, returns 0 (no preload).
-  int Load(const std::string& path, bool on_the_fly = false);
+  // Open and validate a YBB V1 file. Returns its position count, or zero on
+  // failure. Use is_loaded()/last_error() to distinguish an empty valid book
+  // from an error.
+  uint64_t Load(const std::string& path);
+  void Close();
 
-  // Probe: lookup position by SFEN. Returns nullptr if not found.
-  const BookEntry* Probe(const std::string& sfen);
+  // Probe by the board's PackedSfen key. Stored ply is intentionally ignored,
+  // matching JHBR2's previous text-book behavior and IgnoreBookPly=true.
+  const BookEntry* Probe(lczero::ShogiBoard& board);
 
-  bool is_loaded() const { return !entries_.empty() || on_the_fly_; }
+  bool is_loaded() const { return loaded_; }
+  uint64_t position_count() const { return record_count_; }
+  const std::string& path() const { return path_; }
+  const std::string& last_error() const { return last_error_; }
 
  private:
-  static std::string NormalizeSfen(const std::string& sfen);
+  bool ReadIndexEntry(uint64_t index, YbbIndexEntry* entry);
+  bool ReadMove(const YbbIndexEntry& entry, uint16_t move_index,
+                YbbMoveRecord* move);
+  bool ValidateFile(uint64_t file_size);
+  void Fail(std::string error);
 
-  // On-the-fly binary search helpers
-  std::string NextSfen(int64_t seek_from, int64_t& last_pos);
-  const BookEntry* ProbeOnTheFly(const std::string& sfen);
-
-  std::unordered_map<std::string, BookEntry> entries_;
-
-  // On-the-fly state
-  bool on_the_fly_ = false;
-  std::fstream fs_;
-  int64_t file_size_ = 0;
-  BookEntry otf_result_;  // reusable buffer for on-the-fly results
+  std::ifstream index_file_;
+  std::ifstream moves_file_;
+  std::string path_;
+  std::string last_error_;
+  uint64_t record_count_ = 0;
+  uint64_t flags_ = 0;
+  uint64_t moves_base_ = 0;
+  uint64_t file_size_ = 0;
+  bool loaded_ = false;
+  BookEntry result_;
 };
 
 }  // namespace jhbr2

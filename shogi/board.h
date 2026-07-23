@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "shogi/bitboard.h"
+#include "shogi/packed_sfen.h"
 #include "shogi/types.h"
 
 namespace lczero {
@@ -84,6 +85,11 @@ class ShogiBoard {
 
   // Export as SFEN string.
   std::string ToSfen() const;
+
+  // Import/export YaneuraOu's canonical 32-byte PackedSfen. PackedSfen does
+  // not contain the game ply, so callers supply it separately when decoding.
+  bool SetFromPackedSfen(const PackedSfen& packed, int game_ply = 1);
+  bool ToPackedSfen(PackedSfen* packed) const;
 
   // --- Queries ---
 

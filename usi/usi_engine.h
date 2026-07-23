@@ -73,8 +73,11 @@ class USIEngine {
   int max_move_time_ms_ = 0;
   int max_move_time_1m_ms_ = 0;
   std::string book_path_;
-  bool book_on_the_fly_ = false;
+  std::string gote_exit_book_path_;
+  bool use_gote_exit_book_ = false;
+  bool books_dirty_ = true;
   OpeningBook book_;
+  OpeningBook gote_exit_book_;
 };
 
 }  // namespace jhbr2

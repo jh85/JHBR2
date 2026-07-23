@@ -370,6 +370,9 @@ class Move {
  public:
   Move() = default;
 
+  // Construct from the 16-bit representation used by YaneuraOu books.
+  static constexpr Move FromRaw(uint16_t raw) { return Move(raw); }
+
   // Normal board move (from → to), no promotion.
   static constexpr Move Normal(Square from, Square to) {
     return Move(to.as_idx() | (from.as_idx() << 7));

@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "book/book_selection.h"
 #include "mate/dfpn.h"
 #include "shogi/encoder.h"
 #include "usi/search_info.h"
@@ -176,7 +177,9 @@ void USIEngine::CmdUsi() {
   Send("option name MaxMoveTime type spin default 0 min 0 max 300000");
   Send("option name MaxMoveTime1m type spin default 0 min 0 max 60000");
   Send("option name BookFile type string default ");
-  Send("option name BookOnTheFly type check default false");
+  Send("option name UseGoteExitBook type check default false");
+  Send("option name GoteExitBookFile type string default "
+       "user_book1_gote_exit.ybb");
 
   Send("usiok");
 }
@@ -197,15 +200,35 @@ void USIEngine::CmdIsReady() {
         ", format=" + ModelFormatToString(model_format_) +
         ", max_nodes=" + std::to_string(max_nodes_));
 
-    // Load opening book if specified.
+  }
+
+  // Book loading is independent of model loading so BookFile changes followed
+  // by isready take effect without rebuilding the TensorRT evaluators.
+  if (books_dirty_) {
+    book_.Close();
+    gote_exit_book_.Close();
+
     if (!book_path_.empty()) {
-      int book_count = book_.Load(book_path_, book_on_the_fly_);
-      if (book_on_the_fly_) {
-        Log("Book on-the-fly: " + book_path_);
+      const uint64_t book_count = book_.Load(book_path_);
+      if (book_.is_loaded()) {
+        Log("YBB book ready: " + std::to_string(book_count) +
+            " positions from " + book_path_);
       } else {
-        Log("Book loaded: " + std::to_string(book_count) + " positions from " + book_path_);
+        Log("YBB book error: " + book_.last_error());
       }
     }
+
+    if (!gote_exit_book_path_.empty()) {
+      const uint64_t book_count =
+          gote_exit_book_.Load(gote_exit_book_path_);
+      if (gote_exit_book_.is_loaded()) {
+        Log("Gote exit YBB ready: " + std::to_string(book_count) +
+            " positions from " + gote_exit_book_path_);
+      } else if (use_gote_exit_book_) {
+        Log("Gote exit YBB error: " + gote_exit_book_.last_error());
+      }
+    }
+    books_dirty_ = false;
   }
   Send("readyok");
 }
@@ -327,8 +350,14 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
     max_move_time_1m_ms_ = std::stoi(value);
   } else if (name_lower == "bookfile") {
     book_path_ = value;
+    books_dirty_ = true;
+  } else if (name_lower == "goteexitbookfile") {
+    gote_exit_book_path_ = value;
+    books_dirty_ = true;
+  } else if (name_lower == "usegoteexitbook") {
+    use_gote_exit_book_ = ToLower(value) == "true" || value == "1";
   } else if (name_lower == "bookonthefly") {
-    book_on_the_fly_ = (value == "true");
+    Log("BookOnTheFly is deprecated; YBB books are always probed on demand");
   }
 
   Log("Set " + name + " = " + value);
@@ -439,18 +468,30 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     return;
   }
 
-  // Probe opening book.
-  if (book_.is_loaded()) {
-    auto* entry = book_.Probe(board_.ToSfen());
+  // Probe the specialized policy only on Gote turns. A miss deliberately
+  // falls through to MCTS instead of the normal book: it means this line has
+  // left the generated Gote policy.
+  OpeningBook* active_book = nullptr;
+  const OpeningBookChoice book_choice = ChooseOpeningBook(
+      board_.side_to_move(), use_gote_exit_book_, book_.is_loaded(),
+      gote_exit_book_.is_loaded());
+  if (book_choice == OpeningBookChoice::kGoteExit) {
+    active_book = &gote_exit_book_;
+  } else if (book_choice == OpeningBookChoice::kNormal) {
+    active_book = &book_;
+  }
+
+  if (active_book != nullptr) {
+    auto* entry = active_book->Probe(board_);
     if (entry) {
-      Log("Book hit: " + entry->move_usi + " (eval=" +
+      const std::string move_usi = entry->move.ToString();
+      Log(std::string(book_choice == OpeningBookChoice::kGoteExit
+                          ? "Gote exit book hit: "
+                          : "Book hit: ") +
+          move_usi + " (eval=" +
           std::to_string(entry->eval) + ", depth=" +
           std::to_string(entry->depth) + ")");
-      std::string response = "bestmove " + entry->move_usi;
-      if (entry->ponder_usi != "none" && !entry->ponder_usi.empty()) {
-        response += " ponder " + entry->ponder_usi;
-      }
-      Send(response);
+      Send("bestmove " + move_usi);
       return;
     }
   }
