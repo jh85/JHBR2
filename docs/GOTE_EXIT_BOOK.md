@@ -31,19 +31,22 @@ output path, supply it as the second positional argument:
 ```
 
 The default strength guard allows only Gote moves within 30 centipawns of the
-best stored evaluation at every Gote node. The build uses all available CPU
-threads. These defaults can be overridden:
+best stored evaluation at every Gote node. Override it directly on the command
+line:
 
 ```bash
-GOTE_EXIT_EVAL_MARGIN=20 GOTE_EXIT_THREADS=16 \
-  ./tools/generate_gote_exit_book.sh /path/to/new_user_book1.ybb --force
+./tools/generate_gote_exit_book.sh /path/to/new_user_book1.ybb \
+  --gote-exit-eval-margin 20 --force
 ```
 
-`GOTE_BOOK_BUILD_DIR` changes the CMake build directory, and
-`GOTE_BOOK_BUILD_JOBS` changes the compiler parallelism. The lower-level
-generator also accepts `--validate-moves` for a slower full legality check.
-`--max-positions` is only for development tests; its output is incomplete and
-must not be used for play.
+The build uses all available CPU threads. Use `--threads 16` to override that
+number. The shorter `--eval-margin` spelling and the
+`GOTE_EXIT_EVAL_MARGIN`/`GOTE_EXIT_THREADS` environment variables remain
+available for compatibility and automation. `GOTE_BOOK_BUILD_DIR` changes the
+CMake build directory, and `GOTE_BOOK_BUILD_JOBS` changes compiler
+parallelism. The lower-level generator also accepts `--validate-moves` for a
+slower full legality check. `--max-positions` is only for development tests;
+its output is incomplete and must not be used for play.
 
 The source must be a distributed/PetaShock-style YBB whose stored move lists
 contain the in-book transpositions that should participate in minimax

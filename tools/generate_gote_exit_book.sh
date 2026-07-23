@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   echo "Usage: $0 SOURCE.ybb [OUTPUT.ybb] [generator options]" >&2
-  echo "Example: $0 /data/books/user_book1.ybb user_book1_gote_exit.ybb --force" >&2
+  echo "Example: $0 /data/books/user_book1.ybb --gote-exit-eval-margin 20 --force" >&2
 }
 
 if [[ $# -lt 1 ]]; then

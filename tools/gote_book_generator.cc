@@ -69,7 +69,7 @@ struct Options {
 std::string Usage(const char* program) {
   return std::string("Usage: ") + program +
          " --input SOURCE.ybb --output user_book1_gote_exit.ybb"
-         " [--eval-margin CP] [--threads N] [--max-positions N]"
+         " [--gote-exit-eval-margin CP] [--threads N] [--max-positions N]"
          " [--validate-moves] [--force]";
 }
 
@@ -102,11 +102,16 @@ Options ParseOptions(int argc, char** argv) {
       options.input = value("--input");
     } else if (arg == "--output") {
       options.output = value("--output");
-    } else if (arg == "--eval-margin") {
+    } else if (arg == "--eval-margin" ||
+               arg == "--gote-exit-eval-margin") {
+      const char* option_name =
+          arg == "--eval-margin" ? "--eval-margin"
+                                 : "--gote-exit-eval-margin";
       const uint64_t parsed =
-          ParseUnsigned(value("--eval-margin"), "--eval-margin");
+          ParseUnsigned(value(option_name), option_name);
       if (parsed > 32000) {
-        throw std::runtime_error("--eval-margin must be at most 32000");
+        throw std::runtime_error(
+            std::string(option_name) + " must be at most 32000");
       }
       options.eval_margin = static_cast<int>(parsed);
     } else if (arg == "--threads") {
