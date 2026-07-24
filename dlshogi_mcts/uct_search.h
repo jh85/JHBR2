@@ -103,6 +103,7 @@ class Search {
 
   SearchResult Run(lczero::ShogiBoard board, uint64_t starting_pos_key,
                    const std::vector<lczero::Move>& moves);
+  void ResetForNewGame();
   void Stop() { stop_.store(true, std::memory_order_release); }
   void SetMaxTime(float seconds) { config_.max_time = seconds; }
   void SetMaxNodes(size_t n) { config_.max_nodes = static_cast<int>(n); }

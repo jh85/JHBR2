@@ -194,6 +194,16 @@ void USIEngine::Log(const std::string& msg) {
   std::cout << "info string " << msg << std::endl;
 }
 
+void USIEngine::EnsureSearch() {
+  if (search_ || evaluators_.empty()) return;
+
+  std::vector<jhbr2::NNEvaluator*> eval_ptrs;
+  eval_ptrs.reserve(evaluators_.size());
+  for (auto& evaluator : evaluators_) eval_ptrs.push_back(evaluator.get());
+  search_ =
+      std::make_unique<dlshogi_mcts::Search>(eval_ptrs, search_config_);
+}
+
 void USIEngine::CmdUsi() {
   Send(std::string("id name ") + ENGINE_NAME);
   Send(std::string("id author ") + ENGINE_AUTHOR);
@@ -265,6 +275,10 @@ void USIEngine::CmdIsReady() {
         ", max_nodes=" + std::to_string(max_nodes_));
 
   }
+
+  // Construct the cache, tree, and worker objects during isready rather than
+  // charging their one-time allocation cost to the first timed move.
+  EnsureSearch();
 
   // Book loading is independent of model loading so BookFile changes followed
   // by isready take effect without rebuilding the TensorRT evaluators.
@@ -493,10 +507,9 @@ void USIEngine::CmdUsiNewGame() {
   board_.ClearHistory();
   position_start_key_ = board_.Hash();
   position_moves_.clear();
-  // Drop the Search object so the next `go` rebuilds it with a fresh
-  // tree. Otherwise tree reuse would carry over visit counts from the
-  // previous game's positions, which is incorrect.
-  search_.reset();
+  // Search owns long-lived GPU worker state and a potentially multi-million
+  // entry NN cache. Only the MCTS tree contains game-specific statistics.
+  if (search_) search_->ResetForNewGame();
 }
 
 void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
@@ -670,13 +683,8 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
     Send(FormatUSISearchInfo(usi_info));
   };
 
-  // Persistent Search object across `go` commands.
-  if (!search_) {
-    std::vector<jhbr2::NNEvaluator*> eval_ptrs;
-    for (auto& e : evaluators_) eval_ptrs.push_back(e.get());
-    search_ =
-        std::make_unique<dlshogi_mcts::Search>(eval_ptrs, search_config_);
-  }
+  // Persistent Search object across `go` commands and games.
+  EnsureSearch();
   // Search holds its own config snapshot — push per-move
   // updates so max_time / max_nodes reflect THIS go command, not the
   // first one ever issued.

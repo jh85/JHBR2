@@ -169,6 +169,25 @@ void TestChangedStartingPosition() {
             tree.GetCurrentHead()->child_num == 0);
 }
 
+void TestExplicitNewGameReset() {
+  constexpr uint64_t kStartKey = 0x6789;
+  const Move move = Move::Parse("7g7f");
+  NodeTree tree;
+  tree.ResetToPosition(kStartKey, {});
+  auto* old_child = AppendChild(tree.GetCurrentHead(), move, 42);
+  old_child->win.store(17.0f, std::memory_order_relaxed);
+  tree.ResetToPosition(kStartKey, {move});
+
+  tree.DeallocateTree();
+
+  Check("explicit new-game position is not reused",
+        !tree.ResetToPosition(kStartKey, {move}));
+  auto* fresh = tree.GetCurrentHead();
+  Check("explicit new-game root has no stale visits", !fresh->IsEvaled());
+  Check("explicit new-game root has no stale children",
+        fresh->child_num == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -179,6 +198,7 @@ int main() {
   TestRewindResetsHead();
   TestDivergenceResetsHead();
   TestChangedStartingPosition();
+  TestExplicitNewGameReset();
 
   std::printf("\n=== Tree reuse: %d failed ===\n", failures);
   return failures == 0 ? 0 : 1;

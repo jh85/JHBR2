@@ -285,6 +285,23 @@ Search::~Search() {
   for (auto& group : groups_) group.Join();
 }
 
+void Search::ResetForNewGame() {
+  // USI command processing is synchronous, so searches should already be
+  // idle here. Join defensively before invalidating pointers into the tree.
+  Stop();
+  for (auto& group : groups_) group.Join();
+  root_ = nullptr;
+  tree_.DeallocateTree();
+  tree_reused_ = false;
+  root_visits_before_ = 0;
+  playout_count_.store(0, std::memory_order_release);
+
+  // Neural evaluations depend only on the position and model, not on the
+  // game. Preserve the cache across games: destroying millions of cached
+  // policy vectors synchronously can consume the next game's clock.
+  nn_cache_.ResetStats();
+}
+
 bool Search::IsSearchActive() const {
   if (stop_.load(std::memory_order_acquire)) return false;
   if (config_.max_nodes > 0 &&

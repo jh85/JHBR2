@@ -51,6 +51,7 @@ class USIEngine {
   // --- Helpers ---
   void Send(const std::string& msg);
   void Log(const std::string& msg);
+  void EnsureSearch();
 
   // --- Members ---
   lczero::ShogiBoard board_;
