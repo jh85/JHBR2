@@ -31,6 +31,15 @@ struct CachedNNValue {
   uint16_t num_legal_moves = 0;
 };
 
+// Every field that can change the network input must participate in the cache
+// key. The position hash covers board pieces, hands, and side to move, while
+// the repetition plane comes from game history. Fold that plane into a compact
+// 64-bit fingerprint rather than doubling every stored key through alignment.
+inline uint64_t MakeNNCacheKey(uint64_t position_hash, bool repetition) {
+  constexpr uint64_t kRepetitionSalt = 0xd1b54a32d192ed03ULL;
+  return repetition ? position_hash ^ kRepetitionSalt : position_hash;
+}
+
 struct NNCacheStats {
   size_t size = 0;
   size_t capacity = 0;
@@ -253,6 +262,7 @@ class NNCache {
       std::lock_guard<std::mutex> lock(shard.mutex);
       shard.map.clear();
       shard.insertion_order.clear();
+      shard.in_flight.clear();
       shard.size.store(0, std::memory_order_relaxed);
     }
   }

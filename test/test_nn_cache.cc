@@ -27,25 +27,29 @@ jhbr2::CachedNNValue MakeValue(float value, int policy_size) {
   return cached;
 }
 
+uint64_t Key(uint64_t position_hash, bool repetition = false) {
+  return jhbr2::MakeNNCacheKey(position_hash, repetition);
+}
+
 void TestDisabledCache() {
   jhbr2::NNCache cache;
-  cache.Insert(1, MakeValue(0.75f, 4));
-  Check("disabled lookup misses", !cache.Lookup(1, 4));
+  cache.Insert(Key(1), MakeValue(0.75f, 4));
+  Check("disabled lookup misses", !cache.Lookup(Key(1), 4));
   Check("disabled cache remains empty", cache.Size() == 0);
   Check("disabled cache records no probes", cache.GetStats().lookups == 0);
 }
 
 void TestLookupAndCollisionGuard() {
   jhbr2::NNCache cache(4);
-  cache.Insert(11, MakeValue(0.75f, 4));
+  cache.Insert(Key(11), MakeValue(0.75f, 4));
 
-  auto hit = cache.Lookup(11, 4);
+  auto hit = cache.Lookup(Key(11), 4);
   Check("lookup finds inserted value", hit && hit->wdl[0] == 0.75f);
   Check("lookup returns complete policy", hit && hit->policy.size() == 4);
-  Check("legal move count guards lookup", !cache.Lookup(11, 3));
+  Check("legal move count guards lookup", !cache.Lookup(Key(11), 3));
 
-  cache.Insert(11, MakeValue(0.5f, 3));
-  auto replacement = cache.Lookup(11, 3);
+  cache.Insert(Key(11), MakeValue(0.5f, 3));
+  auto replacement = cache.Lookup(Key(11), 3);
   Check("different legal count replaces colliding value",
         replacement && replacement->policy.size() == 3);
 
@@ -56,14 +60,29 @@ void TestLookupAndCollisionGuard() {
   Check("insert count", stats.inserts == 1);
 }
 
+void TestRepetitionKeyIsolation() {
+  jhbr2::NNCache cache(4);
+  cache.Insert(Key(19, false), MakeValue(0.25f, 4));
+  cache.Insert(Key(19, true), MakeValue(0.75f, 4));
+
+  auto ordinary = cache.Lookup(Key(19, false), 4);
+  auto repetition = cache.Lookup(Key(19, true), 4);
+  Check("ordinary position has its own cached evaluation",
+        ordinary && ordinary->wdl[0] == 0.25f);
+  Check("repetition plane has its own cached evaluation",
+        repetition && repetition->wdl[0] == 0.75f);
+  Check("repetition variants occupy separate entries", cache.Size() == 2);
+}
+
 void TestFifoAndHandleLifetime() {
   jhbr2::NNCache cache(1);
-  cache.Insert(1, MakeValue(0.25f, 2));
-  auto retained = cache.Lookup(1, 2);
-  cache.Insert(2, MakeValue(0.75f, 3));
+  cache.Insert(Key(1), MakeValue(0.25f, 2));
+  auto retained = cache.Lookup(Key(1), 2);
+  cache.Insert(Key(2), MakeValue(0.75f, 3));
 
-  Check("FIFO evicts oldest key", !cache.Lookup(1, 2));
-  Check("FIFO retains newest key", static_cast<bool>(cache.Lookup(2, 3)));
+  Check("FIFO evicts oldest key", !cache.Lookup(Key(1), 2));
+  Check("FIFO retains newest key",
+        static_cast<bool>(cache.Lookup(Key(2), 3)));
   Check("evicted handle remains valid",
         retained && retained->wdl[0] == 0.25f && retained->policy.size() == 2);
   Check("capacity remains bounded", cache.Size() == 1);
@@ -72,10 +91,10 @@ void TestFifoAndHandleLifetime() {
 
 void TestDuplicateInsert() {
   jhbr2::NNCache cache(2);
-  cache.Insert(7, MakeValue(0.25f, 2));
-  cache.Insert(7, MakeValue(0.75f, 2));
+  cache.Insert(Key(7), MakeValue(0.25f, 2));
+  cache.Insert(Key(7), MakeValue(0.75f, 2));
 
-  auto hit = cache.Lookup(7, 2);
+  auto hit = cache.Lookup(Key(7), 2);
   Check("first duplicate value wins", hit && hit->wdl[0] == 0.25f);
   Check("duplicate insert counted", cache.GetStats().duplicate_inserts == 1);
   Check("duplicate does not grow cache", cache.Size() == 1);
@@ -83,8 +102,8 @@ void TestDuplicateInsert() {
 
 void TestInFlightReservation() {
   jhbr2::NNCache cache(4);
-  auto owner = cache.LookupOrReserve(17, 4);
-  auto waiter = cache.LookupOrReserve(17, 4);
+  auto owner = cache.LookupOrReserve(Key(17), 4);
+  auto waiter = cache.LookupOrReserve(Key(17), 4);
 
   Check("first miss owns in-flight evaluation", owner.IsOwner());
   Check("second miss waits for in-flight evaluation", waiter.IsWaiter());
@@ -99,7 +118,7 @@ void TestInFlightReservation() {
   Check("waiter receives published value",
         waited_value && waited_value->wdl[0] == 0.625f);
   Check("published value becomes a normal hit",
-        cache.LookupOrReserve(17, 4).IsHit());
+        cache.LookupOrReserve(Key(17), 4).IsHit());
 
   const auto stats = cache.GetStats();
   Check("one in-flight owner", stats.in_flight_owners == 1);
@@ -111,8 +130,8 @@ void TestInFlightReservation() {
 
 void TestCancelledReservation() {
   jhbr2::NNCache cache(4);
-  auto owner = cache.LookupOrReserve(23, 5);
-  auto waiter = cache.LookupOrReserve(23, 5);
+  auto owner = cache.LookupOrReserve(Key(23), 5);
+  auto waiter = cache.LookupOrReserve(Key(23), 5);
 
   jhbr2::NNCache::Handle waited_value;
   std::thread waiting_thread([&] { waited_value = waiter.Wait(); });
@@ -121,7 +140,25 @@ void TestCancelledReservation() {
 
   Check("cancel wakes waiter with no value", !waited_value);
   Check("cancel does not insert", cache.Size() == 0);
-  Check("cancel permits a new owner", cache.LookupOrReserve(23, 5).IsOwner());
+  Check("cancel permits a new owner",
+        cache.LookupOrReserve(Key(23), 5).IsOwner());
+}
+
+void TestClearPreservesAllocationAndDropsEntries() {
+  jhbr2::NNCache cache(4);
+  cache.Insert(Key(31), MakeValue(0.25f, 2));
+  cache.Insert(Key(32, true), MakeValue(0.75f, 3));
+  const size_t capacity = cache.Capacity();
+
+  cache.Clear();
+
+  Check("clear removes ordinary entry", !cache.Lookup(Key(31), 2));
+  Check("clear removes repetition entry", !cache.Lookup(Key(32, true), 3));
+  Check("clear resets logical size", cache.Size() == 0);
+  Check("clear preserves configured capacity", cache.Capacity() == capacity);
+  cache.Insert(Key(33), MakeValue(0.5f, 4));
+  Check("cache remains usable after clear",
+        static_cast<bool>(cache.Lookup(Key(33), 4)));
 }
 
 void TestConcurrentAccess() {
@@ -137,8 +174,8 @@ void TestConcurrentAccess() {
       const int first = thread * kEntriesPerThread;
       for (int i = 0; i < kEntriesPerThread; ++i) {
         const uint64_t key = static_cast<uint64_t>(first + i);
-        cache.Insert(key, MakeValue(0.5f, 8));
-        auto hit = cache.Lookup(key, 8);
+        cache.Insert(Key(key), MakeValue(0.5f, 8));
+        auto hit = cache.Lookup(Key(key), 8);
         if (!hit || hit->policy.size() != 8) failed.store(true);
       }
     });
@@ -152,7 +189,9 @@ void TestConcurrentAccess() {
   for (int thread = 0; thread < kThreads; ++thread) {
     threads.emplace_back([&, thread] {
       for (int key = thread; key < kEntryCount; key += kThreads) {
-        if (!cache.Lookup(static_cast<uint64_t>(key), 8)) failed.store(true);
+        if (!cache.Lookup(Key(static_cast<uint64_t>(key)), 8)) {
+          failed.store(true);
+        }
       }
     });
   }
@@ -171,10 +210,12 @@ void TestConcurrentAccess() {
 int main() {
   TestDisabledCache();
   TestLookupAndCollisionGuard();
+  TestRepetitionKeyIsolation();
   TestFifoAndHandleLifetime();
   TestDuplicateInsert();
   TestInFlightReservation();
   TestCancelledReservation();
+  TestClearPreservesAllocationAndDropsEntries();
   TestConcurrentAccess();
 
   std::printf("\n=== NN cache: %d failed ===\n", failures);

@@ -276,9 +276,15 @@ void USIEngine::CmdIsReady() {
 
   }
 
-  // Construct the cache, tree, and worker objects during isready rather than
-  // charging their one-time allocation cost to the first timed move.
-  EnsureSearch();
+  // isready is the acknowledged per-game preparation barrier. Reuse the
+  // Search allocation and GPU workers, but clear the previous game's tree and
+  // NN entries before readyok so cleanup is never charged to a timed move.
+  if (search_) {
+    search_->PrepareForNewGame();
+  } else {
+    EnsureSearch();
+  }
+  new_game_prepared_ = true;
 
   // Book loading is independent of model loading so BookFile changes followed
   // by isready take effect without rebuilding the TensorRT evaluators.
@@ -507,9 +513,15 @@ void USIEngine::CmdUsiNewGame() {
   board_.ClearHistory();
   position_start_key_ = board_.Hash();
   position_moves_.clear();
-  // Search owns long-lived GPU worker state and a potentially multi-million
-  // entry NN cache. Only the MCTS tree contains game-specific statistics.
-  if (search_) search_->ResetForNewGame();
+  if (search_ && !new_game_prepared_) {
+    // USI clients should issue isready/readyok before each game. Preserve
+    // strict per-game cache isolation for older clients, but make the
+    // unsynchronised slow path visible because it can delay the next go.
+    Log("WARNING usinewgame received without per-game isready; "
+        "clearing search state now");
+    search_->PrepareForNewGame();
+  }
+  new_game_prepared_ = false;
 }
 
 void USIEngine::CmdPosition(const std::vector<std::string>& parts) {

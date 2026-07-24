@@ -60,6 +60,7 @@ class USIEngine {
   dlshogi_mcts::SearchConfig search_config_;
   uint64_t position_start_key_ = 0;
   std::vector<lczero::Move> position_moves_;
+  bool new_game_prepared_ = false;
 
   // Options
   std::string onnx_path_ = "shogi_bt4.onnx";

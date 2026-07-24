@@ -339,6 +339,11 @@ class UsiEngine:
             pass
 
     def new_game(self) -> None:
+        # USI permits expensive per-game preparation behind the acknowledged
+        # isready/readyok barrier. Keep cache/tree cleanup outside the first
+        # move's elapsed time.
+        self.send("isready")
+        self.wait_for("readyok", self.startup_timeout)
         self.send("usinewgame")
 
     def search(

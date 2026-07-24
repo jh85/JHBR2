@@ -48,17 +48,17 @@ float DrawValue(const SearchConfig& cfg, lczero::Color color) {
 }
 
 struct BatchCacheKey {
-  uint64_t hash = 0;
+  uint64_t nn = 0;
   uint16_t num_moves = 0;
 
   bool operator==(const BatchCacheKey& other) const {
-    return hash == other.hash && num_moves == other.num_moves;
+    return nn == other.nn && num_moves == other.num_moves;
   }
 };
 
 struct BatchCacheKeyHash {
   size_t operator()(const BatchCacheKey& key) const {
-    size_t h = std::hash<uint64_t>{}(key.hash);
+    size_t h = std::hash<uint64_t>{}(key.nn);
     h ^= std::hash<uint16_t>{}(key.num_moves) + 0x9e3779b97f4a7c15ULL +
          (h << 6) + (h >> 2);
     return h;
@@ -285,9 +285,9 @@ Search::~Search() {
   for (auto& group : groups_) group.Join();
 }
 
-void Search::ResetForNewGame() {
+void Search::PrepareForNewGame() {
   // USI command processing is synchronous, so searches should already be
-  // idle here. Join defensively before invalidating pointers into the tree.
+  // idle here. Join defensively before invalidating tree and cache handles.
   Stop();
   for (auto& group : groups_) group.Join();
   root_ = nullptr;
@@ -296,9 +296,10 @@ void Search::ResetForNewGame() {
   root_visits_before_ = 0;
   playout_count_.store(0, std::memory_order_release);
 
-  // Neural evaluations depend only on the position and model, not on the
-  // game. Preserve the cache across games: destroying millions of cached
-  // policy vectors synchronously can consume the next game's clock.
+  // Keep the table's reserved buckets, but discard every evaluation from the
+  // preceding game. isready/readyok keeps this potentially expensive work
+  // outside the next move's clock.
+  nn_cache_.Clear();
   nn_cache_.ResetStats();
 }
 
@@ -507,7 +508,6 @@ void UCTSearcher::EvalNode() {
   const size_t batch_size = batch_.size();
   std::vector<int> result_to_miss(batch_size, -1);
   std::vector<std::pair<ShogiBoard, MoveList>> miss_batch;
-  std::vector<uint64_t> miss_keys;
   std::vector<uint16_t> miss_num_moves;
   std::vector<jhbr2::NNCache::Probe> miss_reservations;
   std::vector<jhbr2::NNCache::Probe> wait_probes;
@@ -516,7 +516,6 @@ void UCTSearcher::EvalNode() {
       local_probes;
 
   miss_batch.reserve(batch_size);
-  miss_keys.reserve(batch_size);
   miss_num_moves.reserve(batch_size);
   miss_reservations.reserve(batch_size);
   wait_probes.reserve(batch_size);
@@ -547,7 +546,8 @@ void UCTSearcher::EvalNode() {
 
   for (size_t i = 0; i < batch_size; ++i) {
     auto& elem = batch_[i];
-    const uint64_t key = elem.board.Hash();
+    const uint64_t key = jhbr2::MakeNNCacheKey(
+        elem.board.Hash(), elem.board.IsRepetition());
     const uint16_t num_moves =
         static_cast<uint16_t>(elem.legal_moves.size());
 
@@ -593,7 +593,6 @@ void UCTSearcher::EvalNode() {
     probe_it->second.miss_index = miss_idx;
     result_to_miss[i] = miss_idx;
     miss_batch.emplace_back(elem.board, elem.legal_moves);
-    miss_keys.push_back(key);
     miss_num_moves.push_back(num_moves);
     if (nn_cache.Enabled()) {
       miss_reservations.push_back(std::move(cache_probe));

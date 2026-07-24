@@ -103,7 +103,10 @@ class Search {
 
   SearchResult Run(lczero::ShogiBoard board, uint64_t starting_pos_key,
                    const std::vector<lczero::Move>& moves);
-  void ResetForNewGame();
+  // Called from the acknowledged isready phase. Clears game-specific tree
+  // state and NN entries while preserving GPU evaluators, workers, and cache
+  // bucket allocation.
+  void PrepareForNewGame();
   void Stop() { stop_.store(true, std::memory_order_release); }
   void SetMaxTime(float seconds) { config_.max_time = seconds; }
   void SetMaxNodes(size_t n) { config_.max_nodes = static_cast<int>(n); }
