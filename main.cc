@@ -15,8 +15,8 @@
 
 #include <csignal>
 #include <cstdio>
-#include <cstdlib>
 #include <execinfo.h>
+#include <unistd.h>
 
 static void crash_handler(int sig) {
   fprintf(stderr, "\n=== JHBR2 CRASH: signal %d ===\n", sig);

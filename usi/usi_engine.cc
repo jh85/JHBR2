@@ -8,9 +8,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <exception>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -24,6 +28,16 @@
 namespace jhbr2 {
 
 using namespace lczero;
+
+namespace {
+
+// TensorRT creates one execution context and one set of buffers per worker.
+// Production has successfully used 16 workers/GPU on RTX 5090. Keep a
+// generous USI safety ceiling so higher-end hardware can be benchmarked,
+// while still preventing an accidental unbounded allocation.
+constexpr int kMaxWorkersPerGpu = 64;
+
+}  // namespace
 
 // =====================================================================
 // Helpers
@@ -42,6 +56,39 @@ static std::string ToLower(const std::string& s) {
   std::transform(r.begin(), r.end(), r.begin(),
                  [](unsigned char c) { return std::tolower(c); });
   return r;
+}
+
+static int ParseInt(const std::string& value) {
+  std::size_t consumed = 0;
+  const long long parsed = std::stoll(value, &consumed);
+  if (consumed != value.size() ||
+      parsed < std::numeric_limits<int>::min() ||
+      parsed > std::numeric_limits<int>::max()) {
+    throw std::invalid_argument("expected an integer");
+  }
+  return static_cast<int>(parsed);
+}
+
+static std::size_t ParseSize(const std::string& value) {
+  if (value.empty() || value.front() == '-') {
+    throw std::invalid_argument("expected a non-negative integer");
+  }
+  std::size_t consumed = 0;
+  const unsigned long long parsed = std::stoull(value, &consumed);
+  if (consumed != value.size() ||
+      parsed > std::numeric_limits<std::size_t>::max()) {
+    throw std::invalid_argument("expected a non-negative integer");
+  }
+  return static_cast<std::size_t>(parsed);
+}
+
+static float ParseFiniteFloat(const std::string& value) {
+  std::size_t consumed = 0;
+  const float parsed = std::stof(value, &consumed);
+  if (consumed != value.size() || !std::isfinite(parsed)) {
+    throw std::invalid_argument("expected a finite number");
+  }
+  return parsed;
 }
 
 static ModelFormat ParseModelFormat(const std::string& s) {
@@ -155,20 +202,26 @@ void USIEngine::CmdUsi() {
   Send("option name OnnxModel type string default shogi_bt4.onnx");
   Send("option name ModelFormat type combo default auto var auto var jhbr2 var dlshogi");
   Send("option name DlshogiModel type check default false");
-  Send("option name NoiseEpsilon type string default 0.0");
   Send("option name UseGPU type check default true");
   // Threads is kept as an alias for WorkersPerGpu (backward compat).
-  Send("option name Threads type spin default 2 min 1 max 8");
-  Send("option name WorkersPerGpu type spin default 2 min 1 max 8");
+  Send("option name Threads type spin default 2 min 1 max 64");
+  Send("option name WorkersPerGpu type spin default 2 min 1 max 64");
   Send("option name MinibatchSize type spin default 128 min 1 max 4096");
-  Send("option name PerLeafGathering type check default true");
-  Send("option name LeafDfpnNodes type spin default 10 min 0 max 10000");
-  Send("option name LeafMateMode type combo default shallow var off var dfpn var shallow");
+  Send("option name CInit type string default 1.25");
+  Send("option name CBase type string default 19652.0");
+  Send("option name FpuReduction type string default 0.27");
+  Send("option name CInitRoot type string default 1.25");
+  Send("option name CBaseRoot type string default 19652.0");
+  Send("option name FpuReductionRoot type string default 0.0");
+  Send("option name DrawValueBlack type string default 0.5");
+  Send("option name DrawValueWhite type string default 0.5");
+  Send("option name ResignThreshold type string default 0.01");
+  Send("option name InfoIntervalMs type spin default 1000 min 100 max 10000");
+  Send("option name LeafMateMode type combo default shallow var off var shallow");
   Send("option name LeafMateDepth type spin default 5 min 1 max 7");
   Send("option name RootMateDepth type spin default 7 min 0 max 7");
   Send("option name NNCacheSize type spin default 0 min 0 max 100000000");
   Send("option name NumGPUs type spin default 1 min 1 max 8");
-  Send("option name VirtualLossWeight type string default 1.0");
   Send("option name MaxMovesToDraw type spin default 100000 min 1 max 100000");
   Send("option name MovesLeftWeight type string default 0.0");
   Send("option name MovesLeftThreshold type string default 0.0");
@@ -188,12 +241,23 @@ void USIEngine::CmdIsReady() {
   if (evaluators_.empty()) {
     ShogiEncoderTables::Init();
 
-    for (int g = 0; g < num_gpus_; g++) {
-      Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
-      evaluators_.push_back(
-          std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
-                                        search_config_.workers_per_gpu,
-                                        model_format_));
+    try {
+      for (int g = 0; g < num_gpus_; g++) {
+        Log("Loading model on GPU " + std::to_string(g) + ": " + onnx_path_);
+        auto evaluator =
+            std::make_unique<NNEvaluator>(onnx_path_, use_gpu_, g,
+                                          search_config_.workers_per_gpu,
+                                          model_format_);
+        if (evaluator->num_slots() == 0) {
+          throw std::runtime_error("inference backend created no worker slots");
+        }
+        evaluators_.push_back(std::move(evaluator));
+      }
+    } catch (const std::exception& error) {
+      evaluators_.clear();
+      Log("Model load failed: " + std::string(error.what()));
+      Send("readyok");
+      return;
     }
 
     Log("Model loaded, GPUs=" + std::to_string(num_gpus_) +
@@ -218,7 +282,7 @@ void USIEngine::CmdIsReady() {
       }
     }
 
-    if (!gote_exit_book_path_.empty()) {
+    if (use_gote_exit_book_ && !gote_exit_book_path_.empty()) {
       const uint64_t book_count =
           gote_exit_book_.Load(gote_exit_book_path_);
       if (gote_exit_book_.is_loaded()) {
@@ -235,129 +299,190 @@ void USIEngine::CmdIsReady() {
 
 void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
   std::string name, value;
-  for (size_t i = 1; i < parts.size(); i++) {
-    if (parts[i] == "name" && i + 1 < parts.size()) {
-      name = parts[i + 1];
-    } else if (parts[i] == "value" && i + 1 < parts.size()) {
-      value = parts[i + 1];
+  std::size_t value_marker = parts.size();
+  for (std::size_t i = 1; i < parts.size(); ++i) {
+    if (parts[i] == "value") {
+      value_marker = i;
+      break;
+    }
+  }
+  const std::size_t name_begin =
+      parts.size() > 1 && parts[1] == "name" ? 2 : parts.size();
+  for (std::size_t i = name_begin; i < value_marker; ++i) {
+    if (!name.empty()) name += ' ';
+    name += parts[i];
+  }
+  if (value_marker < parts.size()) {
+    for (std::size_t i = value_marker + 1; i < parts.size(); ++i) {
+      if (!value.empty()) value += ' ';
+      value += parts[i];
     }
   }
 
-  std::string name_lower = ToLower(name);
+  if (name.empty()) {
+    Log("Ignored malformed setoption without a name");
+    return;
+  }
 
-  if (name_lower == "maxnodes") {
-    max_nodes_ = std::stoi(value);
-  } else if (name_lower == "onnxmodel") {
-    onnx_path_ = value;
-    evaluators_.clear();
-    search_.reset();
-  } else if (name_lower == "modelformat") {
-    model_format_ = ParseModelFormat(value);
-    evaluators_.clear();
-    search_.reset();
-  } else if (name_lower == "dlshogimodel") {
-    model_format_ = (value == "true") ? ModelFormat::kDlshogi
-                                      : ModelFormat::kAuto;
-    evaluators_.clear();
-    search_.reset();
-  } else if (name_lower == "noiseepsilon") {
-    noise_epsilon_ = std::stof(value);
-    // dlshogi-style search does not inject root noise in USI play.
-  } else if (name_lower == "usegpu") {
-    use_gpu_ = (value == "true");
-  } else if (name_lower == "threads") {
-    // Backward-compat alias for WorkersPerGpu.
-    int n = std::stoi(value);
-    search_config_.workers_per_gpu = n;
+  const std::string name_lower = ToLower(name);
+  const auto reset_search = [this]() { search_.reset(); };
+  const auto reset_inference = [this]() {
     search_.reset();
     evaluators_.clear();
-  } else if (name_lower == "workerspergpu") {
-    int n = std::stoi(value);
-    if (n < 1) n = 1;
-    search_config_.workers_per_gpu = n;
-    // Each evaluator must be (re-)constructed with this many TRT
-    // execution slots, so drop both Search and evaluators.
-    search_.reset();
-    evaluators_.clear();
-  } else if (name_lower == "minibatchsize") {
-    search_config_.minibatch_size =
-        std::clamp(std::stoi(value), 1, 4096);
-    search_.reset();
-  } else if (name_lower == "perleafgathering") {
-    // Per-leaf gathering is always enabled by the dlshogi-style worker loop.
-  } else if (name_lower == "leafdfpnnodes") {
-    // df-pn at MCTS leaves is not part of this backend; use shallow mate.
-  } else if (name_lower == "leafmatemode") {
-    std::string v = value;
-    for (auto& c : v) c = std::tolower(c);
-    if (v == "shallow") {
-      if (search_config_.leaf_mate_depth <= 0 ||
-          search_config_.leaf_mate_depth % 2 == 0) {
-        search_config_.leaf_mate_depth = 5;
+  };
+
+  try {
+    if (name_lower == "maxnodes") {
+      max_nodes_ = std::clamp(ParseInt(value), 1, 10000000);
+    } else if (name_lower == "onnxmodel") {
+      onnx_path_ = value;
+      reset_inference();
+    } else if (name_lower == "modelformat") {
+      model_format_ = ParseModelFormat(value);
+      reset_inference();
+    } else if (name_lower == "dlshogimodel") {
+      model_format_ = ToLower(value) == "true" ? ModelFormat::kDlshogi
+                                                : ModelFormat::kAuto;
+      reset_inference();
+    } else if (name_lower == "usegpu") {
+      use_gpu_ = ToLower(value) == "true" || value == "1";
+      reset_inference();
+    } else if (name_lower == "threads" ||
+               name_lower == "workerspergpu") {
+      search_config_.workers_per_gpu =
+          std::clamp(ParseInt(value), 1, kMaxWorkersPerGpu);
+      // TensorRT allocates one execution slot per worker.
+      reset_inference();
+    } else if (name_lower == "minibatchsize") {
+      search_config_.minibatch_size =
+          std::clamp(ParseInt(value), 1, 4096);
+      reset_search();
+    } else if (name_lower == "cinit" || name_lower == "c_init") {
+      search_config_.c_init =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+      reset_search();
+    } else if (name_lower == "cbase" || name_lower == "c_base") {
+      search_config_.c_base =
+          std::clamp(ParseFiniteFloat(value), 1.0f, 1.0e9f);
+      reset_search();
+    } else if (name_lower == "fpureduction" ||
+               name_lower == "c_fpu_reduction") {
+      search_config_.c_fpu_reduction =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+      reset_search();
+    } else if (name_lower == "cinitroot" ||
+               name_lower == "c_init_root") {
+      search_config_.c_init_root =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+      reset_search();
+    } else if (name_lower == "cbaseroot" ||
+               name_lower == "c_base_root") {
+      search_config_.c_base_root =
+          std::clamp(ParseFiniteFloat(value), 1.0f, 1.0e9f);
+      reset_search();
+    } else if (name_lower == "fpureductionroot" ||
+               name_lower == "c_fpu_reduction_root") {
+      search_config_.c_fpu_reduction_root =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+      reset_search();
+    } else if (name_lower == "drawvalueblack") {
+      search_config_.draw_value_black =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+      reset_search();
+    } else if (name_lower == "drawvaluewhite") {
+      search_config_.draw_value_white =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 1.0f);
+      reset_search();
+    } else if (name_lower == "resignthreshold") {
+      search_config_.resign_threshold =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 0.5f);
+      reset_search();
+    } else if (name_lower == "infointervalms") {
+      search_config_.info_interval_ms =
+          std::clamp(ParseInt(value), 100, 10000);
+      reset_search();
+    } else if (name_lower == "leafmatemode") {
+      const std::string mode = ToLower(value);
+      if (mode == "shallow") {
+        if (search_config_.leaf_mate_depth <= 0 ||
+            search_config_.leaf_mate_depth % 2 == 0) {
+          search_config_.leaf_mate_depth = 5;
+        }
+      } else if (mode == "off") {
+        search_config_.leaf_mate_depth = 0;
+      } else if (mode == "dfpn") {
+        // Historical behavior treated the unimplemented df-pn mode as off.
+        search_config_.leaf_mate_depth = 0;
+        Log("LeafMateMode=dfpn is retired; treating it as off");
+      } else {
+        Log("Ignored unsupported LeafMateMode value: " + value);
+        return;
       }
+      reset_search();
+    } else if (name_lower == "leafmatedepth") {
+      int depth = std::clamp(ParseInt(value), 1, 7);
+      if (depth % 2 == 0) --depth;
+      search_config_.leaf_mate_depth = depth;
+      reset_search();
+    } else if (name_lower == "rootmatedepth") {
+      int depth = std::clamp(ParseInt(value), 0, 7);
+      if (depth > 0 && depth % 2 == 0) --depth;
+      search_config_.root_mate_depth = depth;
+      reset_search();
+    } else if (name_lower == "nncachesize") {
+      search_config_.nn_cache_size =
+          std::min<std::size_t>(ParseSize(value), 100000000);
+      reset_search();
+    } else if (name_lower == "numgpus") {
+      num_gpus_ = std::clamp(ParseInt(value), 1, 8);
+      reset_inference();
+    } else if (name_lower == "maxmovestodraw") {
+      search_config_.max_moves_to_draw =
+          std::clamp(ParseInt(value), 1, 100000);
+      reset_search();
+    } else if (name_lower == "movesleftweight") {
+      search_config_.moves_left_weight =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 100.0f);
+      reset_search();
+    } else if (name_lower == "movesleftthreshold") {
+      search_config_.moves_left_threshold =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 0.5f);
+      reset_search();
+    } else if (name_lower == "movesleftcap") {
+      search_config_.moves_left_cap =
+          std::clamp(ParseFiniteFloat(value), 0.0f, 10000.0f);
+      reset_search();
+    } else if (name_lower == "dfpnmaxtime") {
+      dfpn_max_time_ms_ = std::clamp(ParseInt(value), 100, 60000);
+    } else if (name_lower == "maxmovetime") {
+      max_move_time_ms_ = std::clamp(ParseInt(value), 0, 300000);
+    } else if (name_lower == "maxmovetime1m") {
+      max_move_time_1m_ms_ = std::clamp(ParseInt(value), 0, 60000);
+    } else if (name_lower == "bookfile") {
+      book_path_ = value;
+      books_dirty_ = true;
+    } else if (name_lower == "goteexitbookfile") {
+      gote_exit_book_path_ = value;
+      books_dirty_ = true;
+    } else if (name_lower == "usegoteexitbook") {
+      const bool enabled = ToLower(value) == "true" || value == "1";
+      if (enabled != use_gote_exit_book_) books_dirty_ = true;
+      use_gote_exit_book_ = enabled;
+    } else if (name_lower == "noiseepsilon" ||
+               name_lower == "perleafgathering" ||
+               name_lower == "leafdfpnnodes" ||
+               name_lower == "virtuallossweight" ||
+               name_lower == "maxgpubatch" ||
+               name_lower == "bookonthefly") {
+      Log("Option " + name + " is retired and ignored");
+      return;
     } else {
-      search_config_.leaf_mate_depth = 0;
+      Log("Unknown option ignored: " + name);
+      return;
     }
-    search_.reset();
-  } else if (name_lower == "leafmatedepth") {
-    int d = std::stoi(value);
-    // Clamp to supported odd values: 1, 3, 5, 7.
-    if (d < 1) d = 1;
-    if (d > 7) d = 7;
-    if (d % 2 == 0) d -= 1;          // round even down to odd
-    search_config_.leaf_mate_depth = d;
-    search_.reset();
-  } else if (name_lower == "rootmatedepth") {
-    int d = std::stoi(value);
-    if (d < 0) d = 0;
-    if (d > 7) d = 7;
-    if (d > 0 && d % 2 == 0) d -= 1;
-    search_config_.root_mate_depth = d;
-    search_.reset();
-  } else if (name_lower == "nncachesize") {
-    search_config_.nn_cache_size = static_cast<size_t>(std::stoull(value));
-    // The cache is owned by the persistent Search object, so rebuild it when
-    // capacity changes. Evaluators can stay loaded.
-    search_.reset();
-  } else if (name_lower == "numgpus") {
-    num_gpus_ = std::stoi(value);
-    search_config_.num_gpus = num_gpus_;
-    evaluators_.clear();
-    search_.reset();
-  } else if (name_lower == "maxmovestodraw") {
-    int n = std::stoi(value);
-    if (n < 1) n = 1;
-    search_config_.max_moves_to_draw = n;
-  } else if (name_lower == "movesleftweight") {
-    search_config_.moves_left_weight = std::max(0.0f, std::stof(value));
-  } else if (name_lower == "movesleftthreshold") {
-    search_config_.moves_left_threshold =
-        std::clamp(std::stof(value), 0.0f, 0.5f);
-  } else if (name_lower == "movesleftcap") {
-    search_config_.moves_left_cap = std::max(0.0f, std::stof(value));
-  } else if (name_lower == "virtuallossweight") {
-    float w = std::stof(value);
-    if (w < 0.1f) w = 0.1f;
-    if (w > 100.0f) w = 100.0f;
-    (void)w;
-  } else if (name_lower == "maxgpubatch") {
-    Log("MaxGpuBatch is deprecated and ignored");
-  } else if (name_lower == "dfpnmaxtime") {
-    dfpn_max_time_ms_ = std::stoi(value);
-  } else if (name_lower == "maxmovetime") {
-    max_move_time_ms_ = std::stoi(value);
-  } else if (name_lower == "maxmovetime1m") {
-    max_move_time_1m_ms_ = std::stoi(value);
-  } else if (name_lower == "bookfile") {
-    book_path_ = value;
-    books_dirty_ = true;
-  } else if (name_lower == "goteexitbookfile") {
-    gote_exit_book_path_ = value;
-    books_dirty_ = true;
-  } else if (name_lower == "usegoteexitbook") {
-    use_gote_exit_book_ = ToLower(value) == "true" || value == "1";
-  } else if (name_lower == "bookonthefly") {
-    Log("BookOnTheFly is deprecated; YBB books are always probed on demand");
+  } catch (const std::exception& error) {
+    Log("Invalid value for " + name + ": " + error.what());
+    return;
   }
 
   Log("Set " + name + " = " + value);
@@ -366,7 +491,6 @@ void USIEngine::CmdSetOption(const std::vector<std::string>& parts) {
 void USIEngine::CmdUsiNewGame() {
   board_.SetStartPos();
   board_.ClearHistory();
-  game_ply_ = 0;
   position_start_key_ = board_.Hash();
   position_moves_.clear();
   // Drop the Search object so the next `go` rebuilds it with a fresh
@@ -408,7 +532,6 @@ void USIEngine::CmdPosition(const std::vector<std::string>& parts) {
     }
   }
 
-  game_ply_ = board_.ply();
 }
 
 void USIEngine::CmdGo(const std::vector<std::string>& parts) {
@@ -598,7 +721,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
 
   auto result =
-      search_->Run(board_, position_start_key_, position_moves_, game_ply_);
+      search_->Run(board_, position_start_key_, position_moves_);
   search_done.store(true, std::memory_order_release);
   if (watchdog.joinable()) watchdog.join();
   Log(std::string("tree_reused ") + (result.tree_reused ? "true" : "false") +

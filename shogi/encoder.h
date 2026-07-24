@@ -22,16 +22,11 @@
 //     147      1  features2: REPETITION   position seen before? (0 in training)
 //                                          TOTAL = 28 + 120 = 148
 //
-// POLICY OUTPUT (3849 moves):
-//   Indices    0-2223:  Board moves (from×to, non-promotion)
-//   Indices 2224-3281:  Board moves (from×to, promotion)
-//   Indices 3282-3848:  Drop moves (7 piece types × 81 squares)
-//
-// ATTENTION POLICY RAW OUTPUT (13689 values):
-//   Section 0:  81×81 = 6561 (board from×to, non-promotion)
-//   Section 1:  81×81 = 6561 (board from×to, promotion)
-//   Section 2:  7×81  = 567  (drop type×to)
-//   Mapped to 3849 policy indices via kShogiAttnPolicyMap.
+// POLICY OUTPUT (2187 labels):
+//   Directions  0-9:  board moves without promotion
+//   Directions 10-19: board moves with promotion
+//   Directions 20-26: drops (P, L, N, S, B, R, G)
+//   Each direction has 81 destination squares: 27 × 81 = 2187.
 
 #pragma once
 

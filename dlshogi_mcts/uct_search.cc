@@ -3,11 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <condition_variable>
-#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -226,7 +225,6 @@ class UCTSearcher {
   void Join() {
     if (handle_.joinable()) handle_.join();
   }
-  void Term() { Join(); }
 
  private:
   void ParallelUctSearch();
@@ -249,19 +247,18 @@ UCTSearcherGroup::UCTSearcherGroup(Search* owner_in, jhbr2::NNEvaluator* nn_in,
                                    int batch_max_in)
     : owner(owner_in),
       nn(nn_in),
-      gpu_id(gpu_id_in),
-      threads(threads_in),
-      batch_max(batch_max_in) {
-  searchers_.reserve(threads);
-  for (int i = 0; i < threads; ++i) {
-    searchers_.push_back(std::make_unique<UCTSearcher>(this, i, batch_max));
+      gpu_id(gpu_id_in) {
+  searchers_.reserve(threads_in);
+  for (int i = 0; i < threads_in; ++i) {
+    searchers_.push_back(
+        std::make_unique<UCTSearcher>(this, i, batch_max_in));
   }
 }
 
 UCTSearcherGroup::UCTSearcherGroup(UCTSearcherGroup&&) noexcept = default;
 UCTSearcherGroup& UCTSearcherGroup::operator=(UCTSearcherGroup&&) noexcept =
     default;
-UCTSearcherGroup::~UCTSearcherGroup() { Term(); }
+UCTSearcherGroup::~UCTSearcherGroup() { Join(); }
 
 void UCTSearcherGroup::Run() {
   for (auto& searcher : searchers_) searcher->Run();
@@ -269,10 +266,6 @@ void UCTSearcherGroup::Run() {
 
 void UCTSearcherGroup::Join() {
   for (auto& searcher : searchers_) searcher->Join();
-}
-
-void UCTSearcherGroup::Term() {
-  for (auto& searcher : searchers_) searcher->Term();
 }
 
 Search::Search(std::vector<jhbr2::NNEvaluator*> evaluators,
@@ -289,7 +282,7 @@ Search::Search(std::vector<jhbr2::NNEvaluator*> evaluators,
 
 Search::~Search() {
   Stop();
-  for (auto& group : groups_) group.Term();
+  for (auto& group : groups_) group.Join();
 }
 
 bool Search::IsSearchActive() const {
@@ -352,14 +345,8 @@ unsigned Search::SelectBestChild(const uct_node_t* node) const {
   return best;
 }
 
-SearchResult Search::Run(ShogiBoard board, int game_ply) {
-  const uint64_t starting_pos_key = board.Hash();
-  static const std::vector<Move> kNoMoves;
-  return Run(std::move(board), starting_pos_key, kNoMoves, game_ply);
-}
-
 SearchResult Search::Run(ShogiBoard board, uint64_t starting_pos_key,
-                         const std::vector<Move>& moves, int) {
+                         const std::vector<Move>& moves) {
   stop_.store(false, std::memory_order_release);
   playout_count_.store(0, std::memory_order_release);
   nn_cache_.ResetStats();
@@ -779,8 +766,7 @@ void Search::MaybeOutputInfo() {
   if (!config_.info_callback) return;
   const int elapsed = timer_.ElapsedMs();
   std::lock_guard<std::mutex> lk(info_mutex_);
-  if (elapsed - last_info_ms_ <
-      static_cast<int>(config_.info_interval * 1000.0f)) {
+  if (elapsed - last_info_ms_ < config_.info_interval_ms) {
     return;
   }
   last_info_ms_ = elapsed;
@@ -832,7 +818,6 @@ SearchResult Search::BuildResult() const {
     jhbr2::nn_diagnostics::LogOnce("build_result", details.str());
   }
   if (safe_wp < config_.resign_threshold) result.best_move = Move();
-  result.root_q = safe_wp * 2.0f - 1.0f;
   result.score_cp = QToCentipawns(safe_wp);
   result.pv = GetPV();
   return result;

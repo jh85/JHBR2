@@ -53,6 +53,51 @@ Use fixed nodes for initial algorithm and parameter comparisons. It greatly
 reduces noise from machine load and NPS changes. Change only one factor in each
 match.
 
+### Automated RTX 5090 topology screening
+
+`tools/run_topology_tuning.py` automates the throughput and paired-game
+workflow. It first sweeps workers at the incumbent batch size, then sweeps
+batch size at the leading worker count. To avoid assuming those parameters are
+independent, it also benchmarks a small interaction grid before launching the
+paired match.
+
+For the current eight-RTX-5090 production configuration:
+
+```bash
+python3 tools/run_topology_tuning.py \
+  --engine ./build-trt/jhbr2 \
+  --model /workspace/JHBR2/engines/current.engine \
+  --openings build-strength/openings-512.txt \
+  --gpus 8 \
+  --baseline-workers 16 \
+  --baseline-minibatch 256 \
+  --nn-cache-size 1000000 \
+  --output topology-runs/rtx5090
+```
+
+The defaults sweep workers `1,2,4,8,12,16,24,32`, minibatches
+`32,64,96,128,192,256`, use 20 two-second benchmark positions, test the top
+three worker/batch interaction grid, and run 80 opening pairs at one-second
+byoyomi. On an eight-GPU host the paired stage uses eight one-GPU match workers
+in parallel. Use `--resume` after an interruption; completed benchmarks and
+pairs are reused.
+
+Topology tuning intentionally uses fixed time because its purpose includes
+measuring how much useful search each hardware configuration completes.
+Fixed-node matches remain the right choice for search-semantic parameters,
+where an NPS difference should not change the nominal work budget. Keep
+`--minibatch-values` at or below the TensorRT engine's reported `max_batch`;
+larger requests are split and do not create a true larger inference batch.
+
+Additional engine settings can be held constant with repeatable
+`--engine-option NAME=VALUE` arguments. The driver controls `OnnxModel`,
+`WorkersPerGpu`, `MinibatchSize`, `NumGPUs`, and `NNCacheSize` itself.
+
+The script deliberately does not change engine defaults. NPS selects only the
+candidate sent to the paired match; inspect `result.json` and the strength
+confidence interval before adopting it. A final winner must still be confirmed
+with the production eight-GPU topology and production clock.
+
 ## 3. Confirm using the production GPU topology and time control
 
 A change that wins in one-GPU screening should be confirmed in the actual

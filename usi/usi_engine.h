@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #ifdef USE_TENSORRT
@@ -58,7 +57,6 @@ class USIEngine {
   std::vector<std::unique_ptr<NNEvaluator>> evaluators_;
   std::unique_ptr<dlshogi_mcts::Search> search_;
   dlshogi_mcts::SearchConfig search_config_;
-  int game_ply_ = 0;
   uint64_t position_start_key_ = 0;
   std::vector<lczero::Move> position_moves_;
 
@@ -67,13 +65,12 @@ class USIEngine {
   ModelFormat model_format_ = ModelFormat::kAuto;
   int max_nodes_ = 800;
   int num_gpus_ = 1;
-  float noise_epsilon_ = 0.0f;
   bool use_gpu_ = true;
   int dfpn_max_time_ms_ = 4000;
   int max_move_time_ms_ = 0;
   int max_move_time_1m_ms_ = 0;
   std::string book_path_;
-  std::string gote_exit_book_path_;
+  std::string gote_exit_book_path_ = "user_book1_gote_exit.ybb";
   bool use_gote_exit_book_ = false;
   bool books_dirty_ = true;
   OpeningBook book_;

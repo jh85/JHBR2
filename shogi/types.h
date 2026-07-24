@@ -27,7 +27,6 @@
 #include <cassert>
 #include <cstdint>
 #include <string>
-#include <vector>
 
 namespace lczero {
 
@@ -448,7 +447,6 @@ class MoveList {
   }
   int size() const { return count_; }
   bool empty() const { return count_ == 0; }
-  void reserve(int) {}  // no-op, for compatibility
   Move& operator[](int i) { return moves_[i]; }
   const Move& operator[](int i) const { return moves_[i]; }
   Move* begin() { return moves_; }
@@ -466,7 +464,6 @@ class MoveList {
 // =====================================================================
 
 inline char PieceType::ToChar() const {
-  constexpr const char* chars = ".PLNSBRGK+l+n+s+h+d";
   // This is approximate; promoted pieces need multi-char in USI.
   if (idx <= 8) return ".PLNSBRGK"[idx];
   return '+';  // Promoted pieces start with '+' in USI

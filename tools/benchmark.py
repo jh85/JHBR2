@@ -9,17 +9,17 @@ statistics aggregated across positions.
 Usage:
     python tools/benchmark.py \\
         ./build/jhbr2 \\
-        ./shogi_bt4_epoch23_dynamic.onnx \\
-        --threads 4 --gpus 1 --minibatch 32 --byoyomi 1000
+        ./shogi_bt4_epoch23.engine \\
+        --workers-per-gpu 16 --gpus 8 --minibatch 256 --byoyomi 1000
 
-Compare two configurations via the --leaf-mate-mode flag:
+Compare two leaf-mate configurations:
     # current production
-    python tools/benchmark.py ./build/jhbr2 model.onnx \\
-        --leaf-mate-mode shallow --leaf-mate-depth 3 > shallow.log
+    python tools/benchmark.py ./build/jhbr2 model.engine \\
+        --leaf-mate-mode shallow --leaf-mate-depth 5 > shallow.log
 
-    # legacy df-pn fallback
-    python tools/benchmark.py ./build/jhbr2 model.onnx \\
-        --leaf-mate-mode dfpn --leaf-dfpn-nodes 10 > dfpn.log
+    # no leaf mate search
+    python tools/benchmark.py ./build/jhbr2 model.engine \\
+        --leaf-mate-mode off > mate-off.log
 
 Notes vs the dlshogi original:
   - dlshogi uses cshogi.usi.Engine; this script uses raw subprocess
@@ -28,10 +28,10 @@ Notes vs the dlshogi original:
         DNN_Model       → OnnxModel
         DNN_Batch_Size  → MinibatchSize
         UCT_NodeLimit   → MaxNodes
-        UCT_Threads     → Threads (per-GPU multiplier via NumGPUs)
-        ReuseSubtree    → (n/a — jhbr2 doesn't yet reuse subtrees)
+        UCT_Threads     → WorkersPerGpu (per-GPU multiplier via NumGPUs)
+        ReuseSubtree    → (always enabled)
         Byoyomi_Margin  → (n/a)
-        Resign_Threshold→ (n/a)
+        Resign_Threshold→ ResignThreshold
         USI_Ponder      → (n/a — jhbr2 doesn't ponder)
         PV_Interval     → (n/a)
 """
@@ -40,7 +40,6 @@ import argparse
 import re
 import statistics
 import subprocess
-import sys
 import time
 
 
@@ -159,8 +158,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('engine', help='Path to jhbr2 binary')
-    p.add_argument('model', help='Path to ONNX model')
-    p.add_argument('--threads', type=int, default=4)
+    p.add_argument('model', help='Path to ONNX or TensorRT engine model')
+    p.add_argument(
+        '--workers-per-gpu', '--threads',
+        dest='workers_per_gpu', type=int, default=4,
+        help='WorkersPerGpu; --threads is a compatibility alias (default: 4)')
     p.add_argument('--gpus', type=int, default=1)
     p.add_argument('--minibatch', type=int, default=32,
                    help='MinibatchSize (dlshogi: DNN_Batch_Size)')
@@ -169,13 +171,10 @@ def main():
     p.add_argument('--byoyomi', type=int, default=1000,
                    help='ms per move')
     p.add_argument('--leaf-mate-mode', default='shallow',
-                   choices=['off', 'dfpn', 'shallow'])
-    p.add_argument('--leaf-mate-depth', type=int, default=3)
-    p.add_argument('--leaf-dfpn-nodes', type=int, default=10)
+                   choices=['off', 'shallow'])
+    p.add_argument('--leaf-mate-depth', type=int, default=5)
     p.add_argument('--limit', type=int, default=None,
                    help='Limit to first N positions (default: all)')
-    p.add_argument('--per-leaf-gathering', default='true',
-                   choices=['true', 'false'])
     p.add_argument('--options',
                    help='Comma-separated extra options as name:value,...')
     args = p.parse_args()
@@ -213,15 +212,13 @@ def main():
 
     # Configure
     send(f'setoption name OnnxModel value {args.model}')
-    send(f'setoption name UseGPU value true')
-    send(f'setoption name Threads value {args.threads}')
+    send('setoption name UseGPU value true')
+    send(f'setoption name WorkersPerGpu value {args.workers_per_gpu}')
     send(f'setoption name NumGPUs value {args.gpus}')
     send(f'setoption name MinibatchSize value {args.minibatch}')
     send(f'setoption name MaxNodes value {args.nodelimit}')
-    send(f'setoption name PerLeafGathering value {args.per_leaf_gathering}')
-    send(f'setoption name LeafMateMode value {args.leaf_mate_mode}')
     send(f'setoption name LeafMateDepth value {args.leaf_mate_depth}')
-    send(f'setoption name LeafDfpnNodes value {args.leaf_dfpn_nodes}')
+    send(f'setoption name LeafMateMode value {args.leaf_mate_mode}')
     if args.options:
         for opt in args.options.split(','):
             name, value = opt.split(':', 1)
@@ -229,11 +226,10 @@ def main():
 
     print(f'engine    : {args.engine}', flush=True)
     print(f'model     : {args.model}', flush=True)
-    print(f'threads={args.threads}  gpus={args.gpus}  '
+    print(f'workers-per-gpu={args.workers_per_gpu}  gpus={args.gpus}  '
           f'minibatch={args.minibatch}', flush=True)
     print(f'leaf-mate-mode={args.leaf_mate_mode}  '
-          f'leaf-mate-depth={args.leaf_mate_depth}  '
-          f'leaf-dfpn-nodes={args.leaf_dfpn_nodes}', flush=True)
+          f'leaf-mate-depth={args.leaf_mate_depth}', flush=True)
     print(f'byoyomi   : {args.byoyomi}ms per move', flush=True)
     print('Loading model...', flush=True)
     t0 = time.time()
@@ -272,9 +268,12 @@ def main():
         nodes = int(nodes_m.group(1)) if nodes_m else None
         tm    = int(time_m.group(1))  if time_m else None
 
-        if nps is not None:   nps_results.append(nps)
-        if nodes is not None: nodes_results.append(nodes)
-        if tm is not None:    times_results.append(tm)
+        if nps is not None:
+            nps_results.append(nps)
+        if nodes is not None:
+            nodes_results.append(nodes)
+        if tm is not None:
+            times_results.append(tm)
 
         n_str  = f'{nodes:>9,}' if nodes is not None else '        ?'
         nps_str = f'{nps:>10,}' if nps is not None else '         ?'
@@ -300,7 +299,7 @@ def main():
     if nps_results:
         nps_results.sort()
         print()
-        print(f'NPS:')
+        print('NPS:')
         print(f'  mean   : {statistics.mean(nps_results):>12,.0f}')
         print(f'  median : {statistics.median(nps_results):>12,.0f}')
         print(f'  min    : {min(nps_results):>12,}')
@@ -313,7 +312,7 @@ def main():
         print(f'  p90    : {p90:>12,}')
     if nodes_results:
         print()
-        print(f'Nodes:')
+        print('Nodes:')
         print(f'  total  : {sum(nodes_results):>13,}')
         print(f'  mean   : {statistics.mean(nodes_results):>13,.0f}')
         print(f'  median : {statistics.median(nodes_results):>13,.0f}')

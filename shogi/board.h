@@ -228,14 +228,14 @@ class ShogiBoard {
   // Repetition result.
   enum class RepetitionResult {
     kNone,       // No repetition
-    kDraw,       // Normal sennichite (4th occurrence) → draw
+    kDraw,       // Search-time normal repetition → draw
     kWin,        // Opponent was giving perpetual check → we win
     kLoss,       // We were giving perpetual check → we lose
   };
 
-  // Check for sennichite by examining position history.
-  // Call this after DoMove() to check if the new position is a repetition.
-  // The history is tracked internally.
+  // Search-time repetition adjudication. This deliberately returns a result
+  // at the first prior occurrence so the search avoids cycles; the game
+  // controller remains responsible for the official fourth occurrence.
   RepetitionResult CheckRepetition() const;
 
   // Get the repetition count (how many times current position has occurred).

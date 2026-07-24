@@ -61,6 +61,7 @@ The governing rule is:
 Related detailed documents:
 
 - `docs/STRENGTH_TESTING.md`
+- `docs/ENGINE_PARAMETER_INVENTORY.md`
 - `docs/port_5ply_mate_check_plan.md`
 - `docs/port_specialized_mate1_plan.md`
 - `docs/port_yaneuraou_check_generator_plan.md`
@@ -179,18 +180,15 @@ core move generator. Keep a seed and first failing SFEN in the output.
 - Add fault injection for short inference result arrays and non-finite
   policy/value/moves-left outputs.
 
-### 1.4 Make USI options truthful
+### 1.4 Keep USI options truthful
 
-Audit every advertised option. The following currently have no effect or only
-compatibility behavior in the active backend:
-
-- `NoiseEpsilon` does not inject root noise in USI play.
-- `PerLeafGathering` is always enabled.
-- `LeafDfpnNodes` is not used by the active leaf search.
-- `VirtualLossWeight` parses and clamps a value but does not apply it.
-
-Either implement an option, clearly mark it deprecated, or stop advertising
-it. Silent no-ops make experiments invalid.
+The 2026-07-24 parameter audit stopped advertising `NoiseEpsilon`,
+`PerLeafGathering`, `LeafDfpnNodes`, and `VirtualLossWeight`. Old
+configurations receive an explicit retired-option message instead of a false
+acknowledgement. Core PUCT/FPU, draw, resign, and info-interval settings are
+now active USI options. Keep
+`docs/ENGINE_PARAMETER_INVENTORY.md` synchronized whenever a default, bound,
+or search constant changes.
 
 ### Acceptance gate
 
@@ -221,16 +219,17 @@ the intended code path, then use staged paired experiments.
 | Leaf mate depth | 5 | 1, 3, 5, 7 | Measure tactical Elo and node cost |
 | Root mate depth | 7 | 0, 5, 7 | Already subjectively valuable; confirm |
 | NN cache size | 0 default | 0, 250K, 1M, 4M | Record hit rate, RAM, NPS, and Elo |
-| Workers per GPU | 2 | 1--4 initially | Hardware/model/profile specific |
-| Minibatch size | 128 | 32, 64, 128, 256 | Must fit TensorRT profile |
+| Workers per GPU | 2 | 4, 8, 12, 16, 24, 32 on RTX 5090 | Hardware/model/profile specific; monitor GPU memory |
+| Minibatch size | 128 | 32, 64, 96, 128, 192, 256 | Stop at the TensorRT profile maximum; rebuild the engine profile to test a true larger batch |
 | Moves-left weight | 0 | small positive values | Only with a valid trained MLH head |
 | Moves-left threshold | 0 | 0--0.3 | Tune jointly after enabling MLH |
 | Moves-left cap | 20 | 5--40 | Tune jointly after enabling MLH |
 | Policy softmax temperature | implicit 1.0 | 0.7--1.5 | Must be implemented before testing |
 
-Other constants should be classified before tuning:
+Other constants are classified in
+`docs/ENGINE_PARAMETER_INVENTORY.md`. Important examples are:
 
-- `kVirtualLoss = 1` and the advertised no-op `VirtualLossWeight`;
+- `kVirtualLoss = 1` (there is no advertised runtime multiplier);
 - 65,536 position mutexes;
 - CP display scale 756;
 - info interval;
@@ -539,8 +538,8 @@ repeat them.
 3. Run harness calibration and a short eight-GPU fixed-node baseline.
 4. Implement and test a 300+10-aware adaptive time manager.
 5. Confirm it under the actual clock.
-6. Expose `PolicyTemperature` and the core PUCT/FPU constants as truthful USI
-   options.
+6. Implement and expose `PolicyTemperature`; the core PUCT/FPU constants are
+   already truthful USI options.
 7. Run coarse fixed-node screening, then held-out and production-clock
    confirmation.
 8. Continue the correctness differential suite in parallel with parameter

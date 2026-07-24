@@ -100,25 +100,6 @@ Bitboard ShogiBoard::StepAttacks(PieceType pt, Color c, Square sq) {
 // Sliding attacks (lance, bishop, rook, horse, dragon)
 // =====================================================================
 
-namespace {
-
-// Slide in one direction until hitting a piece or the board edge.
-Bitboard RayAttack(int f, int r, int df, int dr, const Bitboard& occ) {
-  Bitboard bb = Bitboard::Zero();
-  f += df;
-  r += dr;
-  while (f >= 0 && f < 9 && r >= 0 && r < 9) {
-    Square sq(File::FromIdx(f), Rank::FromIdx(r));
-    bb.Set(sq);
-    if (occ.Test(sq)) break;  // Blocked.
-    f += df;
-    r += dr;
-  }
-  return bb;
-}
-
-}  // namespace
-
 Bitboard ShogiBoard::SlidingAttacks(PieceType pt, Color c, Square sq,
                                     const Bitboard& occ) const {
   if (pt == kLance) {
@@ -437,7 +418,6 @@ void ShogiBoard::GenerateBoardMoves(MoveList& moves) const {
   Color us = side_to_move_;
   Bitboard our = pieces(us);
   Bitboard occ = occupied();
-  Bitboard their = pieces(~us);
 
   Bitboard tmp = our;
   while (tmp.Any()) {
@@ -807,7 +787,6 @@ MoveList ShogiBoard::GenerateCheckingMovesViaFilter() {
 
   MoveList legal = GenerateLegalMoves();
   MoveList result;
-  result.reserve(legal.size());
 
   for (size_t i = 0; i < legal.size(); ++i) {
     const Move m = legal[i];

@@ -280,33 +280,20 @@ struct NNEvaluator::Impl {};
 
 NNEvaluator::NNEvaluator(const std::string&, bool, int, int, ModelFormat)
     : impl_(std::make_unique<Impl>()) {
-  ShogiEncoderTables::Init();
+  throw std::runtime_error(
+      "JHBR2 was built without TensorRT or ONNX Runtime; "
+      "a neural-network backend is required");
 }
 
 NNEvaluator::~NNEvaluator() = default;
 
-NNOutput NNEvaluator::Evaluate(const ShogiBoard& board,
-                                const MoveList& legal_moves) {
-  NNOutput result;
-  result.value = 0.0f;
-  result.draw = 0.1f;
-  result.wdl[0] = 0.45f;
-  result.wdl[1] = 0.1f;
-  result.wdl[2] = 0.45f;
-  const float uniform =
-      legal_moves.empty() ? 0.0f : 1.0f / legal_moves.size();
-  result.policy.assign(legal_moves.size(), uniform);
-  return result;
+NNOutput NNEvaluator::Evaluate(const ShogiBoard&, const MoveList&) {
+  throw std::logic_error("neural-network backend is unavailable");
 }
 
 std::vector<NNOutput> NNEvaluator::EvaluateBatch(
-    const std::vector<std::pair<ShogiBoard, MoveList>>& batch) {
-  std::vector<NNOutput> results;
-  results.reserve(batch.size());
-  for (const auto& [board, moves] : batch) {
-    results.push_back(Evaluate(board, moves));
-  }
-  return results;
+    const std::vector<std::pair<ShogiBoard, MoveList>>&) {
+  throw std::logic_error("neural-network backend is unavailable");
 }
 
 #endif

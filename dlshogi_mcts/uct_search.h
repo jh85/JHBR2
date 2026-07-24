@@ -6,9 +6,6 @@
 #include <functional>
 #include <memory>
 #include <mutex>
-#include <random>
-#include <string>
-#include <thread>
 #include <vector>
 
 #include "dlshogi_mcts/uct_node.h"
@@ -46,7 +43,6 @@ struct SearchConfig {
   float max_time = 0.0f;
   int workers_per_gpu = 2;
   int minibatch_size = 128;
-  int num_gpus = 1;
   int max_moves_to_draw = 100000;
   int leaf_mate_depth = 5;
 
@@ -63,19 +59,17 @@ struct SearchConfig {
   float moves_left_cap = 20.0f;       // clamp |child_M - parent_M| (plies)
 
   size_t nn_cache_size = 0;
-  float info_interval = 1.0f;
+  int info_interval_ms = 1000;
   InfoCallback info_callback = nullptr;
 };
 
 struct SearchResult {
   lczero::Move best_move;
-  lczero::Move ponder_move;
   bool tree_reused = false;
   int root_visits_before = 0;
   int nodes = 0;
   float time_sec = 0.0f;
   float nps = 0.0f;
-  float root_q = 0.0f;
   int score_cp = 0;
   std::vector<lczero::Move> pv;
   jhbr2::NNCacheStats nn_cache;
@@ -93,13 +87,10 @@ class UCTSearcherGroup {
 
   void Run();
   void Join();
-  void Term();
 
   Search* owner = nullptr;
   jhbr2::NNEvaluator* nn = nullptr;
   int gpu_id = 0;
-  int threads = 0;
-  int batch_max = 0;
 
  private:
   std::vector<std::unique_ptr<class UCTSearcher>> searchers_;
@@ -110,10 +101,8 @@ class Search {
   Search(std::vector<jhbr2::NNEvaluator*> evaluators, const SearchConfig& config);
   ~Search();
 
-  SearchResult Run(lczero::ShogiBoard board, int game_ply = 1);
   SearchResult Run(lczero::ShogiBoard board, uint64_t starting_pos_key,
-                   const std::vector<lczero::Move>& moves,
-                   int game_ply = 1);
+                   const std::vector<lczero::Move>& moves);
   void Stop() { stop_.store(true, std::memory_order_release); }
   void SetMaxTime(float seconds) { config_.max_time = seconds; }
   void SetMaxNodes(size_t n) { config_.max_nodes = static_cast<int>(n); }
