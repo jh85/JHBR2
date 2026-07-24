@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <utility>
 
 namespace jhbr2 {
 
@@ -40,12 +41,22 @@ MateDfpnSolver::MateDfpnSolver(size_t default_nodes_limit)
 // =====================================================================
 
 Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
-  stop_.store(false, std::memory_order_relaxed);
+  return search(std::move(board), nodes_limit, Deadline::max());
+}
+
+Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit,
+                            Deadline deadline) {
+  deadline_ = deadline;
   nodes_searched_ = 0;
   nodes_limit_ = nodes_limit;
   mate_ply_ = 0;
   pv_.clear();
   path_hashes_.clear();
+
+  // Do not clear stop_ here. The caller can launch search() on a worker and
+  // legitimately request cancellation before that worker gets scheduled.
+  // Clearing it here loses the request and makes a subsequent join unbounded.
+  if (ShouldStop()) return Move();
 
   // An expansion can allocate many move children. Small root budgets need
   // more than four child slots per expanded node on tactical positions.
@@ -70,17 +81,26 @@ Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
   // Search iteratively until solved or out of resources.
   while (root.pn != 0 && root.dn != 0 &&
          !pool_.OutOfMemory() &&
-         !stop_.load(std::memory_order_relaxed) &&
+         !ShouldStop() &&
          nodes_searched_ < nodes_limit) {
     Search<true>(pos, root, DfpnNode::INF, DfpnNode::INF, 0);
   }
 
   path_hashes_.pop_back();
 
+  // A stopped or expired search is always unresolved. In particular, do not
+  // return a proof assembled from partially expanded nodes.
+  if (ShouldStop()) return Move();
+
   // Interpret result.
   if (root.pn == 0) {
     // Mate proven.
     ExtractPV(root);
+    if (ShouldStop()) {
+      pv_.clear();
+      mate_ply_ = 0;
+      return Move();
+    }
     if (!pv_.empty()) {
       return pv_[0];
     }
@@ -94,6 +114,12 @@ Move MateDfpnSolver::search(ShogiBoard board, size_t nodes_limit) {
   }
 }
 
+bool MateDfpnSolver::ShouldStop() {
+  if (stop_.load(std::memory_order_acquire)) return true;
+  if (deadline_ != Deadline::max() && Clock::now() >= deadline_) return true;
+  return false;
+}
+
 // =====================================================================
 // Core recursive search
 // =====================================================================
@@ -104,11 +130,12 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
                              uint32_t second_pn, uint32_t second_dn,
                              int ply) {
   // Early exit if stopped.
-  if (stop_.load(std::memory_order_relaxed)) return;
+  if (ShouldStop()) return;
 
   // Expand if not yet expanded.
   if (!node.is_expanded()) {
     ExpandNode<or_node>(board, node, ply);
+    if (ShouldStop()) return;
     nodes_searched_++;
     SummarizeNode<or_node>(node);
     return;
@@ -119,7 +146,7 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
          node.dn < second_dn &&
          node.pn != 0 && node.dn != 0 &&
          !pool_.OutOfMemory() &&
-         !stop_.load(std::memory_order_relaxed) &&
+         !ShouldStop() &&
          nodes_searched_ < nodes_limit_) {
 
     // Find best child and 2nd-best thresholds.
@@ -151,6 +178,10 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
     path_hashes_.pop_back();
     board.UndoMove(best->last_move, undo);
 
+    // Once cancellation is observed, only unwind board/path state. Avoid
+    // repeatedly summarizing every ancestor on a potentially deep path.
+    if (ShouldStop()) return;
+
     // Update node's pn/dn from children.
     SummarizeNode<or_node>(node);
   }
@@ -163,9 +194,12 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
 
 template<bool or_node>
 void MateDfpnSolver::ExpandNode(ShogiBoard& board, DfpnNode& node, int ply) {
+  if (ShouldStop()) return;
+
   // Quick 1-ply mate check for OR nodes.
   if constexpr (or_node) {
     Move mate1 = Mate1Ply(board);
+    if (ShouldStop()) return;
     if (!mate1.is_null()) {
       // Found a 1-ply mate, including a mating countercheck when the
       // attacker starts in check.
@@ -193,6 +227,7 @@ void MateDfpnSolver::ExpandNode(ShogiBoard& board, DfpnNode& node, int ply) {
     // Defender: generate all legal evasions (we must be in check).
     moves = board.GenerateLegalMoves();
   }
+  if (ShouldStop()) return;
 
   if (moves.empty()) {
     if constexpr (or_node) {
@@ -351,6 +386,7 @@ MoveList MateDfpnSolver::GenerateChecks(ShogiBoard& board) {
   MoveList checks;
 
   for (const Move& m : all_moves) {
+    if (ShouldStop()) return checks;
     UndoInfo undo = board.DoMove(m);
     if (board.InCheck()) {
       checks.push_back(m);

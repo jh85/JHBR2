@@ -23,6 +23,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -122,6 +123,9 @@ class DfpnNodePool {
 
 class MateDfpnSolver {
  public:
+  using Clock = std::chrono::steady_clock;
+  using Deadline = Clock::time_point;
+
   explicit MateDfpnSolver(size_t default_nodes_limit = 100000);
 
   // Search for a forced checkmate from the given position.
@@ -133,6 +137,7 @@ class MateDfpnSolver {
   //
   // The side_to_move of the board is the attacker (OR node).
   Move search(ShogiBoard board, size_t nodes_limit);
+  Move search(ShogiBoard board, size_t nodes_limit, Deadline deadline);
   Move search(ShogiBoard board) {
     return search(board, default_nodes_limit_);
   }
@@ -154,9 +159,14 @@ class MateDfpnSolver {
   std::vector<Move> get_pv() const { return pv_; }
   size_t get_nodes_searched() const { return nodes_searched_; }
 
-  void stop() { stop_.store(true, std::memory_order_relaxed); }
+  // Cancellation is sticky for the lifetime of this solver. This is
+  // intentional: asynchronous callers may request cancellation before the
+  // worker thread has entered search(), and that request must not be lost.
+  void stop() { stop_.store(true, std::memory_order_release); }
 
  private:
+  bool ShouldStop();
+
   // Core recursive search.
   // or_node: true = attacker (generate checks), false = defender (generate evasions).
   // second_pn/second_dn: threshold from parent (stop if pn/dn exceeds 2nd-best sibling).
@@ -194,6 +204,7 @@ class MateDfpnSolver {
   int mate_ply_ = 0;
   std::vector<Move> pv_;
   std::atomic<bool> stop_{false};
+  Deadline deadline_ = Deadline::max();
 
   // Repetition detection: track hashes on the current search path.
   std::vector<uint64_t> path_hashes_;

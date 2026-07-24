@@ -626,8 +626,7 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   // --- Launch root df-pn in parallel ---
   auto move_start_time = std::chrono::steady_clock::now();
 
-  // Keep the solver and its result in one state shared by the worker and
-  // deadline timer.
+  // Keep the solver and its result in one state shared with the worker.
   struct DfpnState {
     MateDfpnSolver solver;
     std::atomic<bool> done{false};
@@ -638,29 +637,15 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   auto dfpn =
       std::make_shared<DfpnState>(time_budget.root_dfpn_nodes, board_);
 
+  const auto dfpn_time_deadline =
+      move_start_time +
+      std::chrono::milliseconds(time_budget.root_dfpn_time_ms);
   auto dfpn_thread =
-      std::thread([dfpn, root_dfpn_nodes = time_budget.root_dfpn_nodes]() {
-        dfpn->mate_move = dfpn->solver.search(dfpn->board, root_dfpn_nodes);
+      std::thread([dfpn, root_dfpn_nodes = time_budget.root_dfpn_nodes,
+                   dfpn_time_deadline]() {
+        dfpn->mate_move = dfpn->solver.search(
+            dfpn->board, root_dfpn_nodes, dfpn_time_deadline);
         dfpn->done.store(true, std::memory_order_release);
-      });
-
-  // Enforce DfPnMaxTime independently of MCTS duration. Cancellation is
-  // atomic and checked throughout df-pn, so the worker can always be joined
-  // safely instead of being detached while its result is still shared.
-  auto dfpn_timer = std::thread(
-      [dfpn, root_dfpn_time_ms = time_budget.root_dfpn_time_ms,
-       move_start_time]() {
-        while (!dfpn->done.load(std::memory_order_acquire)) {
-          const auto elapsed_ms =
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::steady_clock::now() - move_start_time)
-                  .count();
-          if (elapsed_ms >= root_dfpn_time_ms) {
-            dfpn->solver.stop();
-            return;
-          }
-          std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
       });
 
   // --- Run dlshogi-style MCTS ---
@@ -734,9 +719,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   auto dfpn_wait_deadline =
       std::chrono::steady_clock::now() +
       std::chrono::milliseconds(time_budget.root_dfpn_grace_ms);
-  const auto dfpn_time_deadline =
-      move_start_time +
-      std::chrono::milliseconds(time_budget.root_dfpn_time_ms);
   dfpn_wait_deadline = std::min(dfpn_wait_deadline, dfpn_time_deadline);
   if (time_budget.hard_deadline_ms > 0) {
     const auto move_deadline =
@@ -751,7 +733,6 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   }
   if (!dfpn->done.load(std::memory_order_acquire)) dfpn->solver.stop();
   if (dfpn_thread.joinable()) dfpn_thread.join();
-  if (dfpn_timer.joinable()) dfpn_timer.join();
 
   // --- Choose result ---
   bool use_mate = dfpn->done.load(std::memory_order_acquire) &&
@@ -824,14 +805,18 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
 
   std::atomic<bool> search_done{false};
   Move mate_move;
+  const auto t0 = std::chrono::steady_clock::now();
+  const auto deadline =
+      time_limit_ms > 0
+          ? t0 + std::chrono::milliseconds(time_limit_ms)
+          : MateDfpnSolver::Deadline::max();
 
-  auto search_thread = std::thread([&]() {
-    mate_move = solver.search(board_, max_nodes);
-    search_done = true;
+  auto search_thread = std::thread([&, deadline]() {
+    mate_move = solver.search(board_, max_nodes, deadline);
+    search_done.store(true, std::memory_order_release);
   });
 
-  auto t0 = std::chrono::steady_clock::now();
-  while (!search_done) {
+  while (!search_done.load(std::memory_order_acquire)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     if (time_limit_ms > 0) {
       auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -847,7 +832,7 @@ void USIEngine::CmdGoMate(const std::vector<std::string>& parts) {
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0).count();
 
-  if (!search_done && time_limit_ms > 0) {
+  if (!search_done.load(std::memory_order_acquire) && time_limit_ms > 0) {
     Log("Mate search timeout after " + std::to_string(elapsed) + " ms");
     Send("checkmate timeout");
   } else if (!mate_move.is_null() && !MateDfpnSolver::IsNoMate(mate_move)) {
