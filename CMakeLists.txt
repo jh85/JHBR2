@@ -219,6 +219,15 @@ add_executable(test_tree_reuse
 )
 target_link_libraries(test_tree_reuse PRIVATE shogi_core)
 
+# ---- Test: lock-free evaluated-node traversal and child publication ----
+# This target supplies a deterministic fake evaluator, so it deliberately does
+# not link nn_backend or inherit USE_TENSORRT.
+add_executable(test_lockfree_search
+  test/test_lockfree_search.cc
+  ${DLSHOGI_MCTS_SRCS}
+)
+target_link_libraries(test_lockfree_search PRIVATE mate_solver shogi_core)
+
 # ---- Test: root vs descendant repetition search policy ----
 add_executable(test_search_repetition test/test_search_repetition.cc)
 target_link_libraries(test_search_repetition PRIVATE shogi_core)

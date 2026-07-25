@@ -456,7 +456,11 @@ PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
   unsigned next = 0;
   Move next_move;
   uct_node_t* next_node = nullptr;
-  {
+
+  // Expansion mutates child arrays and must remain serialized. Once SetEvaled
+  // publishes the node, all selection inputs are immutable or atomic, and
+  // child-node ownership is published independently by child_node_slot_t.
+  if (!current->IsEvaled()) {
     std::lock_guard<std::mutex> lk(GetPositionMutex(board));
     if (!current->IsEvaled()) {
       if (current->child_num != 0) return PlayoutStatus::kDiscarded;
@@ -479,19 +483,18 @@ PlayoutStatus UCTSearcher::UctSearch(ShogiBoard* board, child_node_t* parent,
                   &visitor.eval_valid);
       return PlayoutStatus::kQueuing;
     }
-
-    if (current->child_num == 0) {
-      visitor.terminal_value =
-          ResolveTerminalEdge(parent, EdgeOutcome::kWin);
-      return PlayoutStatus::kTerminal;
-    }
-    next = SelectMaxUcbChild(parent, current);
-    AddVirtualLoss(&current->child[next], current);
-    visitor.trajectories.push_back({current, next});
-    next_move = current->child[next].move;
-    next_node = current->child_nodes[next].get();
-    if (next_node == nullptr) next_node = current->CreateChildNode(next);
   }
+
+  if (current->child_num == 0) {
+    visitor.terminal_value =
+        ResolveTerminalEdge(parent, EdgeOutcome::kWin);
+    return PlayoutStatus::kTerminal;
+  }
+  next = SelectMaxUcbChild(parent, current);
+  AddVirtualLoss(&current->child[next], current);
+  visitor.trajectories.push_back({current, next});
+  next_move = current->child[next].move;
+  next_node = current->child_nodes[next].GetOrCreate();
 
   board->DoMove(next_move);
   return UctSearch(board, &current->child[next], next_node, visitor);
@@ -768,10 +771,12 @@ int Search::QToCentipawns(float win_rate) const {
 std::vector<Move> Search::GetPV() const {
   std::vector<Move> pv;
   const uct_node_t* node = root_;
-  while (node && node->child_num > 0 && node->child) {
+  // MaybeOutputInfo() can run while another worker expands the next PV node.
+  // Acquire its evaluated state before reading the published child arrays.
+  while (node && node->IsEvaled() && node->child_num > 0 && node->child) {
     const unsigned idx = SelectBestChild(node);
     pv.push_back(node->child[idx].move);
-    if (!node->child_nodes || !node->child_nodes[idx]) break;
+    if (!node->child_nodes) break;
     node = node->child_nodes[idx].get();
     if (pv.size() > 256) break;
   }

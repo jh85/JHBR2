@@ -1,6 +1,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <thread>
 #include <vector>
 
 #include "dlshogi_mcts/uct_node.h"
@@ -116,6 +117,59 @@ void TestMultiChildPruning() {
         selected->move_count.load(std::memory_order_relaxed) == 17);
 }
 
+void TestConcurrentChildPublication() {
+  ShogiBoard board;
+  board.SetStartPos();
+
+  uct_node_t node;
+  node.ExpandNode(&board);
+  node.SetEvaled();
+  Check("concurrent publication has enough child slots", node.child_num >= 4);
+  if (node.child_num < 4) return;
+
+  constexpr int kThreads = 32;
+  constexpr int kIterations = 2000;
+  constexpr int kTargets = 4;
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+  std::vector<uct_node_t*> observed(static_cast<size_t>(kThreads), nullptr);
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+
+  for (int thread = 0; thread < kThreads; ++thread) {
+    threads.emplace_back([&, thread] {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+
+      const int target = thread % kTargets;
+      uct_node_t* child = nullptr;
+      for (int iteration = 0; iteration < kIterations; ++iteration) {
+        child = node.CreateChildNode(target);
+      }
+      observed[static_cast<size_t>(thread)] = child;
+    });
+  }
+
+  while (ready.load(std::memory_order_acquire) != kThreads) {
+    std::this_thread::yield();
+  }
+  start.store(true, std::memory_order_release);
+  for (auto& thread : threads) thread.join();
+
+  bool stable = true;
+  for (int thread = 0; thread < kThreads; ++thread) {
+    const int target = thread % kTargets;
+    stable = stable &&
+             observed[static_cast<size_t>(thread)] != nullptr &&
+             observed[static_cast<size_t>(thread)] ==
+                 node.child_nodes[static_cast<size_t>(target)].get();
+  }
+  Check("concurrent child publication returns one stable node per edge",
+        stable);
+}
+
 void TestRewindResetsHead() {
   constexpr uint64_t kStartKey = 0x2345;
   const Move move1 = Move::Parse("7g7f");
@@ -195,6 +249,7 @@ int main() {
 
   TestExtensionAndIdenticalPosition();
   TestMultiChildPruning();
+  TestConcurrentChildPublication();
   TestRewindResetsHead();
   TestDivergenceResetsHead();
   TestChangedStartingPosition();

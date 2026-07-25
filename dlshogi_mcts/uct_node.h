@@ -10,6 +10,37 @@
 
 namespace dlshogi_mcts {
 
+struct uct_node_t;
+
+// Owns one lazily-created child node while publishing its address atomically.
+// Search workers only call get()/GetOrCreate(); tree reuse may Take()/Reset()
+// slots after every search worker has joined.
+class child_node_slot_t {
+ public:
+  child_node_slot_t() = default;
+  ~child_node_slot_t();
+
+  child_node_slot_t(const child_node_slot_t&) = delete;
+  child_node_slot_t& operator=(const child_node_slot_t&) = delete;
+  child_node_slot_t(child_node_slot_t&&) = delete;
+  child_node_slot_t& operator=(child_node_slot_t&&) = delete;
+
+  uct_node_t* get() const noexcept;
+  explicit operator bool() const noexcept { return get() != nullptr; }
+
+  // Concurrent callers either publish a new node or receive the node another
+  // caller published. The returned pointer remains owned by this slot.
+  uct_node_t* GetOrCreate();
+
+  // Tree-lifecycle operations. These must only run after search workers join.
+  std::unique_ptr<uct_node_t> Take() noexcept;
+  std::unique_ptr<uct_node_t> Reset(
+      std::unique_ptr<uct_node_t> replacement) noexcept;
+
+ private:
+  std::atomic<uct_node_t*> node_{nullptr};
+};
+
 struct child_node_t {
   child_node_t() = default;
   explicit child_node_t(lczero::Move m) : move(m) {}
@@ -76,7 +107,7 @@ struct uct_node_t {
   float eval_m = 0.0f;  // this node's own NN moves-left (set once at eval)
   short child_num = 0;
   std::unique_ptr<child_node_t[]> child;
-  std::unique_ptr<std::unique_ptr<uct_node_t>[]> child_nodes;
+  std::unique_ptr<child_node_slot_t[]> child_nodes;
 };
 
 class NodeTree {
