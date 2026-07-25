@@ -159,10 +159,43 @@ void MateDfpnSolver::Search(ShogiBoard& board, DfpnNode& node,
     // Apply move.
     UndoInfo undo = board.DoMove(best->last_move);
 
-    // Repetition check.
+    // Rule-aware repetition check over both the game history inherited at the
+    // root and the moves made by this df-pn search. CheckRepetition() reports
+    // from the child side-to-move's perspective. The child is an AND
+    // (defender) node after an OR move, and an OR (attacker) node after an AND
+    // move, so the same kWin/kLoss result has opposite proof meaning.
+    const auto repetition =
+        board.CheckRepetition(kRepetitionLookbackPly);
+    if (repetition != ShogiBoard::RepetitionResult::kNone) {
+      bool attacker_wins = false;
+      if constexpr (or_node) {
+        // The child is the defender: their repetition loss proves the
+        // attacker's win; their win or a draw disproves mate.
+        attacker_wins =
+            repetition == ShogiBoard::RepetitionResult::kLoss;
+      } else {
+        // The child is the attacker: their repetition win proves a win; their
+        // loss or a draw disproves mate.
+        attacker_wins =
+            repetition == ShogiBoard::RepetitionResult::kWin;
+      }
+
+      if (attacker_wins) {
+        best->set_mate(ply + 1);
+      } else {
+        best->set_nomate(ply + 1);
+      }
+      best->repeated = true;
+      board.UndoMove(best->last_move, undo);
+      SummarizeNode<or_node>(node);
+      continue;
+    }
+
+    // Retain the path-only hash guard for cycles beyond the bounded
+    // rule-aware window. In a checking/evasion df-pn tree, such a cycle cannot
+    // establish a checkmate, so the conservative result is no-mate.
     uint64_t hash = board.Hash();
     if (IsRepetition(hash)) {
-      // Repetition detected — treat as no-mate for attacker.
       best->set_nomate(ply + 1);
       best->repeated = true;
       board.UndoMove(best->last_move, undo);

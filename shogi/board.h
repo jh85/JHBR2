@@ -236,7 +236,11 @@ class ShogiBoard {
   // Search-time repetition adjudication. This deliberately returns a result
   // at the first prior occurrence so the search avoids cycles; the game
   // controller remains responsible for the official fourth occurrence.
-  RepetitionResult CheckRepetition() const;
+  //
+  // If max_back_plies is positive, only positions within that many plies of
+  // the current position are considered. A non-positive value scans all
+  // retained game/search history.
+  RepetitionResult CheckRepetition(int max_back_plies = 0) const;
 
   // Get the repetition count (how many times current position has occurred).
   int RepetitionCount() const;

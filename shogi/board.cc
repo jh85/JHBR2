@@ -1747,7 +1747,8 @@ int ShogiBoard::RepetitionCount() const {
   return count;
 }
 
-ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition() const {
+ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition(
+    int max_back_plies) const {
   // Detect repetition at the FIRST prior occurrence (search-time policy
   // matching dlshogi and YaneuraOu). The actual rule fires on the 4th
   // occurrence, but treating the 2nd occurrence as already-perpetual
@@ -1760,13 +1761,19 @@ ShogiBoard::RepetitionResult ShogiBoard::CheckRepetition() const {
   // been continuously checking for the entire cycle, we LOSE; if the
   // opponent has, we WIN; otherwise it's a normal draw.
 
-  for (int i = static_cast<int>(history_.size()) - 1; i >= 0; --i) {
-    const auto& entry = history_[i];
+  const int history_size = static_cast<int>(history_.size());
+  const int max_distance =
+      max_back_plies > 0 ? std::min(history_size, max_back_plies)
+                         : history_size;
+  // The same side must be to move and a legal shogi position cannot return to
+  // itself in two plies, so only distances 4, 6, 8, ... can match. With the
+  // df-pn limit of 16 this is at most seven small comparisons per node.
+  for (int dist = 4; dist <= max_distance; dist += 2) {
+    const auto& entry = history_[history_size - dist];
     if (entry.hash == hash_ &&
         entry.hand_black == hand_[BLACK].raw() &&
         entry.hand_white == hand_[WHITE].raw()) {
       Color us = side_to_move_;
-      int dist = static_cast<int>(history_.size()) - i;
 
       if (continuous_check_[us] >= dist) {
         return RepetitionResult::kLoss;  // We were giving perpetual check

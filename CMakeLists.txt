@@ -264,6 +264,10 @@ target_link_libraries(test_mate PRIVATE mate_solver shogi_core)
 add_executable(test_dfpn_cancellation test/test_dfpn_cancellation.cc)
 target_link_libraries(test_dfpn_cancellation PRIVATE mate_solver shogi_core)
 
+# ---- Test: df-pn repetition handling across the game/search boundary ----
+add_executable(test_dfpn_repetition test/test_dfpn_repetition.cc)
+target_link_libraries(test_dfpn_repetition PRIVATE mate_solver shogi_core)
+
 # ---- Test: shallow mate (Phase 0+) ----
 add_executable(test_shallow_mate test/test_shallow_mate.cc)
 target_link_libraries(test_shallow_mate PRIVATE mate_solver shogi_core)

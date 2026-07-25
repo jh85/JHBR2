@@ -126,6 +126,11 @@ class MateDfpnSolver {
   using Clock = std::chrono::steady_clock;
   using Deadline = Clock::time_point;
 
+  // Match dlshogi's bounded repetition check. At most seven same-side
+  // positions can be compared (distances 4..16), keeping the per-node cost
+  // small while covering practical perpetual-check cycles.
+  static constexpr int kRepetitionLookbackPly = 16;
+
   explicit MateDfpnSolver(size_t default_nodes_limit = 100000);
 
   // Search for a forced checkmate from the given position.

@@ -37,6 +37,27 @@ namespace {
 // while still preventing an accidental unbounded allocation.
 constexpr int kMaxWorkersPerGpu = 64;
 
+const char* RepetitionResultName(ShogiBoard::RepetitionResult result) {
+  switch (result) {
+    case ShogiBoard::RepetitionResult::kNone:
+      return "none";
+    case ShogiBoard::RepetitionResult::kDraw:
+      return "draw";
+    case ShogiBoard::RepetitionResult::kWin:
+      return "opponent-win";
+    case ShogiBoard::RepetitionResult::kLoss:
+      return "opponent-loss";
+  }
+  return "unknown";
+}
+
+ShogiBoard::RepetitionResult RootMoveRepetitionResult(
+    const ShogiBoard& board, Move move) {
+  ShogiBoard child = board;
+  child.DoMove(move);
+  return child.CheckRepetition(MateDfpnSolver::kRepetitionLookbackPly);
+}
+
 }  // namespace
 
 // =====================================================================
@@ -758,6 +779,20 @@ void USIEngine::CmdGo(const std::vector<std::string>& parts) {
   bool use_mate = dfpn->done.load(std::memory_order_acquire) &&
                   !dfpn->mate_move.is_null() &&
                   !MateDfpnSolver::IsNoMate(dfpn->mate_move);
+
+  // Defense in depth: a root df-pn result must not replace MCTS when its very
+  // first move enters a repetition. The solver now adjudicates these nodes
+  // itself, but keeping the final boundary check prevents a future df-pn
+  // regression from turning an OUTE_SENNICHITE loss into bestmove.
+  if (use_mate) {
+    const auto repetition =
+        RootMoveRepetitionResult(board_, dfpn->mate_move);
+    if (repetition != ShogiBoard::RepetitionResult::kNone) {
+      Log("Rejected root df-pn move " + dfpn->mate_move.ToString() +
+          ": repetition=" + RepetitionResultName(repetition));
+      use_mate = false;
+    }
+  }
 
   if (use_mate) {
     auto pv = dfpn->solver.get_pv();

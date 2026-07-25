@@ -61,6 +61,22 @@ void TestFreshDescendantIsNotTerminal() {
             ShogiBoard::RepetitionResult::kNone);
 }
 
+void TestBoundedRepetitionLookback() {
+  ShogiBoard board;
+  board.SetStartPos();
+  board.DoMove(Move::Parse("5i5h"));
+  board.DoMove(Move::Parse("5a5b"));
+  board.DoMove(Move::Parse("5h5i"));
+  board.DoMove(Move::Parse("5b5a"));
+
+  Check("four-ply repetition is outside a three-ply window",
+        board.CheckRepetition(3) ==
+            ShogiBoard::RepetitionResult::kNone);
+  Check("four-ply repetition is inside a four-ply window",
+        board.CheckRepetition(4) ==
+            ShogiBoard::RepetitionResult::kDraw);
+}
+
 }  // namespace
 
 int main() {
@@ -69,6 +85,7 @@ int main() {
   TestRepeatedRootIsNotTerminal();
   TestRepeatedDescendantIsTerminal();
   TestFreshDescendantIsNotTerminal();
+  TestBoundedRepetitionLookback();
 
   std::printf("\n=== Search repetition: %d failed ===\n", failures);
   return failures == 0 ? 0 : 1;
